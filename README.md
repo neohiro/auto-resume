@@ -78,6 +78,17 @@ The walk-away loop:
 
 ## Install
 
+**Easiest: just ask your agent.** You are already talking to an AI with full shell access - let it do the work. Paste this into OpenCode:
+
+```text
+Install the auto-resume plugin from https://github.com/neohiro/auto-resume
+into my global plugins folder (~/.config/opencode/plugins/) so every
+session gets it machine-wide.
+```
+
+The agent downloads the single file, puts it in place, and tells you when it is done - restart OpenCode and you are protected. (Yes, auto-resume can help install the thing that will keep auto-resume sessions alive. It appreciates the irony.)
+
+
 **Option A — one file (recommended):**
 
 Windows PowerShell:
