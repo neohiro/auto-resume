@@ -217,6 +217,8 @@ const ev = (type, properties) => ({ event: { type, properties } })
   const hooksA = await AutoResumePlugin({ client: makeClient(makeState()) })
   await hooksA.event(ev("session.error", { sessionID: "p1", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
   await sleep(150) // let the store flush to disk
+  const savedRaw = JSON.parse(await readFile(process.env.OPENCODE_RESUME_STOPSTORE, "utf8"))
+  ok(savedRaw.p1 > 0, "S11: stop marker flushed to disk")
   // run #2: OpenCode restarted — fresh plugin state, store reloaded from disk
   const stateB = makeState()
   stateB.sessionList = [{ id: "p1", time: { updated: Date.now() - 1_000 } }]
@@ -230,6 +232,11 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await sleep(300)
   ok(!stateB.prompts.some((p) => p.id === "p1"),
     "S11: persisted stop keeps automation quiet after restart")
+  // stray infra failures on a stopped session must not resurrect anything
+  await hooksB.event(ev("session.error", { sessionID: "p1", error: { name: "APIError", data: { statusCode: 503, message: "service unavailable" } } }))
+  await sleep(300)
+  ok(!stateB.prompts.some((p) => p.id === "p1"),
+    "S11: errors on a persisted-stopped session stay ignored")
   // only the user's next real prompt lifts the stop — on disk too
   await hooksB.event(ev("message.updated", { info: { role: "user", sessionID: "p1", id: "up1" } }))
   stateB.msgStore.up1 = "alright, go"

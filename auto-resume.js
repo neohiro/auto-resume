@@ -415,22 +415,26 @@ export const AutoResumePlugin = async ({ client }) => {
   const STOP_STORE_PATH = str("OPENCODE_RESUME_STOPSTORE", selfPath ? `${selfPath}.stopped.json` : "")
   const STOP_STORE_TTL_MS = 14 * 86_400_000 // forget ancient markers
   const persistedStops = new Map() // sessionID -> stoppedAt
-  let stopStoreLoaded = false
+  let stopStoreLoading = null
 
-  const loadStoppedStore = async () => {
-    if (!STOP_STORE_PATH || stopStoreLoaded) return
-    stopStoreLoaded = true
-    try {
-      const { readFile } = await import("node:fs/promises")
-      const raw = JSON.parse(await readFile(STOP_STORE_PATH, "utf8"))
-      const cutoff = Date.now() - STOP_STORE_TTL_MS
-      if (raw && typeof raw === "object") {
-        for (const [id, ts] of Object.entries(raw)) {
-          if (typeof ts === "number" && ts > cutoff) persistedStops.set(id, ts)
+  /** Single-flight: every caller awaits the SAME read, so a revival scan
+   *  racing the init load always observes the fully restored markers. */
+  const loadStoppedStore = () => {
+    if (!STOP_STORE_PATH) return Promise.resolve()
+    stopStoreLoading ??= (async () => {
+      try {
+        const { readFile } = await import("node:fs/promises")
+        const raw = JSON.parse(await readFile(STOP_STORE_PATH, "utf8"))
+        const cutoff = Date.now() - STOP_STORE_TTL_MS
+        if (raw && typeof raw === "object") {
+          for (const [id, ts] of Object.entries(raw)) {
+            if (typeof ts === "number" && ts > cutoff) persistedStops.set(id, ts)
+          }
         }
-      }
-      log("info", "restored persisted user-stops", { count: persistedStops.size })
-    } catch { /* no store yet (or unreadable) — start empty */ }
+        log("info", "restored persisted user-stops", { count: persistedStops.size })
+      } catch { /* no store yet (or unreadable) — start empty */ }
+    })()
+    return stopStoreLoading
   }
 
   const writeStopStoreOnce = async () => {
