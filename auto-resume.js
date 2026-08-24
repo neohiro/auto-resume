@@ -122,7 +122,14 @@
  *  OPENCODE_AUTOPILOT_IMPROVE_CYCLES     max improvement cycles     (2)
  *  OPENCODE_AUTOPILOT_MAX_NUDGES         max self-driven nudges/task(25)
  *  OPENCODE_AUTOPILOT_BUDGET_MS          wall-clock budget per task (28800000 = 8h, 0=off)
+ *  OPENCODE_RESUME_AUTO_UPDATE           self-update daily from GitHub (true)
  */
+
+import { writeFile, rename } from "node:fs/promises"
+
+const AUTO_RESUME_VERSION = "1.3.0"
+const UPDATE_URL =
+  "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
 const DEFAULTS = {
   enabled: true,
@@ -144,6 +151,7 @@ const DEFAULTS = {
   breakerCooldownMs: 300_000,
   compactOnOverflow: true,
   toastThrottleMs: 3_000,
+  autoUpdate: true,
   switchOnQuota: true,
   switchOnRateLimit: true,
   switchOnFailures: true,
@@ -259,6 +267,10 @@ const CONTINUATION_ANYWHERE = [
   /\bwill continue\b/i,
   /\bcontinu(e|ing) (in the next|with the next|shortly|below)\b/i,
   /\bmore (to come|coming soon|follows)\b/i,
+  /\bremaining things to do\b/i,
+  /\bleft on the (list|todo)\b/i,
+  /\bstill (?:on the (list|todo)|to be done|remaining)\b/i,
+  /\bitems? remain(?:ing)?\b/i,
 ]
 const CONTINUATION_STEM = /^(continue|continuing|resumed?|proceeding|finalizing|finalize|finishing|finishing up|wrapping up|next up|partial(?:ly)? (?:done|complete)|incomplete)\b/i
 
@@ -333,6 +345,7 @@ function loadConfig() {
     breakerCooldownMs: num("OPENCODE_RESUME_BREAKER_COOLDOWN_MS", DEFAULTS.breakerCooldownMs),
     compactOnOverflow: bool("OPENCODE_RESUME_COMPACT_ON_OVERFLOW", DEFAULTS.compactOnOverflow),
     toastThrottleMs: num("OPENCODE_RESUME_TOAST_THROTTLE_MS", DEFAULTS.toastThrottleMs),
+    autoUpdate: bool("OPENCODE_RESUME_AUTO_UPDATE", DEFAULTS.autoUpdate),
     switchOnQuota: bool("OPENCODE_RESUME_SWITCH_ON_QUOTA", DEFAULTS.switchOnQuota),
     switchOnRateLimit: bool("OPENCODE_RESUME_SWITCH_ON_RATELIMIT", DEFAULTS.switchOnRateLimit),
     switchOnFailures: bool("OPENCODE_RESUME_SWITCH_ON_FAILURES", DEFAULTS.switchOnFailures),
@@ -395,6 +408,7 @@ export const AutoResumePlugin = async ({ client }) => {
         toolErrs: 0, debugArmed: false, toolRunning: false,
         lastTurnHadText: false,
         retryEnteredAt: 0, retryNext: 0, child: false, reanimated: false,
+        lastInjectKind: null,
       }
       sessions.set(id, s)
     }
@@ -644,6 +658,7 @@ export const AutoResumePlugin = async ({ client }) => {
     const body = { parts: [{ type: "text", text: autonomousPrompt(plan) }] }
     if (model) body.model = model
 
+    s.lastInjectKind = plan.kind
     s.lastInjectAt = Date.now() // mark BEFORE dispatch: user-message event arrives at turn start
     s.lastResumeAt = s.lastInjectAt
     try {
@@ -890,9 +905,17 @@ export const AutoResumePlugin = async ({ client }) => {
       const open = todos.filter((t) => t.status === "pending" || t.status === "in_progress")
       const finished = todos.filter((t) => t.status === "completed" || t.status === "cancelled")
 
+      // Implicit todo lists: markdown checkboxes in the assistant's own reply
+      // count as a todo list even when the todo tool was never used.
+      const replyText = (lastAssistant.parts ?? [])
+        .map((x) => (x?.type === "text" ? x.text : "")).join(" ")
+      const boxes = [...replyText.matchAll(/[-*+]\s+\[([ xX])\]/g)]
+      const cbOpen = boxes.filter((m) => m[1] === " ").length
+      const cbDone = boxes.length - cbOpen
+
       // The agent ended its turn by asking a question or announcing more
       // work ("Continue to finalize.") instead of finishing — keep it going.
-      if (open.length === 0 && cfg.autonomy && cfg.proceedOnAsk &&
+      if (open.length === 0 && s.lastInjectKind !== "propose" && cfg.autonomy && cfg.proceedOnAsk &&
           s.proceedCount < cfg.maxProceeds && s.nudges < cfg.maxNudges && budgetLeft(s)) {
         const text = (lastAssistant.parts ?? [])
           .map((x) => (x?.type === "text" ? x.text : "")).join(" ")
@@ -913,7 +936,7 @@ export const AutoResumePlugin = async ({ client }) => {
       }
 
       // Full completion → self-improvement passes → wrap-up proposals → toast
-      if (todos.length > 0 && open.length === 0) {
+      if ((todos.length > 0 || boxes.length > 0) && open.length === 0 && cbOpen === 0) {
         if (cfg.autonomy && cfg.improveLoop && s.improveDone < cfg.improveCycles &&
             s.nudges < cfg.maxNudges && budgetLeft(s)) {
           s.improveDone += 1
@@ -936,18 +959,19 @@ export const AutoResumePlugin = async ({ client }) => {
       }
 
       // Unfinished todos → drive continuation (with spin detection + caps)
-      if (cfg.autonomy && cfg.todoDrive && open.length > 0 &&
+      if (cfg.autonomy && cfg.todoDrive && (open.length > 0 || cbOpen > 0) &&
           s.nudges < cfg.maxNudges && budgetLeft(s)) {
-        if (finished.length === s.lastDriveCompleted) {
+        const doneNow = finished.length + cbDone
+        if (doneNow === s.lastDriveCompleted) {
           s.staleDrives += 1
         } else {
           s.staleDrives = 0
-          s.lastDriveCompleted = finished.length
+          s.lastDriveCompleted = doneNow
         }
         if (s.staleDrives < 2) {
           s.nudges += 1
           s.driveCount += 1
-          log("info", "todo-drive nudge", { sessionID, open: open.length, drive: s.driveCount })
+          log("info", "todo-drive nudge", { sessionID, open: open.length + cbOpen, drive: s.driveCount })
           schedule(sessionID, cfg.nudgeDelayMs, { kind: "todos", prompt: PROMPTS.todos })
           return
         }
@@ -1084,10 +1108,63 @@ export const AutoResumePlugin = async ({ client }) => {
     }
   }
 
+
+  // -- self-updater: daily check against the official repo -------------------
+  let lastUpdateCheckAt = 0
+  const isNewerVersion = (remote, local) => {
+    const r = String(remote).split(".").map((x) => parseInt(x, 10) || 0)
+    const l = String(local).split(".").map((x) => parseInt(x, 10) || 0)
+    for (let i = 0; i < 3; i += 1) {
+      if ((r[i] || 0) !== (l[i] || 0)) return (r[i] || 0) > (l[i] || 0)
+    }
+    return false
+  }
+  const selfPath = (() => {
+    try {
+      if (!import.meta.url.startsWith("file:")) return null
+      return decodeURIComponent(new URL(import.meta.url).pathname).replace(/^\/([A-Za-z]:)/, "$1")
+    } catch { return null }
+  })()
+  const checkForUpdates = async () => {
+    if (!cfg.autoUpdate || !selfPath) return
+    if (Date.now() - lastUpdateCheckAt < 86_400_000) return
+    lastUpdateCheckAt = Date.now()
+    try {
+      const res = await fetch(`${UPDATE_URL}?t=${Date.now()}`, {
+        headers: { "user-agent": `auto-resume-plugin/${AUTO_RESUME_VERSION}` },
+      })
+      if (!res.ok) return
+      const src = await res.text()
+      if (!src.startsWith("/**")) return // sanity: plausible release only
+      const match = src.match(/AUTO_RESUME_VERSION = "([^"]+)"/)
+      if (!match) return
+      if (!isNewerVersion(match[1], AUTO_RESUME_VERSION)) {
+        log("debug", "auto-resume up to date", { local: AUTO_RESUME_VERSION, remote: match[1] })
+        return
+      }
+      let current = ""
+      try {
+        const { readFile } = await import("node:fs/promises")
+        current = await readFile(selfPath, "utf8")
+      } catch { /* keep empty backup */ }
+      await writeFile(`${selfPath}.bak`, current, "utf8")
+      const tmp = `${selfPath}.tmp`
+      await writeFile(tmp, src, "utf8")
+      await rename(tmp, selfPath)
+      log("info", "self-updated", { from: AUTO_RESUME_VERSION, to: match[1], path: selfPath })
+      toast(
+        `${RESUME_TAG}: Updated ${AUTO_RESUME_VERSION} -> ${match[1]}. Restart OpenCode to load it.`,
+        "info",
+      )
+    } catch (err) {
+      log("debug", "update check skipped", { err: err?.message ?? String(err) })
+    }
+  }
   if (cfg.enabled) {
     const wd = setInterval(() => detach(checkStalls, "watchdog"), cfg.watchdogMs)
     wd.unref?.()
     detach(() => log("debug", "auto-resume plugin initialized"), "init-log")
+    detach(checkForUpdates, "update-check")
     detach(reanimate, "reanimate")
   } else {
     console.warn(`${RESUME_TAG} disabled via OPENCODE_RESUME_ENABLED`)

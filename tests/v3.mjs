@@ -4,6 +4,7 @@ process.env.OPENCODE_RESUME_RATE_LIMIT_BASE_MS ??= "40"
 process.env.OPENCODE_RESUME_MAX_DELAY_MS ??= "500"
 process.env.OPENCODE_RESUME_NUDGE_DELAY_MS ??= "30"
 process.env.OPENCODE_RESUME_TOAST_THROTTLE_MS ??= "0"
+process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
 
 import { AutoResumePlugin } from "../auto-resume.js"
 

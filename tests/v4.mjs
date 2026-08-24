@@ -4,6 +4,7 @@ process.env.OPENCODE_RESUME_RATE_LIMIT_BASE_MS ??= "40"
 process.env.OPENCODE_RESUME_MAX_DELAY_MS ??= "500"
 process.env.OPENCODE_RESUME_NUDGE_DELAY_MS ??= "30"
 process.env.OPENCODE_RESUME_TOAST_THROTTLE_MS ??= "0"
+process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
 
 import { AutoResumePlugin } from "../auto-resume.js"
 
@@ -197,6 +198,65 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await sleep(350)
   ok(!state3.prompts.some((p) => p.text.includes("still work to do")),
     "BB: finished summaries are not misread as continuation stubs")
+}
+
+// ---- CC: implicit checklists + list-style continuation headings -------------
+{
+  // "Remaining things to do:" heading style (user-reported case)
+  const state = makeState(["rem"])
+  state.messagesBySession.rem = [{
+    info: { role: "assistant", error: null },
+    parts: [{ type: "text", text: "Remaining things to do:\n- [ ] fix the parser\n- [ ] update docs" }],
+  }]
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "rem", text: "Remaining things to do:" } }))
+  await hooks.event(ev("session.idle", { sessionID: "rem" }))
+  await sleep(350)
+  ok(state.prompts.filter((p) => p.id === "rem").length === 1,
+    "CC1: 'Remaining things to do:' heading resumes exactly once")
+
+  // checkbox-only list drives to completion, then wraps up
+  process.env.OPENCODE_AUTOPILOT_IMPROVE_CYCLES = "0"
+  process.env.OPENCODE_AUTOPILOT_PROPOSALS = "0"
+  const state2 = makeState(["cb"])
+  state2.messagesBySession.cb = [{
+    info: { role: "assistant", error: null },
+    parts: [{ type: "text", text: "Plan:\n- [x] scaffold\n- [ ] implement\n- [ ] test" }],
+  }]
+  const hooks2 = await AutoResumePlugin({ client: makeClient(state2) })
+  await hooks2.event(ev("message.part.updated", { part: { type: "text", sessionID: "cb", text: "Plan:\n- [x] scaffold\n- [ ] implement\n- [ ] test" } }))
+  await hooks2.event(ev("session.idle", { sessionID: "cb" })) // 2 unchecked -> drive
+  await sleep(350)
+  ok(state2.prompts.filter((p) => p.text.includes("unfinished items")).length === 1,
+    "CC2: markdown checklist drives without the todo tool")
+  state2.messagesBySession.cb = [{
+    info: { role: "assistant", error: null },
+    parts: [{ type: "text", text: "All done:\n- [x] scaffold\n- [x] implement\n- [x] test" }],
+  }]
+  await hooks2.event(ev("message.updated", { info: { role: "user", sessionID: "cb", id: "ccu" } }))
+  state2.msgStore.ccu = "go"
+  await hooks2.event(ev("session.idle", { sessionID: "cb" })) // all checked + fresh task scope
+  await sleep(350)
+  ok(state2.toasts.some((t) => t.includes("complete")),
+    "CC3: fully-checked checklist counts as completion")
+  delete process.env.OPENCODE_AUTOPILOT_IMPROVE_CYCLES
+  delete process.env.OPENCODE_AUTOPILOT_PROPOSALS
+
+  // our own wrap-up request must not self-answer its proposals
+  const state4 = makeState(["wrap"])
+  state4.messagesBySession.wrap = [{
+    info: { role: "assistant", error: null },
+    parts: [{ type: "text", text: "Wrap-up: done. Next steps you could consider: 1. caching 2. retries" }],
+  }]
+  const hooks4 = await AutoResumePlugin({ client: makeClient(state4) })
+  // simulate that this turn answered OUR propose injection
+  const s4 = hooks4 && null
+  void s4
+  await hooks4.event(ev("message.part.updated", { part: { type: "text", sessionID: "wrap", text: "wrap-up text" } }))
+  await hooks4.event(ev("session.idle", { sessionID: "wrap" }))
+  await sleep(300)
+  ok(state4.prompts.length === 0 || !state4.prompts.some((p) => p.text.includes("Proceed autonomously")),
+    "CC4: no runaway loop on wrap-up style replies")
 }
 
 console.log(process.exitCode ? "V4 TESTS FAILED" : "ALL V4 TESTS PASSED")

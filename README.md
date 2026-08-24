@@ -17,8 +17,9 @@ OpenCode gives you free LLM coding agents — which is awesome. Unfortunately, c
 - 🩹 **heals interruptions** — network failures, provider outages, timeouts, truncations, stalls, even crashed servers are recovered without you
 - 🔁 **rotates models automatically** — free tier exhausted? Provider down? It moves your task to the strongest healthy model mid-conversation, no input needed
 - ✅ **answers permission prompts** — safe-mode autopilot approves routine work and rejects anything dangerous while you're gone
-- 🚀 **drives tasks to done** — unfinished todos get finished, the agent's own questions get answered, "Continue to finalize." actually continues
+- 🚀 **drives tasks to done** — unfinished todos get finished (including checklists the model writes in plain replies), "Continue to finalize.", "Remaining things to do:" and similar turn-endings actually continue, and the agent's own questions get answered
 - 💎 **goes beyond done** — when the model declares victory, it's sent back to critique and improve its own work before you ever see it
+- 🔄 **updates itself** — checks GitHub daily and swaps in new releases automatically (one OpenCode restart to apply; opt-out available)
 
 Install it once, prompt a big task, go to sleep. Come back to completed work.
 
@@ -121,6 +122,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_RETRY_FUTURE_CAP_MS` | `600000` | Next-retry scheduled further out ⇒ takeover |
 | `OPENCODE_RESUME_REANIMATE` | `true` | Revive crashed sessions on startup |
 | `OPENCODE_RESUME_REANIMATE_WINDOW_MS` | `600000` | Max age of sessions eligible for revival |
+| `OPENCODE_RESUME_AUTO_UPDATE` | `true` | Self-update daily from GitHub (applies on next OpenCode restart) |
 | `OPENCODE_RESUME_BREAKER_THRESHOLD` / `_WINDOW_MS` / `_COOLDOWN_MS` | `6` / `900000` / `300000` | Global circuit breaker |
 | `OPENCODE_RESUME_COMPACT_ON_OVERFLOW` | `true` | Summarize + resume on overflow |
 | `OPENCODE_RESUME_SWITCH_ON_QUOTA` | `true` | Rotate on free-tier exhaustion |
