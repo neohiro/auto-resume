@@ -158,5 +158,46 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(state.prompts.length === 0, "AA: subagent failure left to parent orchestrator")
 }
 
+// ---- BB: continuation stubs without question marks --------------------------
+{
+  const state = makeState(["fin"])
+  state.messagesBySession.fin = [{
+    info: { role: "assistant", error: null },
+    parts: [{ type: "text", text: "Continue to finalize." }],
+  }]
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "fin", text: "Continue to finalize." } }))
+  await hooks.event(ev("session.idle", { sessionID: "fin" }))
+  await sleep(350)
+  ok(state.prompts.some((p) => p.text.includes("indicating there is still work to do")),
+    "BB: 'Continue to finalize.' keeps the task going")
+
+  const state2 = makeState(["ell"])
+  state2.messagesBySession.ell = [{
+    info: { role: "assistant", error: null },
+    parts: [{ type: "text", text: "Continuing..." }],
+  }]
+  const hooks2 = await AutoResumePlugin({ client: makeClient(state2) })
+  await hooks2.event(ev("message.part.updated", { part: { type: "text", sessionID: "ell", text: "Continuing..." } }))
+  await hooks2.event(ev("session.idle", { sessionID: "ell" }))
+  await sleep(350)
+  ok(state2.prompts.length === 1, "BB: 'Continuing...' detected")
+
+  // long genuine summary mentioning 'continue' in prose must not re-trigger
+  const longSummary = "The migration is complete: all 42 tables were moved, every index rebuilt from scratch, and the full test suite passes locally and in CI. Documentation was updated across the three affected modules. If you ever want to extend this further, you can continue with the reporting module in a follow-up session."
+  ok(longSummary.length > 250, "BB precondition: summary is long")
+  const state3 = makeState(["done"])
+  state3.messagesBySession.done = [{
+    info: { role: "assistant", error: null },
+    parts: [{ type: "text", text: longSummary }],
+  }]
+  const hooks3 = await AutoResumePlugin({ client: makeClient(state3) })
+  await hooks3.event(ev("message.part.updated", { part: { type: "text", sessionID: "done", text: longSummary } }))
+  await hooks3.event(ev("session.idle", { sessionID: "done" }))
+  await sleep(350)
+  ok(!state3.prompts.some((p) => p.text.includes("still work to do")),
+    "BB: finished summaries are not misread as continuation stubs")
+}
+
 console.log(process.exitCode ? "V4 TESTS FAILED" : "ALL V4 TESTS PASSED")
 

@@ -187,6 +187,9 @@ const PROMPTS = {
   proceed: () =>
     `${RESUME_TAG} Proceed autonomously with exactly what you just proposed or asked about — the answer is yes. Do not ask again; decide and continue.` +
     AUTONOMY_DIRECTIVE,
+  keepGoing: () =>
+    `${RESUME_TAG} You ended your reply indicating there is still work to do ("continue", "finalize", etc.) but the turn stopped. Pick up exactly where you left off right now and finish it. Do not restate what is already done.` +
+    AUTONOMY_DIRECTIVE,
   debug: () =>
     `${RESUME_TAG} The last several tool calls failed repeatedly. Stop repeating the same failing approach. Diagnose the actual root cause first (read the full error output, inspect relevant files/state), form a hypothesis, then apply a targeted fix.`,
   improve: (cycle, total) =>
@@ -246,6 +249,32 @@ const QUESTION_PATTERNS = [
   /\bawait(ing)? (your|further) (confirmation|instructions|approval|input)\b/i,
   /\bwaiting for your\b/i, /\bprompt (me|you) when\b/i,
 ]
+
+/** Turn-ending continuation stubs: the agent announced more work but stopped
+ *  ("Continue to finalize.", "Continuing...", "To be continued.") without a
+ *  question mark — so the question detector never fires on these. */
+const CONTINUATION_ANYWHERE = [
+  /\bcontinue to finalize\b/i,
+  /\bto be continued\b/i,
+  /\bwill continue\b/i,
+  /\bcontinu(e|ing) (in the next|with the next|shortly|below)\b/i,
+  /\bmore (to come|coming soon|follows)\b/i,
+]
+const CONTINUATION_STEM = /^(continue|continuing|resumed?|proceeding|finalizing|finalize|finishing|finishing up|wrapping up|next up|partial(?:ly)? (?:done|complete)|incomplete)\b/i
+
+/** A short closing line announcing unfinished work. */
+const looksLikeContinuationStub = (text) => {
+  const t = String(text ?? "").trim()
+  if (!t || t.length > 250) return false
+  return CONTINUATION_STEM.test(t) || CONTINUATION_ANYWHERE.some((re) => re.test(t))
+}
+
+/** Unambiguous phrases count even inside longer replies. */
+const looksLikeContinuationLong = (text) => {
+  const t = String(text ?? "").trim()
+  if (!t) return false
+  return CONTINUATION_ANYWHERE.some((re) => re.test(t))
+}
 
 const tierScore = (modelID) => {
   let score = 0
@@ -861,18 +890,25 @@ export const AutoResumePlugin = async ({ client }) => {
       const open = todos.filter((t) => t.status === "pending" || t.status === "in_progress")
       const finished = todos.filter((t) => t.status === "completed" || t.status === "cancelled")
 
-      // The agent ended its turn by asking a question instead of doing —
-      // answer it ourselves and keep the task moving.
+      // The agent ended its turn by asking a question or announcing more
+      // work ("Continue to finalize.") instead of finishing — keep it going.
       if (open.length === 0 && cfg.autonomy && cfg.proceedOnAsk &&
           s.proceedCount < cfg.maxProceeds && s.nudges < cfg.maxNudges && budgetLeft(s)) {
         const text = (lastAssistant.parts ?? [])
           .map((x) => (x?.type === "text" ? x.text : "")).join(" ")
-        if (text && QUESTION_PATTERNS.some((re) => re.test(text))) {
-          s.proceedCount += 1
-          s.nudges += 1
-          log("info", "agent asked a question — proceeding autonomously", { sessionID })
-          schedule(sessionID, cfg.nudgeDelayMs, { kind: "proceed", prompt: PROMPTS.proceed })
-          return
+        if (text && text.trim()) {
+          const asked = QUESTION_PATTERNS.some((re) => re.test(text))
+          const stubbed = looksLikeContinuationStub(text) || looksLikeContinuationLong(text)
+          if (asked || stubbed) {
+            s.proceedCount += 1
+            s.nudges += 1
+            log("info", asked ? "agent asked a question — proceeding autonomously" : "agent announced continuation but stopped — resuming", { sessionID })
+            schedule(sessionID, cfg.nudgeDelayMs, {
+              kind: "proceed",
+              prompt: asked ? PROMPTS.proceed : PROMPTS.keepGoing,
+            })
+            return
+          }
         }
       }
 

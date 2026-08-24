@@ -2,7 +2,7 @@
 
 # auto-resume
 
-**Self-healing sessions for [OpenCode](https://opencode.ai) — hand it a big task, walk away, come back to finished work.**
+**Free AI coding agents that don't fall asleep on the job.**
 
 Recovery · Model rotation · Permission autopilot · Task autonomy
 
@@ -10,11 +10,23 @@ Recovery · Model rotation · Permission autopilot · Task autonomy
 
 ---
 
+OpenCode gives you free LLM coding agents — which is awesome. Unfortunately, compared to other agentic coding software, its sessions are **prone to interruptions**: one network hiccup, rate limit, provider outage or max-token cutoff and your carefully prompted task just… stops. You walk away expecting a finished product and come back to an error message.
+
+**auto-resume makes OpenCode sessions effectively unkillable.** It sits quietly in the background of every session and:
+
+- 🩹 **heals interruptions** — network failures, provider outages, timeouts, truncations, stalls, even crashed servers are recovered without you
+- 🔁 **rotates models automatically** — free tier exhausted? Provider down? It moves your task to the strongest healthy model mid-conversation, no input needed
+- ✅ **answers permission prompts** — safe-mode autopilot approves routine work and rejects anything dangerous while you're gone
+- 🚀 **drives tasks to done** — unfinished todos get finished, the agent's own questions get answered, "Continue to finalize." actually continues
+- 💎 **goes beyond done** — when the model declares victory, it's sent back to critique and improve its own work before you ever see it
+
+Install it once, prompt a big task, go to sleep. Come back to completed work.
+
+This is what auto-resume is for.
+
+---
+
 `auto-resume` is a single-file OpenCode plugin that turns flaky, interruption-prone AI coding sessions into unattended ones. It hooks into OpenCode's event bus and keeps work alive whenever something dies — network blips, provider outages, free-tier limits, max-token truncations, stalled streams, permission prompts, unfinished todo lists — and then goes one step further: it makes the model **critique and improve its own finished work**.
-
-## Why
-
-OpenCode already retries transient provider errors a few times internally. But when those attempts run out, the session just stops: you return to an error, a half-finished refactor, or a silent hang. This plugin picks up where the built-in retry ends and drives the task to completion.
 
 ## What it does
 
@@ -158,8 +170,9 @@ git clone https://github.com/neohiro/auto-resume && cd auto-resume
 npm test        # 46 assertions across 4 suites, mocked SDK, no OpenCode needed
 ```
 
-The test suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops) against a mocked client and assert on every injected prompt, abort, permission response, and toast.
+The five suites (60+ assertions) simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops) against a mocked client and assert on every injected prompt, abort, permission response, and toast.
 
 ## License
 
 [MIT](LICENSE)
+
