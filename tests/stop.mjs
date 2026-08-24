@@ -5,6 +5,8 @@ process.env.OPENCODE_RESUME_MAX_DELAY_MS ??= "500"
 process.env.OPENCODE_RESUME_NUDGE_DELAY_MS ??= "30"
 process.env.OPENCODE_RESUME_TOAST_THROTTLE_MS ??= "0"
 process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
+// keep the stop-store out of the repo dir unless a suite overrides it
+process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), "ar-stop-default.json")
 
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -198,8 +200,9 @@ const ev = (type, properties) => ({ event: { type, properties } })
   const hooks = await AutoResumePlugin({ client: makeClient(state) })
   await hooks.event(ev("todo.updated", { sessionID: "s10", todos: [{ title: "t", status: "pending" }] }))
   await hooks.event(ev("session.error", { sessionID: "s10", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
-  await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "s10", id: "own1" } }))
+  // the handler fetches the message text DURING dispatch — register it first
   state.msgStore.own1 = "[auto-resume] Continue working through them autonomously now, one by one."
+  await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "s10", id: "own1" } }))
   await hooks.event(ev("session.idle", { sessionID: "s10" })) // todos pending, but stop stands
   await sleep(350)
   ok(!state.prompts.some((p) => p.text.includes("unfinished items")),
@@ -233,8 +236,9 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await sleep(200)
   const raw = JSON.parse(await readFile(process.env.OPENCODE_RESUME_STOPSTORE, "utf8"))
   ok(!raw.p1, "S11: cleared stop removed from the persistent store")
-  delete process.env.OPENCODE_RESUME_STOPSTORE
   await rm(dir, { recursive: true, force: true })
+  // keep a valid store path for any later suites
+  process.env.OPENCODE_RESUME_STOPSTORE = join(tmpdir(), "ar-stop-after-s11.json")
 }
 
 console.log(process.exitCode ? "STOP TESTS FAILED" : "ALL STOP TESTS PASSED")

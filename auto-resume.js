@@ -132,7 +132,7 @@
  *  OPENCODE_AUTOPILOT_MAX_COST_USD       spend cap per task, USD     (10, 0=off)
  */
 
-import { writeFile, rename } from "node:fs/promises"
+import { writeFile, rename, unlink } from "node:fs/promises"
 
 const AUTO_RESUME_VERSION = "1.5.0"
 const UPDATE_URL =
@@ -433,16 +433,41 @@ export const AutoResumePlugin = async ({ client }) => {
     } catch { /* no store yet (or unreadable) — start empty */ }
   }
 
-  const saveStoppedStore = () =>
-    detach(async () => {
-      if (!STOP_STORE_PATH) return
-      const out = {}
-      const cutoff = Date.now() - STOP_STORE_TTL_MS
-      for (const [id, ts] of persistedStops) if (ts > cutoff) out[id] = ts
-      const tmp = `${STOP_STORE_PATH}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
-      await writeFile(tmp, JSON.stringify(out, null, 2), "utf8")
-      await rename(tmp, STOP_STORE_PATH)
-    }, "stop-store-save")
+  const writeStopStoreOnce = async () => {
+    if (!STOP_STORE_PATH) return
+    const out = {}
+    const cutoff = Date.now() - STOP_STORE_TTL_MS
+    for (const [id, ts] of persistedStops) if (ts > cutoff) out[id] = ts
+    const payload = JSON.stringify(out, null, 2)
+    const tmp = `${STOP_STORE_PATH}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
+    await writeFile(tmp, payload, "utf8")
+    // Windows: freshly written files can be briefly locked (AV/indexer), so
+    // the atomic rename may fail with EPERM/EACCES/EBUSY — retry with
+    // backoff, then fall back to a plain overwrite of the final path.
+    for (const delayMs of [25, 50, 100, 200, 400]) {
+      try {
+        await rename(tmp, STOP_STORE_PATH)
+        return
+      } catch (err) {
+        if (!["EPERM", "EACCES", "EBUSY", "EEXIST"].includes(err?.code)) throw err
+        await new Promise((r) => setTimeout(r, delayMs))
+      }
+    }
+    try {
+      await writeFile(STOP_STORE_PATH, payload, "utf8")
+    } finally {
+      try { await unlink(tmp) } catch { /* best effort */ }
+    }
+  }
+
+  // Serialize saves: overlapping renames on the same destination are the
+  // main source of transient Windows sharing violations.
+  let stopSaveChain = Promise.resolve()
+  const saveStoppedStore = () => {
+    stopSaveChain = stopSaveChain.then(writeStopStoreOnce).catch((err) =>
+      log("warn", "could not persist user-stop", { err: err?.message ?? String(err) }))
+    return stopSaveChain
+  }
 
   /** Stopped = flagged live this run OR remembered from a previous run. */
   const isUserStopped = (sessionID) =>
