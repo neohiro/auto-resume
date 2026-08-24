@@ -128,7 +128,7 @@
 
 import { writeFile, rename } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.4.0"
+const AUTO_RESUME_VERSION = "1.4.1"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
