@@ -77,6 +77,10 @@
  * wall-clock budget, spin detection, circuit breaker with cool-down,
  * incident-signature dedupe, idle-status check before every injection.
  * All injected user messages are tagged "[auto-resume]" for visibility.
+ * Each engaged session also carries a live title tag —
+ *   "<title> [auto-resume: 🟢 armed | 🔁 recovering | ⏸️ stopped | 🚫 paused]"
+ * Turning auto-resume off for a session ("auto-resume off" in chat) removes
+ * every trace of it from the title until "auto-resume on" is sent.
  *
  * ══════════════════════════════════════════════════════════════════
  *  CONFIGURATION (env vars, all optional)
@@ -129,12 +133,14 @@
  *  OPENCODE_RESUME_AUTO_UPDATE           self-update daily from GitHub (true)
  *  OPENCODE_RESUME_STOPSTORE             user-stop memory file
  *                                        (<plugin dir>/auto-resume.js.stopped.json)
+ *  OPENCODE_RESUME_OFFSTORE              per-session opt-out memory file
+ *                                        (<plugin dir>/auto-resume.js.off.json)
  *  OPENCODE_AUTOPILOT_MAX_COST_USD       spend cap per task, USD     (10, 0=off)
  */
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.5.0"
+const AUTO_RESUME_VERSION = "1.6.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -408,74 +414,228 @@ export const AutoResumePlugin = async ({ client }) => {
     } catch { return null }
   })()
 
-  // ── persistent memory of user stops (survives OpenCode restarts) ──────
-  // A session the user stopped must never be auto-started again — not by
-  // recovery, not by re-animation after a crash/restart — until they send a
-  // new prompt. The markers live in a tiny JSON sidecar next to this file.
-  const STOP_STORE_PATH = str("OPENCODE_RESUME_STOPSTORE", selfPath ? `${selfPath}.stopped.json` : "")
-  const STOP_STORE_TTL_MS = 14 * 86_400_000 // forget ancient markers
-  const persistedStops = new Map() // sessionID -> stoppedAt
-  let stopStoreLoading = null
+  // ── persistent JSON sidecars next to this file ─────────────────────────
+  // Two tiny maps survive OpenCode restarts:
+  //   • .stopped.json — sessions the user STOPPED (quiet until next prompt)
+  //   • .off.json     — sessions where auto-resume is turned OFF entirely
+  const STORE_TTL_MS = 14 * 86_400_000 // forget ancient markers
 
-  /** Single-flight: every caller awaits the SAME read, so a revival scan
-   *  racing the init load always observes the fully restored markers. */
-  const loadStoppedStore = () => {
-    if (!STOP_STORE_PATH) return Promise.resolve()
-    stopStoreLoading ??= (async () => {
-      try {
-        const { readFile } = await import("node:fs/promises")
-        const raw = JSON.parse(await readFile(STOP_STORE_PATH, "utf8"))
-        const cutoff = Date.now() - STOP_STORE_TTL_MS
-        if (raw && typeof raw === "object") {
-          for (const [id, ts] of Object.entries(raw)) {
-            if (typeof ts === "number" && ts > cutoff) persistedStops.set(id, ts)
+  const makeMapStore = (label, path) => {
+    const map = new Map() // sessionID -> timestamp
+    let loading = null
+    let saveChain = Promise.resolve()
+    const load = () => {
+      if (!path) return Promise.resolve()
+      // Single-flight: every caller awaits the SAME read, so a revival scan
+      // racing the init load always observes the fully restored markers.
+      loading ??= (async () => {
+        try {
+          const { readFile } = await import("node:fs/promises")
+          const raw = JSON.parse(await readFile(path, "utf8"))
+          const cutoff = Date.now() - STORE_TTL_MS
+          if (raw && typeof raw === "object") {
+            for (const [id, ts] of Object.entries(raw)) {
+              if (typeof ts === "number" && ts > cutoff) map.set(id, ts)
+            }
           }
+          log("info", `restored persisted ${label}`, { count: map.size })
+        } catch { /* no store yet (or unreadable) — start empty */ }
+      })()
+      return loading
+    }
+    const writeOnce = async () => {
+      if (!path) return
+      const out = {}
+      const cutoff = Date.now() - STORE_TTL_MS
+      for (const [id, ts] of map) if (ts > cutoff) out[id] = ts
+      const payload = JSON.stringify(out, null, 2)
+      const tmp = `${path}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
+      await writeFile(tmp, payload, "utf8")
+      // Windows: freshly written files can be briefly locked (AV/indexer), so
+      // the atomic rename may fail with EPERM/EACCES/EBUSY — retry with
+      // backoff, then fall back to a plain overwrite of the final path.
+      for (const delayMs of [25, 50, 100, 200, 400]) {
+        try {
+          await rename(tmp, path)
+          return
+        } catch (err) {
+          if (!["EPERM", "EACCES", "EBUSY", "EEXIST"].includes(err?.code)) throw err
+          await new Promise((r) => setTimeout(r, delayMs))
         }
-        log("info", "restored persisted user-stops", { count: persistedStops.size })
-      } catch { /* no store yet (or unreadable) — start empty */ }
-    })()
-    return stopStoreLoading
-  }
-
-  const writeStopStoreOnce = async () => {
-    if (!STOP_STORE_PATH) return
-    const out = {}
-    const cutoff = Date.now() - STOP_STORE_TTL_MS
-    for (const [id, ts] of persistedStops) if (ts > cutoff) out[id] = ts
-    const payload = JSON.stringify(out, null, 2)
-    const tmp = `${STOP_STORE_PATH}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
-    await writeFile(tmp, payload, "utf8")
-    // Windows: freshly written files can be briefly locked (AV/indexer), so
-    // the atomic rename may fail with EPERM/EACCES/EBUSY — retry with
-    // backoff, then fall back to a plain overwrite of the final path.
-    for (const delayMs of [25, 50, 100, 200, 400]) {
+      }
       try {
-        await rename(tmp, STOP_STORE_PATH)
-        return
-      } catch (err) {
-        if (!["EPERM", "EACCES", "EBUSY", "EEXIST"].includes(err?.code)) throw err
-        await new Promise((r) => setTimeout(r, delayMs))
+        await writeFile(path, payload, "utf8")
+      } finally {
+        try { await unlink(tmp) } catch { /* best effort */ }
       }
     }
-    try {
-      await writeFile(STOP_STORE_PATH, payload, "utf8")
-    } finally {
-      try { await unlink(tmp) } catch { /* best effort */ }
+    // Serialize saves: overlapping renames on the same destination are the
+    // main source of transient Windows sharing violations.
+    const save = () => {
+      saveChain = saveChain.then(writeOnce).catch((err) =>
+        log("warn", `could not persist ${label}`, { err: err?.message ?? String(err) }))
+      return saveChain
     }
+    return { map, load, save }
   }
 
-  // Serialize saves: overlapping renames on the same destination are the
-  // main source of transient Windows sharing violations.
-  let stopSaveChain = Promise.resolve()
-  const saveStoppedStore = () => {
-    stopSaveChain = stopSaveChain.then(writeStopStoreOnce).catch((err) =>
-      log("warn", "could not persist user-stop", { err: err?.message ?? String(err) }))
-    return stopSaveChain
-  }
+  const stopStore = makeMapStore(
+    "user-stops",
+    str("OPENCODE_RESUME_STOPSTORE", selfPath ? `${selfPath}.stopped.json` : ""),
+  )
+  const offStore = makeMapStore(
+    "opt-outs",
+    str("OPENCODE_RESUME_OFFSTORE", selfPath ? `${selfPath}.off.json` : ""),
+  )
+  const persistedStops = stopStore.map
 
   /** Stopped = flagged live this run OR remembered from a previous run. */
   const isUserStopped = (sessionID) =>
     Boolean(sessions.get(sessionID)?.userStopped || persistedStops.has(sessionID))
+
+  /** Opted out = auto-resume fully disabled for this session by the user. */
+  const isOptedOut = (sessionID) => offStore.map.has(sessionID)
+
+  /** Anything automation might do for this session is blocked. */
+  const suppressed = (sessionID) => isUserStopped(sessionID) || isOptedOut(sessionID)
+
+  // ── per-session title indicator ────────────────────────────────────────
+  // While auto-resume is enabled for a session, its title carries a trailing
+  // "[auto-resume: <icon> <status>]" tag. Turning it off restores the exact
+  // previous title — no trace of the plugin remains.
+  const TITLE_MARK_TEST = /\[auto-resume:/i
+  const TITLE_MARK_STRIP = /\s*\[auto-resume:[^\]]*\]/gi
+  const STATUS_STYLE = {
+    armed:      { glyph: "🟢", label: "armed" },
+    recovering: { glyph: "🔁", label: "recovering" },
+    stopped:    { glyph: "⏸️", label: "stopped" },
+    paused:     { glyph: "🚫", label: "paused" },
+  }
+  const knownTitles = new Map()   // sessionID -> latest raw title we saw
+  const writtenTitles = new Map() // sessionID -> last title this plugin wrote
+  const titleTimers = new Map()   // sessionID -> debounce timer
+
+  const statusKeyOf = (sessionID) => {
+    const s = sessions.get(sessionID)
+    if (s?.userStopped || persistedStops.has(sessionID)) return "stopped"
+    const capped = Boolean(
+      s && (
+        s.costToasted ||
+        (cfg.maxTaskCostUsd > 0 && s.taskCost >= cfg.maxTaskCostUsd) ||
+        s.chain >= cfg.maxChain ||
+        s.nudges >= cfg.maxNudges ||
+        s.rotations >= cfg.maxRotations ||
+        (cfg.budgetMs > 0 && s.taskStartAt && Date.now() - s.taskStartAt >= cfg.budgetMs)
+      ),
+    )
+    if (capped) return "paused"
+    if (s && (s.chain > 0 || s.pendingResume || s.retryEnteredAt || s.stallResumes > 0)) {
+      return "recovering"
+    }
+    return "armed"
+  }
+
+  const resolveSessionUpdate = () => {
+    const ns = client.session ?? {}
+    return (
+      ns.update ?? ns.updateSessionById ?? ns.patchSessionById ?? ns.patchSessionId ?? null
+    )
+  }
+
+  const fetchSessionTitle = async (sessionID) => {
+    const ns = client.session ?? {}
+    try {
+      const get = ns.get ?? ns.getSessionById
+      if (typeof get === "function") {
+        const res = await get.call(ns, { path: { id: sessionID } })
+        const data = res?.data ?? res
+        if (typeof data?.title === "string") return data.title
+      }
+    } catch { /* fall through to list */ }
+    try {
+      const res = await client.session.list()
+      const list = (res?.data ?? res) ?? []
+      const hit = Array.isArray(list) ? list.find((x) => x?.id === sessionID) : null
+      if (typeof hit?.title === "string") return hit.title
+    } catch { /* ignore */ }
+    return null
+  }
+
+  const refreshTitleNow = async (sessionID) => {
+    try {
+      if (sessions.get(sessionID)?.child) return
+      const update = resolveSessionUpdate()
+      if (typeof update !== "function") return
+      let raw = knownTitles.get(sessionID)
+      if (raw == null) {
+        raw = await fetchSessionTitle(sessionID)
+        if (raw == null) return
+        knownTitles.set(sessionID, raw)
+      }
+      const base = raw.replace(TITLE_MARK_STRIP, "").trimEnd()
+      if (isOptedOut(sessionID)) {
+        // Off: restore the pristine title — remove every trace of us.
+        if (base !== raw) {
+          await update.call(client.session, { path: { id: sessionID }, body: { title: base } })
+          log("info", "title restored (auto-resume off)", { sessionID })
+        }
+        writtenTitles.delete(sessionID)
+        knownTitles.set(sessionID, base)
+        return
+      }
+      const style = STATUS_STYLE[statusKeyOf(sessionID)]
+      const target = `${base} [auto-resume: ${style.glyph} ${style.label}]`
+      if (target === raw || target === writtenTitles.get(sessionID)) return
+      await update.call(client.session, { path: { id: sessionID }, body: { title: target } })
+      writtenTitles.set(sessionID, target)
+      knownTitles.set(sessionID, target)
+      log("info", `title indicator → ${style.label}`, { sessionID })
+    } catch (err) {
+      log("warn", "title indicator update failed", { sessionID, err: err?.message ?? String(err) })
+    }
+  }
+
+  /** Coalesce bursts of transitions into one PATCH per session. */
+  const queueTitleRefresh = (sessionID) => {
+    if (sessions.get(sessionID)?.child) return
+    const existing = titleTimers.get(sessionID)
+    if (existing) clearTimeout(existing)
+    const t = setTimeout(() => {
+      titleTimers.delete(sessionID)
+      detach(refreshTitleNow(sessionID), "title-refresh")
+    }, 250)
+    t.unref?.()
+    titleTimers.set(sessionID, t)
+  }
+
+  /** In-chat switch: "auto-resume off" disables everything for THIS session;
+   *  "auto-resume on" re-enables and starts fresh. Persisted across restarts. */
+  const handleToggleCommand = (sessionID, mode) => {
+    const s = state(sessionID)
+    if (mode === "off") {
+      offStore.map.set(sessionID, Date.now())
+      offStore.save()
+      // an explicit opt-out supersedes any stop marker
+      if (persistedStops.delete(sessionID)) stopStore.save()
+      s.userStopped = false
+      const t = timers.get(sessionID)
+      if (t) { clearTimeout(t); timers.delete(sessionID) }
+      log("info", "auto-resume disabled for session", { sessionID })
+      toast(`${RESUME_TAG}: Off for this session — nothing will be automated here until you say "auto-resume on".`, "info")
+      queueTitleRefresh(sessionID)
+      return
+    }
+    const wasOff = isOptedOut(sessionID)
+    if (offStore.map.delete(sessionID)) offStore.save()
+    if (persistedStops.delete(sessionID)) stopStore.save()
+    resetTaskScope(s)
+    s.userStopped = false
+    s.currentModel = null
+    s.emptyNudges = 0
+    log("info", "auto-resume enabled for session", { sessionID })
+    toast(`${RESUME_TAG}: ${wasOff ? "On again for this session" : "Already on here"} — armed. 🟢`, "info")
+    queueTitleRefresh(sessionID)
+  }
 
   const state = (id) => {
     let s = sessions.get(id)
@@ -695,6 +855,7 @@ export const AutoResumePlugin = async ({ client }) => {
       sessionID, from: exhausted ? modelKey(exhausted) : null, to: modelKey(alt), reason,
     })
     toast(`${RESUME_TAG}: ${reason} on ${exhausted ? modelKey(exhausted) : "model"} — continuing on ${modelKey(alt)}.`)
+    queueTitleRefresh(sessionID)
     return true
   }
 
@@ -706,11 +867,12 @@ export const AutoResumePlugin = async ({ client }) => {
     if (s.userStopped) return
     s.userStopped = true
     persistedStops.set(sessionID, Date.now())
-    saveStoppedStore()
+    stopStore.save()
     const t = timers.get(sessionID)
     if (t) { clearTimeout(t); timers.delete(sessionID) }
     log("info", "user stop detected — automation paused until next prompt", { sessionID, why })
     toast(`${RESUME_TAG}: Stopped by you — staying quiet until your next prompt.`, "info")
+    queueTitleRefresh(sessionID)
   }
 
   /** Aborts issued by our own takeover (stall/retry restarts) must never read
@@ -719,7 +881,7 @@ export const AutoResumePlugin = async ({ client }) => {
     s.takeoverAt > 0 && Date.now() - s.takeoverAt < 10_000
 
   const schedule = (sessionID, delayMs, plan) => {
-    if (isUserStopped(sessionID)) {
+    if (suppressed(sessionID)) {
       log("info", `not scheduling "${plan.kind}" — session was stopped by the user`, { sessionID })
       return
     }
@@ -752,7 +914,7 @@ export const AutoResumePlugin = async ({ client }) => {
   const runPlan = async (sessionID, plan) => {
     if (!injectionAllowed(sessionID)) return
     const s0 = state(sessionID)
-    if (isUserStopped(sessionID)) {
+    if (suppressed(sessionID)) {
       log("info", `suppressed "${plan.kind}" — session was stopped by the user`, { sessionID })
       return
     }
@@ -801,6 +963,7 @@ export const AutoResumePlugin = async ({ client }) => {
     try {
       await client.session.prompt({ path: { id: sessionID }, body })
       log("info", `injected "${plan.kind}"`, { sessionID, model: model ? modelKey(model) : undefined })
+      queueTitleRefresh(sessionID)
     } catch (err) {
       log("error", "resume prompt rejected", { sessionID, err: err?.message ?? String(err) })
       noteResumeFailure()
@@ -820,8 +983,8 @@ export const AutoResumePlugin = async ({ client }) => {
       return
     }
     const s = state(sessionID)
-    if (isUserStopped(sessionID)) {
-      log("info", "ignoring error — session was stopped by the user", { sessionID })
+    if (suppressed(sessionID)) {
+      log("info", "ignoring error — automation is off for this session", { sessionID })
       return
     }
     const nowMs = Date.now()
@@ -840,6 +1003,7 @@ export const AutoResumePlugin = async ({ client }) => {
     log("warn", `session error (${kind})`, {
       sessionID, name: error?.name, statusCode: error?.data?.statusCode, message: error?.data?.message,
     })
+    queueTitleRefresh(sessionID)
 
     if (kind === "abort") {
       if (isOwnTakeoverAbort(s)) {
@@ -1022,12 +1186,14 @@ export const AutoResumePlugin = async ({ client }) => {
 
   const evaluateIdle = async (sessionID) => {
     const s = state(sessionID)
-    if (isUserStopped(sessionID)) { s.awaitingCompactionSince = 0; return }
+    if (suppressed(sessionID)) { s.awaitingCompactionSince = 0; return }
     const relevant =
       s.lastErrorName || s.lastResumeAt || s.continueCount ||
       s.todos.length || s.lastTurnHadText
     s.awaitingCompactionSince = 0
     if (!relevant) return
+    // any engaged session shows its indicator while auto-resume is enabled
+    queueTitleRefresh(sessionID)
 
     let entries = []
     try {
@@ -1169,6 +1335,7 @@ export const AutoResumePlugin = async ({ client }) => {
     s.retryNext = 0
     log("warn", why, { sessionID })
     toast(toastMsg)
+    queueTitleRefresh(sessionID)
     detach(async () => {
       try { await client.session.abort({ path: { id: sessionID } }) } catch { /* already dead */ }
       setTimeout(() => schedule(sessionID, 800, { kind: "resume", prompt: PROMPTS.resume }), 1_500).unref?.()
@@ -1180,10 +1347,17 @@ export const AutoResumePlugin = async ({ client }) => {
     // Memory hygiene: drop state for sessions that have been idle for hours.
     for (const [sessionID, s] of sessions) {
       if (s.status === "busy" || s.status === "retry") continue
-      if (nowMs - s.lastActivity > 21_600_000) sessions.delete(sessionID)
+      if (nowMs - s.lastActivity > 21_600_000) {
+        sessions.delete(sessionID)
+        knownTitles.delete(sessionID)
+        writtenTitles.delete(sessionID)
+        const tt = titleTimers.get(sessionID)
+        if (tt) clearTimeout(tt)
+        titleTimers.delete(sessionID)
+      }
     }
     for (const [sessionID, s] of sessions) {
-      if (s.child || isUserStopped(sessionID)) continue
+      if (s.child || suppressed(sessionID)) continue
 
       // A session parked in OpenCode's internal retry loop can wait for a
       // provider-specified Retry-After of effectively unlimited length.
@@ -1222,7 +1396,7 @@ export const AutoResumePlugin = async ({ client }) => {
   // that was mid-recovery or awaiting its first reply. On startup we scan
   // recent sessions and give those a fresh continuation.
   const reanimate = async () => {
-    await loadStoppedStore() // markers must be known before any revival decision
+    await Promise.all([stopStore.load(), offStore.load()]) // markers known before any revival decision
     if (!cfg.reanimate) return
     let list = []
     try {
@@ -1236,8 +1410,9 @@ export const AutoResumePlugin = async ({ client }) => {
     const cutoff = Date.now() - cfg.reanimateWindowMs
     for (const sess of list) {
       if (!sess?.id || sess.parentID) continue // subagents belong to parents
-      // The user stopped this session: never auto-start it, whatever happened.
-      if (persistedStops.has(sess.id)) continue
+      // The user stopped this session or turned auto-resume off here:
+      // never auto-start it, whatever happened.
+      if (suppressed(sess.id)) continue
       if ((sess.time?.updated ?? 0) < cutoff) continue // too old to be a crash victim
       const s = state(sess.id)
       if (s.reanimated) continue
@@ -1395,24 +1570,34 @@ export const AutoResumePlugin = async ({ client }) => {
               // fetching the stored message text and matching our tag.
               const s0 = state(info.sessionID)
               let ours = false
+              let userText = ""
               if (info.id) {
                 try {
                   const res = await client.session.message({
                     path: { id: info.sessionID, messageID: info.id },
                   })
                   const data = res?.data ?? res
-                  const text = (data?.parts ?? [])
+                  userText = (data?.parts ?? [])
                     .map((x) => (x?.type === "text" ? x.text : "")).join(" ")
-                  ours = text.includes(RESUME_TAG)
+                  ours = userText.includes(RESUME_TAG)
                 } catch { ours = false }
+              }
+              // In-chat switch: exactly "auto-resume off" / "auto-resume on"
+              // (leading "/" allowed). Short exact match so prose never trips it.
+              const toggleCmd = /^\/?auto[- ]?resume[ :]?(off|on)[.!]?\s*$/i.exec(userText.trim())
+              if (toggleCmd) {
+                handleToggleCommand(info.sessionID, toggleCmd[1].toLowerCase())
+                break
               }
               if (!ours) {
                 // A REAL prompt starts a new workflow — lift the stop, on
                 // disk too, so future runs automate this session again.
-                if (persistedStops.delete(info.sessionID)) saveStoppedStore()
+                // (An explicit opt-out is only lifted by "auto-resume on".)
+                if (persistedStops.delete(info.sessionID)) stopStore.save()
                 resetTaskScope(s0)
                 s0.currentModel = null
                 s0.emptyNudges = 0
+                queueTitleRefresh(info.sessionID)
               }
               s0.lastTurnHadText = false // new turn begins
               break
@@ -1505,7 +1690,7 @@ export const AutoResumePlugin = async ({ client }) => {
             permissionPending.set(p.sessionID, Date.now()) // always: watchdog depends on it
             if (!p.id) break
             // After a user Stop, the human owns every decision again.
-            const decision = isUserStopped(p.sessionID) ? null : decidePermission(p)
+            const decision = suppressed(p.sessionID) ? null : decidePermission(p)
             if (decision) {
               detach(respondToPermission(p.sessionID, p, decision,
                 decision === "reject" ? "dangerous pattern" : "autopilot"), "permission")
@@ -1524,7 +1709,8 @@ export const AutoResumePlugin = async ({ client }) => {
             const nowMs = Date.now()
             if (cfg.reanimate && nowMs - lastReanimateAt > 300_000) {
               lastReanimateAt = nowMs
-    detach(loadStoppedStore, "stop-store-load")
+    detach(stopStore.load, "stop-store-load")
+    detach(offStore.load, "off-store-load")
     detach(reanimate, "reanimate")
             }
             break
@@ -1536,6 +1722,15 @@ export const AutoResumePlugin = async ({ client }) => {
             if (info?.id) {
               const s = state(info.id)
               if (info.parentID) s.child = true
+              // Adopt external renames: if the user (or core) retitled the
+              // session and our tag is gone, re-attach it to the new base.
+              if (typeof info.title === "string" && knownTitles.get(info.id) !== info.title) {
+                knownTitles.set(info.id, info.title)
+                if (writtenTitles.has(info.id) && !TITLE_MARK_TEST.test(info.title)) {
+                  writtenTitles.delete(info.id)
+                  queueTitleRefresh(info.id)
+                }
+              }
             }
             break
           }
@@ -1555,7 +1750,16 @@ export const AutoResumePlugin = async ({ client }) => {
             if (id) {
               sessions.delete(id)
               permissionPending.delete(id)
-              if (persistedStops.delete(id)) saveStoppedStore()
+              const hadMarker = persistedStops.delete(id) || offStore.map.delete(id)
+              if (hadMarker) {
+                stopStore.save()
+                offStore.save()
+              }
+              knownTitles.delete(id)
+              writtenTitles.delete(id)
+              const tt = titleTimers.get(id)
+              if (tt) clearTimeout(tt)
+              titleTimers.delete(id)
               const t = timers.get(id)
               if (t) clearTimeout(t)
               timers.delete(id)

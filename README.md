@@ -19,6 +19,7 @@ OpenCode gives you free LLM coding agents — which is awesome. Unfortunately, c
 - ✅ **answers permission prompts** — safe-mode autopilot approves routine work and rejects anything dangerous while you're gone
 - 🚀 **drives tasks to done** — unfinished todos get finished (including checklists the model writes in plain replies), "Continue to finalize.", "Remaining things to do:" and similar turn-endings actually continue, and the agent's own questions get answered
 - 💎 **goes beyond done** — when the model declares victory, it's sent back to critique and improve its own work before you ever see it
+- 🏷️ **shows itself** — engaged sessions carry a live `[auto-resume: 🟢 armed / 🔁 recovering / ⏸️ stopped / 🚫 paused]` tag behind the title; say `auto-resume off` to disable it for one session (title restored without a trace) and `auto-resume on` to re-arm
 - 🔄 **updates itself** — checks GitHub daily and swaps in new releases automatically (one OpenCode restart to apply; opt-out available)
 
 Install it once, prompt a big task, go to sleep. Come back to completed work.
@@ -136,6 +137,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_REANIMATE_WINDOW_MS` | `600000` | Max age of sessions eligible for revival |
 | `OPENCODE_RESUME_AUTO_UPDATE` | `true` | Self-update daily from GitHub (applies on next OpenCode restart) |
 | `OPENCODE_RESUME_STOPSTORE` | `<plugin>/auto-resume.js.stopped.json` | Where user-stop markers are persisted across restarts |
+| `OPENCODE_RESUME_OFFSTORE` | `<plugin>/auto-resume.js.off.json` | Where per-session opt-outs (`auto-resume off`) are persisted |
 | `OPENCODE_RESUME_BREAKER_THRESHOLD` / `_WINDOW_MS` / `_COOLDOWN_MS` | `6` / `900000` / `300000` | Global circuit breaker |
 | `OPENCODE_RESUME_COMPACT_ON_OVERFLOW` | `true` | Summarize + resume on overflow |
 | `OPENCODE_RESUME_SWITCH_ON_QUOTA` | `true` | Rotate on free-tier exhaustion |
@@ -163,6 +165,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 ## Safety rails
 
 - **User Stop is absolute**: hitting Stop cancels every queued injection and pauses recovery, todo-drive, auto-proceed, improvement passes, proposals *and* permission autopilot until you send the next prompt — and the stop is **remembered across restarts** (small JSON sidecar file), so a stopped session is never automatically revived
+- **Per-session kill switch**: `auto-resume off` in chat disables everything for that session only (survives restarts; title restored with no trace) — `auto-resume on` re-arms. On-by-default everywhere else: install and go
 - Per-task resume chain cap, reset by any real user message or clean completion
 - Shared autopilot nudge budget + wall-clock budget per task
 - Spin detection (todo drive stops when nothing progresses)
@@ -175,7 +178,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 
 ## Compatibility
 
-Works anywhere OpenCode runs — **Windows, macOS, Linux**. The plugin is a single zero-dependency file using only the OpenCode SDK client, timers, and environment variables, plus two tiny local files it manages itself: the self-update backup and the user-stop memory (`auto-resume.js.stopped.json`). Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
+Works anywhere OpenCode runs — **Windows, macOS, Linux**. The plugin is a single zero-dependency file using only the OpenCode SDK client, timers, and environment variables, plus the tiny local files it manages itself: the self-update backup, the user-stop memory (`auto-resume.js.stopped.json`), and the per-session opt-out memory (`auto-resume.js.off.json`). Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
 
 Tested against OpenCode's event API: `session.error`, `session.status`, `session.idle`, `message.updated`, `message.part.updated`, `todo.updated`, `permission.updated/replied`, `session.compacted`.
 
