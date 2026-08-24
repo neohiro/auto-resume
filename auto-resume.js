@@ -412,6 +412,7 @@ export const AutoResumePlugin = async ({ client }) => {
         lastTurnHadText: false,
         retryEnteredAt: 0, retryNext: 0, child: false, reanimated: false,
         lastInjectKind: null,
+        lastEvalSig: null,
         taskCost: 0, costToasted: false,
       }
       sessions.set(id, s)
@@ -662,8 +663,13 @@ export const AutoResumePlugin = async ({ client }) => {
         status = (res?.data ?? res)?.[sessionID]?.type
       } catch { status = "unknown" }
       if (status && status !== "idle") {
-        schedule(sessionID, 5_000, plan) // core busy/retrying — check again shortly
-        return
+        plan.polls = (plan.polls || 0) + 1
+        if (plan.polls > 12) {
+          log("warn", "session never went idle; injecting anyway", { sessionID })
+        } else {
+          schedule(sessionID, 5_000, plan) // core busy/retrying — check again shortly
+          return
+        }
       }
     }
 
@@ -828,9 +834,13 @@ export const AutoResumePlugin = async ({ client }) => {
   }
 
   // ── permission autopilot ───────────────────────────────────────────
+  let denyListCache = null
   const denyList = () => {
-    const extra = cfg.extraDeny.split(",").map((x) => x.trim()).filter(Boolean)
-    return [...DANGEROUS_PATTERNS, ...extra]
+    if (!denyListCache) {
+      const extra = cfg.extraDeny.split(",").map((x) => x.trim()).filter(Boolean)
+      denyListCache = [...DANGEROUS_PATTERNS, ...extra]
+    }
+    return denyListCache
   }
   const looksDangerous = (perm) => {
     const blob = JSON.stringify({ t: perm.title, m: perm.metadata, c: perm.callID }).toLowerCase()
@@ -900,6 +910,12 @@ export const AutoResumePlugin = async ({ client }) => {
       if (entries[i]?.info?.role === "assistant") { lastAssistant = entries[i]; break }
     }
     if (!lastAssistant) return
+
+    // session.status(idle) and session.idle fire for the SAME turn end —
+    // evaluate each finished turn exactly once, keyed by its last message.
+    const turnSig = `${lastAssistant.info?.id ?? ""}:${(lastAssistant.parts ?? []).length}`
+    if (turnSig && turnSig === s.lastEvalSig) return
+    s.lastEvalSig = turnSig
 
     const info = lastAssistant.info
     if (info.modelID && !s.currentModel) {
@@ -1021,6 +1037,11 @@ export const AutoResumePlugin = async ({ client }) => {
 
   const checkStalls = () => {
     const nowMs = Date.now()
+    // Memory hygiene: drop state for sessions that have been idle for hours.
+    for (const [sessionID, s] of sessions) {
+      if (s.status === "busy" || s.status === "retry") continue
+      if (nowMs - s.lastActivity > 21_600_000) sessions.delete(sessionID)
+    }
     for (const [sessionID, s] of sessions) {
       if (s.child) continue
 
@@ -1146,6 +1167,7 @@ export const AutoResumePlugin = async ({ client }) => {
     try {
       const res = await fetch(`${UPDATE_URL}?t=${Date.now()}`, {
         headers: { "user-agent": `auto-resume-plugin/${AUTO_RESUME_VERSION}` },
+        signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(15_000) : undefined,
       })
       if (!res.ok) return
       const src = await res.text()
@@ -1162,7 +1184,7 @@ export const AutoResumePlugin = async ({ client }) => {
         current = await readFile(selfPath, "utf8")
       } catch { /* keep empty backup */ }
       await writeFile(`${selfPath}.bak`, current, "utf8")
-      const tmp = `${selfPath}.tmp`
+      const tmp = `${selfPath}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
       await writeFile(tmp, src, "utf8")
       await rename(tmp, selfPath)
       log("info", "self-updated", { from: AUTO_RESUME_VERSION, to: match[1], path: selfPath })
@@ -1185,11 +1207,13 @@ export const AutoResumePlugin = async ({ client }) => {
   }
 
   return {
-    event: async ({ event }) => {
+    event: async (input) => {
       if (!cfg.enabled) return
+      const event = input && typeof input === "object" ? input.event : null
+      if (!event || typeof event.type !== "string") return
       try {
-        const type = event?.type
-        const p = event?.properties ?? {}
+        const type = event.type
+        const p = event.properties ?? {}
 
         switch (type) {
           case "session.error": {

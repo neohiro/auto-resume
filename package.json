@@ -1,6 +1,6 @@
 {
   "name": "opencode-auto-resume",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Self-healing OpenCode sessions: automatic retries, model rotation on quota/outages, permission autopilot, and walk-away task autonomy.",
   "type": "module",
   "main": "auto-resume.js",
@@ -8,7 +8,7 @@
     "auto-resume.js"
   ],
   "scripts": {
-    "test": "node scripts/check-version.cjs && node tests/smoke.mjs && node tests/extended.mjs && node tests/v2.mjs && node tests/v3.mjs && node tests/v4.mjs"
+    "test": "node scripts/check-version.cjs && node tests/smoke.mjs && node tests/extended.mjs && node tests/v2.mjs && node tests/v3.mjs && node tests/v4.mjs && node tests/stress.mjs"
   },
   "keywords": [
     "opencode",

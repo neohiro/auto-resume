@@ -31,10 +31,13 @@ function makeClient(state) {
       },
       abort: async ({ path }) => { state.aborts.push(path.id); return true },
       summarize: async () => true,
-      messages: async ({ path }) => ({
-        data: state.messagesBySession[path.id] ??
-          [{ info: { role: "assistant", error: null }, parts: [{ type: "text", text: "ok" }] }],
-      }),
+      messages: async ({ path }) => {
+        const entries = structuredClone(state.messagesBySession[path.id] ?? [
+          { info: { role: "assistant", error: null }, parts: [{ type: "text", text: "ok" }] },
+        ])
+        if (entries.length) entries[entries.length - 1].info.id = `m${++state.msgN}`
+        return { data: entries }
+      },
       message: async ({ path }) => ({ data: { parts: [{ type: "text", text: state.msgStore[path.messageID] ?? "" }] } }),
     },
   }
@@ -43,7 +46,7 @@ function makeClient(state) {
 function makeState(idle = []) {
   return {
     prompts: [], aborts: [], summarizes: [], toasts: [], permResponses: [],
-    idleIds: new Set(idle), msgStore: {}, sessionList: [], messagesBySession: {},
+    idleIds: new Set(idle), msgStore: {}, msgN: 0, sessionList: [], messagesBySession: {},
   }
 }
 const fresh = (idle) => AutoResumePlugin({ client: makeClient(makeState(idle)) }).then((hooks) => hooks)
@@ -301,4 +304,3 @@ const ev = (type, properties) => ({ event: { type, properties } })
 }
 
 console.log(process.exitCode ? "V4 TESTS FAILED" : "ALL V4 TESTS PASSED")
-
