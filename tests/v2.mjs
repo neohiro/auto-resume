@@ -37,7 +37,7 @@ function makeClient(state) {
       summarize: async ({ path }) => { state.summarizes.push(path.id); return true },
       messages: async () => ({
         data: [{
-          info: { role: "assistant", error: null, providerID: "openai", modelID: "gpt-5" },
+          info: { role: "assistant", error: null, providerID: "openai", modelID: "gpt-5", id: `m${++state.msgN}` },
           parts: [{ type: "text", text: "done" }],
         }],
       }),
@@ -55,7 +55,7 @@ function makeClient(state) {
 async function fresh(idle = []) {
   const state = {
     prompts: [], aborts: [], summarizes: [], toasts: [], permResponses: [],
-    idleIds: new Set(idle), msgStore: {},
+    idleIds: new Set(idle), msgStore: {}, msgN: 0,
   }
   const hooks = await AutoResumePlugin({ client: makeClient(state) })
   return { state, hooks }
@@ -183,6 +183,5 @@ const ev = (type, properties) => ({ event: { type, properties } })
 }
 
 console.log(process.exitCode ? "V2 TESTS FAILED" : "ALL V2 TESTS PASSED")
-
 
 

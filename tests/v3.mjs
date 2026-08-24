@@ -28,7 +28,7 @@ function makeClient(state, providers) {
       abort: async () => true,
       summarize: async () => true,
       messages: async () => ({
-        data: [{ info: { role: "assistant", error: null, providerID: "provA", modelID: "m" }, parts: [{ type: "text", text: "ok" }] }],
+        data: [{ info: { role: "assistant", error: null, providerID: "provA", modelID: "m", id: `m${++state.msgN}` }, parts: [{ type: "text", text: "ok" }] }],
       }),
       message: async ({ path }) => ({ data: { parts: [{ type: "text", text: state.msgStore[path.messageID] ?? "" }] } }),
     },
@@ -36,7 +36,7 @@ function makeClient(state, providers) {
 }
 
 async function fresh(idle, providers) {
-  const state = { prompts: [], aborts: [], summarizes: [], toasts: [], permResponses: [], idleIds: new Set(idle), msgStore: {} }
+  const state = { prompts: [], aborts: [], summarizes: [], toasts: [], permResponses: [], idleIds: new Set(idle), msgStore: {}, msgN: 0 }
   const hooks = await AutoResumePlugin({ client: makeClient(state, providers) })
   return { state, hooks }
 }
@@ -122,4 +122,3 @@ const ev = (type, properties) => ({ event: { type, properties } })
 }
 
 console.log(process.exitCode ? "V3 TESTS FAILED" : "ALL V3 TESTS PASSED")
-
