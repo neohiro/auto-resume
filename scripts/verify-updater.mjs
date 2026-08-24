@@ -94,5 +94,21 @@ rmSync(ROOT, { recursive: true, force: true })
   NODE_OK(!threw && readFileSync(file, "utf8") === before, "T4: unreachable update endpoint fails silently, plugin still boots")
 }
 
+// ---- T5/T6: restart confirmation (pure ack semantics, network-independent) ---
+{
+  const { file } = scenario("ack")
+  // Simulate an install that was updated during a past session: current
+  // feature-complete code, but the ack marker still holds the OLD version.
+  writeFileSync(file, readFileSync(SOURCE, "utf8").replace(/AUTO_RESUME_VERSION = "[^"]+"/, 'AUTO_RESUME_VERSION = "7.7.7"'))
+  writeFileSync(`${file}.acked`, "0.8.0")
+  const s2 = await boot(file)
+  await sleep(1500)
+  NODE_OK(s2.toasts.some((t) => t.includes("Now running v7.7.7") && t.includes("(previously 0.8.0)")),
+    "T5: restart confirms the applied update exactly once")
+  const s3 = await boot(file)
+  await sleep(1200)
+  NODE_OK(!s3.toasts.some((t) => t.includes("Now running v")), "T6: confirmation never fires again")
+}
+
 console.log(process.exitCode ? "UPDATER VERIFICATION FAILED" : "UPDATER VERIFICATION: ALL PATHS PROVEN")
 

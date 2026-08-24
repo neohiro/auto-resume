@@ -128,7 +128,7 @@
 
 import { writeFile, rename } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.4.2"
+const AUTO_RESUME_VERSION = "1.4.3"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1205,6 +1205,24 @@ export const AutoResumePlugin = async ({ client }) => {
     // this an actual daily check while OpenCode stays open.
     const upd = setInterval(() => detach(checkForUpdates, "update-check"), 3_600_000)
     upd.unref?.()
+    // Updates apply on restart (module cache): confirm to the user that the
+    // version they are NOW running is the one fetched during a past session.
+    detach(async () => {
+      if (!selfPath) return
+      try {
+        const { readFile, writeFile } = await import("node:fs/promises")
+        const ackPath = `${selfPath}.acked`
+        let acked = ""
+        try { acked = await readFile(ackPath, "utf8").catch(() => "") } catch { }
+        if (acked.trim() === AUTO_RESUME_VERSION) return
+        await writeFile(ackPath, AUTO_RESUME_VERSION, "utf8")
+        if (!acked) return // first boot after clean install: nothing to confirm
+        toast(
+          `${RESUME_TAG}: Now running v${AUTO_RESUME_VERSION} (previously ${acked.trim() || "unknown"}) — update fully applied.`,
+          "info",
+        )
+      } catch { /* cosmetic only */ }
+    }, "update-notice")
     detach(reanimate, "reanimate")
   } else {
     console.warn(`${RESUME_TAG} disabled via OPENCODE_RESUME_ENABLED`)
