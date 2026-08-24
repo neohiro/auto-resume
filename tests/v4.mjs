@@ -259,5 +259,46 @@ const ev = (type, properties) => ({ event: { type, properties } })
     "CC4: no runaway loop on wrap-up style replies")
 }
 
+// ---- DD: task cost cap halts auto-drive --------------------------------------
+{
+  process.env.OPENCODE_AUTOPILOT_MAX_COST_USD = "10"
+  const state = makeState(["cost"])
+  state.messagesBySession.cost = [{
+    info: { role: "assistant", error: null },
+    parts: [{ type: "text", text: "Plan:\n- [ ] work" }],
+  }]
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  // first turn costs $6 -> under cap
+  await hooks.event(ev("message.updated", { info: { role: "assistant", sessionID: "cost", cost: 6 } }))
+  await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "cost", text: "Plan:" } }))
+  await hooks.event(ev("session.idle", { sessionID: "cost" }))
+  await sleep(350)
+  ok(state.prompts.length === 1, "DD: drives while under the cap")
+  // second turn pushes total to $12 -> over cap
+  await hooks.event(ev("message.updated", { info: { role: "assistant", sessionID: "cost", cost: 6 } }))
+  await hooks.event(ev("session.idle", { sessionID: "cost" }))
+  await sleep(350)
+  ok(state.prompts.length === 1, "DD: injections stop at the cap")
+  ok(state.toasts.some((t) => t.includes("$12.00") && t.includes("cap")),
+    "DD: cost-cap toast names the amount")
+  delete process.env.OPENCODE_AUTOPILOT_MAX_COST_USD
+}
+
+// ---- EE: server.connected re-scans for orphaned sessions ---------------------
+{
+  const now = Date.now()
+  const state = makeState()
+  // init scan finds nothing (list empty at boot)
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  // ...then a crashed session appears (e.g. machine woke from sleep)
+  state.sessionList = [{ id: "woke", time: { updated: now - 1_000 } }]
+  state.messagesBySession.woke = [
+    { info: { role: "user", sessionID: "woke" }, parts: [] },
+  ]
+  await hooks.event(ev("server.connected", {}))
+  await sleep(2200)
+  ok(state.prompts.some((p) => p.id === "woke"), "EE: reconnect revives sessions orphaned by sleep")
+}
+
 console.log(process.exitCode ? "V4 TESTS FAILED" : "ALL V4 TESTS PASSED")
 

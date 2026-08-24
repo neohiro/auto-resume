@@ -123,11 +123,12 @@
  *  OPENCODE_AUTOPILOT_MAX_NUDGES         max self-driven nudges/task(25)
  *  OPENCODE_AUTOPILOT_BUDGET_MS          wall-clock budget per task (28800000 = 8h, 0=off)
  *  OPENCODE_RESUME_AUTO_UPDATE           self-update daily from GitHub (true)
+ *  OPENCODE_AUTOPILOT_MAX_COST_USD       spend cap per task, USD     (10, 0=off)
  */
 
 import { writeFile, rename } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.3.0"
+const AUTO_RESUME_VERSION = "1.4.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -152,6 +153,7 @@ const DEFAULTS = {
   compactOnOverflow: true,
   toastThrottleMs: 3_000,
   autoUpdate: true,
+  maxTaskCostUsd: 10,
   switchOnQuota: true,
   switchOnRateLimit: true,
   switchOnFailures: true,
@@ -346,6 +348,7 @@ function loadConfig() {
     compactOnOverflow: bool("OPENCODE_RESUME_COMPACT_ON_OVERFLOW", DEFAULTS.compactOnOverflow),
     toastThrottleMs: num("OPENCODE_RESUME_TOAST_THROTTLE_MS", DEFAULTS.toastThrottleMs),
     autoUpdate: bool("OPENCODE_RESUME_AUTO_UPDATE", DEFAULTS.autoUpdate),
+    maxTaskCostUsd: num("OPENCODE_AUTOPILOT_MAX_COST_USD", DEFAULTS.maxTaskCostUsd),
     switchOnQuota: bool("OPENCODE_RESUME_SWITCH_ON_QUOTA", DEFAULTS.switchOnQuota),
     switchOnRateLimit: bool("OPENCODE_RESUME_SWITCH_ON_RATELIMIT", DEFAULTS.switchOnRateLimit),
     switchOnFailures: bool("OPENCODE_RESUME_SWITCH_ON_FAILURES", DEFAULTS.switchOnFailures),
@@ -409,6 +412,7 @@ export const AutoResumePlugin = async ({ client }) => {
         lastTurnHadText: false,
         retryEnteredAt: 0, retryNext: 0, child: false, reanimated: false,
         lastInjectKind: null,
+        taskCost: 0, costToasted: false,
       }
       sessions.set(id, s)
     }
@@ -424,7 +428,7 @@ export const AutoResumePlugin = async ({ client }) => {
       lastDriveCompleted: -1, proposalSent: false, improveDone: 0,
       proceedCount: 0, taskStartAt: Date.now(), toolErrs: 0,
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
-      lastTurnHadText: false,
+      lastTurnHadText: false, taskCost: 0, costToasted: false,
       lastErrorName: null, lastErrorSig: null,
     })
     if (!keepTimers) s.stallResumes = 0
@@ -632,6 +636,15 @@ export const AutoResumePlugin = async ({ client }) => {
 
   const runPlan = async (sessionID, plan) => {
     if (!injectionAllowed(sessionID)) return
+    const s0 = state(sessionID)
+    if (cfg.maxTaskCostUsd > 0 && s0.taskCost >= cfg.maxTaskCostUsd) {
+      if (!s0.costToasted) {
+        s0.costToasted = true
+        log("warn", "task cost cap reached - stopping auto-injections", { sessionID, spent: Math.round(s0.taskCost * 100) / 100 })
+        toast(`${RESUME_TAG}: Task cost $${s0.taskCost.toFixed(2)} reached the $${cfg.maxTaskCostUsd} cap - pausing auto-drive. Raise OPENCODE_AUTOPILOT_MAX_COST_USD to continue.`, "warning")
+      }
+      return
+    }
     const s = state(sessionID)
 
     if (plan.kind === "resume") {
@@ -1111,6 +1124,7 @@ export const AutoResumePlugin = async ({ client }) => {
 
   // -- self-updater: daily check against the official repo -------------------
   let lastUpdateCheckAt = 0
+  let lastReanimateAt = 0
   const isNewerVersion = (remote, local) => {
     const r = String(remote).split(".").map((x) => parseInt(x, 10) || 0)
     const l = String(local).split(".").map((x) => parseInt(x, 10) || 0)
@@ -1221,6 +1235,7 @@ export const AutoResumePlugin = async ({ client }) => {
                 s.originalModel = s.originalModel ?? seen
                 s.lastModel = seen
               }
+              if (typeof info.cost === "number") state(info.sessionID).taskCost += info.cost
               if (info.error) detach(handleError(info.sessionID, info.error), "handleError")
             }
             break
@@ -1309,6 +1324,17 @@ export const AutoResumePlugin = async ({ client }) => {
 
           case "permission.replied": {
             if (p.sessionID) permissionPending.delete(p.sessionID)
+            break
+          }
+
+          case "server.connected": {
+            // Laptop woke up / client reconnected: rescan for sessions that
+            // were orphaned while the machine was asleep (throttled).
+            const nowMs = Date.now()
+            if (cfg.reanimate && nowMs - lastReanimateAt > 300_000) {
+              lastReanimateAt = nowMs
+              detach(reanimate, "reanimate")
+            }
             break
           }
 
