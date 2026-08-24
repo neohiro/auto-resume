@@ -128,7 +128,7 @@
 
 import { writeFile, rename } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.4.2"
+const AUTO_RESUME_VERSION = "1.4.1"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1201,10 +1201,6 @@ export const AutoResumePlugin = async ({ client }) => {
     wd.unref?.()
     detach(() => log("debug", "auto-resume plugin initialized"), "init-log")
     detach(checkForUpdates, "update-check")
-    // Long-lived processes: re-probe hourly; the built-in 24h window makes
-    // this an actual daily check while OpenCode stays open.
-    const upd = setInterval(() => detach(checkForUpdates, "update-check"), 3_600_000)
-    upd.unref?.()
     detach(reanimate, "reanimate")
   } else {
     console.warn(`${RESUME_TAG} disabled via OPENCODE_RESUME_ENABLED`)
