@@ -1,0 +1,28 @@
+{
+  "name": "opencode-auto-resume",
+  "version": "1.0.0",
+  "description": "Self-healing OpenCode sessions: automatic retries, model rotation on quota/outages, permission autopilot, and walk-away task autonomy.",
+  "type": "module",
+  "main": "auto-resume.js",
+  "files": [
+    "auto-resume.js"
+  ],
+  "scripts": {
+    "test": "node tests/smoke.mjs && node tests/extended.mjs && node tests/v2.mjs && node tests/v3.mjs"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin",
+    "ai",
+    "agent",
+    "retry",
+    "resilience",
+    "autopilot",
+    "fallback"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
