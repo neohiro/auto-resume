@@ -14,7 +14,13 @@
  *   • truncated output (MessageOutputLengthError) → seamless continue nudge
  *   • context-window overflow → triggers compaction, resumes afterwards
  *   • empty responses → re-nudge
- *   • stalled streams (busy w/o events) → abort + restart (skips pending perms)
+ *   • stalled streams (busy w/o events) → abort + restart (skips pending perms,
+ *     extended grace while a long tool legitimately runs)
+ *   • internal retry loops that never end (huge provider Retry-After values)
+ *     → taken over: aborted and resumed by the plugin
+ *   • server/machine crashes → on startup, recently-active interrupted
+ *     sessions are re-animated automatically
+ *   • subagent/child sessions are left to their parent orchestrator
  *   • user aborts are always respected; auth errors surfaced, never hammered
  *
  * ══════════════════════════════════════════════════════════════════
@@ -55,6 +61,8 @@
  *     repeating the failing approach and diagnose the root cause first
  *   • AUTONOMY DIRECTIVE: every injected prompt instructs the model to make
  *     its own decisions, never wait for confirmation, document assumptions
+ *   • AUTO-PROCEED: if the agent ends its turn by asking a question
+ *     ("Should I proceed...?"), it answers itself and continues (capped)
  *   • WRAP-UP: when the todo list completes → asks once for concrete
  *     improvement proposals (listed, not implemented) + success toast
  *   • BEYOND EXPECTATIONS: before wrapping up, runs a self-critique pass —
@@ -78,6 +86,12 @@
  *  OPENCODE_RESUME_NUDGE_DELAY_MS        continue-nudge delay       (1500)
  *  OPENCODE_RESUME_STALL_TIMEOUT_MS      busy-silence => stalled    (240000)
  *  OPENCODE_RESUME_WATCHDOG_MS           stall check interval       (10000)
+ *  OPENCODE_RESUME_RUNNING_TOOL_FACTOR   grace multiplier while a
+ *                                        tool is running            (4)
+ *  OPENCODE_RESUME_RETRY_TAKEOVER_MS     stuck-in-core-retry limit  (900000)
+ *  OPENCODE_RESUME_RETRY_FUTURE_CAP_MS   absurd next-retry distance (600000)
+ *  OPENCODE_RESUME_REANIMATE             revive crashed sessions    (true)
+ *  OPENCODE_RESUME_REANIMATE_WINDOW_MS   max age for revival        (600000)
  *  OPENCODE_RESUME_BREAKER_THRESHOLD     failures before breaker    (6)
  *  OPENCODE_RESUME_BREAKER_WINDOW_MS     breaker rolling window     (900000)
  *  OPENCODE_RESUME_BREAKER_COOLDOWN_MS   breaker cool-down          (300000)
@@ -101,6 +115,9 @@
  *  OPENCODE_AUTOPILOT_TODO_DRIVE         continue unfinished todos  (true)
  *  OPENCODE_AUTOPILOT_DEBUG_NUDGE        diagnose after tool errors (true)
  *  OPENCODE_AUTOPILOT_PROPOSALS          wrap-up proposals message  (true)
+ *  OPENCODE_AUTOPILOT_PROCEED            answer the agent's own
+ *                                        questions and continue     (true)
+ *  OPENCODE_AUTOPILOT_MAX_PROCEEDS       self-answers per task      (3)
  *  OPENCODE_AUTOPILOT_IMPROVE            self-improvement pass      (true)
  *  OPENCODE_AUTOPILOT_IMPROVE_CYCLES     max improvement cycles     (2)
  *  OPENCODE_AUTOPILOT_MAX_NUDGES         max self-driven nudges/task(25)
@@ -117,6 +134,11 @@ const DEFAULTS = {
   nudgeDelayMs: 1_500,
   stallTimeoutMs: 240_000,
   watchdogMs: 10_000,
+  runningToolFactor: 4,
+  retryTakeoverMs: 900_000,
+  retryFutureCapMs: 600_000,
+  reanimate: true,
+  reanimateWindowMs: 600_000,
   breakerThreshold: 6,
   breakerWindowMs: 900_000,
   breakerCooldownMs: 300_000,
@@ -137,6 +159,8 @@ const DEFAULTS = {
   todoDrive: true,
   debugNudge: true,
   proposals: true,
+  proceedOnAsk: true,
+  maxProceeds: 3,
   improveLoop: true,
   improveCycles: 2,
   maxNudges: 25,
@@ -160,6 +184,9 @@ const PROMPTS = {
     (auto ? AUTONOMY_DIRECTIVE : ""),
   todos: () =>
     `${RESUME_TAG} This session went idle while the todo list still has unfinished items. Continue working through them autonomously now, one by one, marking each completed as you go.`,
+  proceed: () =>
+    `${RESUME_TAG} Proceed autonomously with exactly what you just proposed or asked about — the answer is yes. Do not ask again; decide and continue.` +
+    AUTONOMY_DIRECTIVE,
   debug: () =>
     `${RESUME_TAG} The last several tool calls failed repeatedly. Stop repeating the same failing approach. Diagnose the actual root cause first (read the full error output, inspect relevant files/state), form a hypothesis, then apply a targeted fix.`,
   improve: (cycle, total) =>
@@ -211,6 +238,15 @@ const TIER_PENALTY = [
   [/\bfast(est)?\b/i, -25], [/\bbasic\b/i, -25], [/\blean\b/i, -20],
 ]
 
+/** Turn-ending question markers: the agent stopped to ask instead of doing. */
+const QUESTION_PATTERNS = [
+  /\bshall i\b/i, /\bshould i\b/i, /\bwould you like me\b/i,
+  /\bdo you want me to\b/i, /\bwant me to\b/i, /\bcan i (proceed|continue|start|begin|go ahead)\b/i,
+  /\bshould we\b/i, /\blet me know (if|when|whether)\b/i,
+  /\bawait(ing)? (your|further) (confirmation|instructions|approval|input)\b/i,
+  /\bwaiting for your\b/i, /\bprompt (me|you) when\b/i,
+]
+
 const tierScore = (modelID) => {
   let score = 0
   for (const [re, pts] of TIER_BONUS) if (re.test(modelID)) score += pts
@@ -258,6 +294,11 @@ function loadConfig() {
     nudgeDelayMs: num("OPENCODE_RESUME_NUDGE_DELAY_MS", DEFAULTS.nudgeDelayMs),
     stallTimeoutMs: num("OPENCODE_RESUME_STALL_TIMEOUT_MS", DEFAULTS.stallTimeoutMs),
     watchdogMs: num("OPENCODE_RESUME_WATCHDOG_MS", DEFAULTS.watchdogMs),
+    runningToolFactor: Math.max(1, num("OPENCODE_RESUME_RUNNING_TOOL_FACTOR", DEFAULTS.runningToolFactor)),
+    retryTakeoverMs: num("OPENCODE_RESUME_RETRY_TAKEOVER_MS", DEFAULTS.retryTakeoverMs),
+    retryFutureCapMs: num("OPENCODE_RESUME_RETRY_FUTURE_CAP_MS", DEFAULTS.retryFutureCapMs),
+    reanimate: bool("OPENCODE_RESUME_REANIMATE", DEFAULTS.reanimate),
+    reanimateWindowMs: num("OPENCODE_RESUME_REANIMATE_WINDOW_MS", DEFAULTS.reanimateWindowMs),
     breakerThreshold: num("OPENCODE_RESUME_BREAKER_THRESHOLD", DEFAULTS.breakerThreshold),
     breakerWindowMs: num("OPENCODE_RESUME_BREAKER_WINDOW_MS", DEFAULTS.breakerWindowMs),
     breakerCooldownMs: num("OPENCODE_RESUME_BREAKER_COOLDOWN_MS", DEFAULTS.breakerCooldownMs),
@@ -278,6 +319,8 @@ function loadConfig() {
     todoDrive: bool("OPENCODE_AUTOPILOT_TODO_DRIVE", DEFAULTS.todoDrive),
     debugNudge: bool("OPENCODE_AUTOPILOT_DEBUG_NUDGE", DEFAULTS.debugNudge),
     proposals: bool("OPENCODE_AUTOPILOT_PROPOSALS", DEFAULTS.proposals),
+    proceedOnAsk: bool("OPENCODE_AUTOPILOT_PROCEED", DEFAULTS.proceedOnAsk),
+    maxProceeds: num("OPENCODE_AUTOPILOT_MAX_PROCEEDS", DEFAULTS.maxProceeds),
     improveLoop: bool("OPENCODE_AUTOPILOT_IMPROVE", DEFAULTS.improveLoop),
     improveCycles: num("OPENCODE_AUTOPILOT_IMPROVE_CYCLES", DEFAULTS.improveCycles),
     maxNudges: num("OPENCODE_AUTOPILOT_MAX_NUDGES", DEFAULTS.maxNudges),
@@ -319,8 +362,10 @@ export const AutoResumePlugin = async ({ client }) => {
         rlStreak: 0, failStreak: 0, rotations: 0,
         todos: [], nudges: 0, driveCount: 0, staleDrives: -1,
         lastDriveCompleted: -1, proposalSent: false, taskStartAt: 0,
-        improveDone: 0,
-        toolErrs: 0, debugArmed: false,
+        improveDone: 0, proceedCount: 0,
+        toolErrs: 0, debugArmed: false, toolRunning: false,
+        lastTurnHadText: false,
+        retryEnteredAt: 0, retryNext: 0, child: false, reanimated: false,
       }
       sessions.set(id, s)
     }
@@ -334,7 +379,9 @@ export const AutoResumePlugin = async ({ client }) => {
       rlStreak: 0, failStreak: 0, rotations: 0,
       nudges: 0, driveCount: 0, staleDrives: -1,
       lastDriveCompleted: -1, proposalSent: false, improveDone: 0,
-      taskStartAt: Date.now(), toolErrs: 0, debugArmed: false,
+      proceedCount: 0, taskStartAt: Date.now(), toolErrs: 0,
+      debugArmed: false, retryEnteredAt: 0, retryNext: 0,
+      lastTurnHadText: false,
       lastErrorName: null, lastErrorSig: null,
     })
     if (!keepTimers) s.stallResumes = 0
@@ -530,7 +577,18 @@ export const AutoResumePlugin = async ({ client }) => {
       ? plan.prompt(cfg.autonomy)
       : plan.prompt
 
+  /** Child (subagent) sessions belong to their parent orchestrator — never inject. */
+  const injectionAllowed = (sessionID) => {
+    const s = sessions.get(sessionID)
+    if (s?.child) {
+      log("info", "skipping injection into subagent session", { sessionID })
+      return false
+    }
+    return true
+  }
+
   const runPlan = async (sessionID, plan) => {
+    if (!injectionAllowed(sessionID)) return
     const s = state(sessionID)
 
     if (plan.kind === "resume") {
@@ -576,6 +634,10 @@ export const AutoResumePlugin = async ({ client }) => {
 
   // ── central failure handler ────────────────────────────────────────
   const handleError = async (sessionID, error) => {
+    if (sessions.get(sessionID)?.child) {
+      log("info", "ignoring error in subagent session (parent orchestrates)", { sessionID })
+      return
+    }
     const s = state(sessionID)
     const nowMs = Date.now()
     // Dedupe only the SAME incident (session.error + message.updated both fire);
@@ -641,23 +703,34 @@ export const AutoResumePlugin = async ({ client }) => {
       s.compactAttempted = true
       s.awaitingCompactionSince = Date.now()
       detach(async () => {
-        try {
-          const body = s.currentModel ?? s.lastModel
-            ? { providerID: (s.currentModel ?? s.lastModel).providerID, modelID: (s.currentModel ?? s.lastModel).modelID }
-            : undefined
+        const summarizeWith = async (model) => {
+          const body = model ? { providerID: model.providerID, modelID: model.modelID } : undefined
           await client.session.summarize({ path: { id: sessionID }, body })
-          log("info", "compaction requested after overflow", { sessionID })
-          setTimeout(() => {
-            const cur = state(sessionID)
-            if (cur.awaitingCompactionSince) {
-              cur.awaitingCompactionSince = 0
-              toast(`${RESUME_TAG}: Compaction did not complete — not resuming.`, "error")
-            }
-          }, 180_000).unref?.()
-        } catch (err) {
-          log("error", "summarize failed", { sessionID, err: err?.message ?? String(err) })
-          toast(`${RESUME_TAG}: Compaction failed — context overflow unresolved.`, "error")
         }
+        try {
+          await summarizeWith(s.currentModel ?? s.lastModel)
+          log("info", "compaction requested after overflow", { sessionID })
+        } catch (err) {
+          // The summarizer model itself may be the problem (quota, outage) —
+          // fall back to the best alternate model for this one-shot job.
+          log("warn", "compaction failed on primary model, rotating summarizer", {
+            sessionID, err: err?.message ?? String(err),
+          })
+          const alt = await pickAlternateModel(s.currentModel ?? s.lastModel)
+          if (!alt) {
+            toast(`${RESUME_TAG}: Compaction failed and no alternate model available.`, "error")
+            return
+          }
+          await summarizeWith(alt)
+          log("info", "compaction requested on alternate model", { sessionID, model: modelKey(alt) })
+        }
+        setTimeout(() => {
+          const cur = state(sessionID)
+          if (cur.awaitingCompactionSince) {
+            cur.awaitingCompactionSince = 0
+            toast(`${RESUME_TAG}: Compaction did not complete — not resuming.`, "error")
+          }
+        }, 180_000).unref?.()
       }, "summarize")
       return
     }
@@ -753,7 +826,9 @@ export const AutoResumePlugin = async ({ client }) => {
 
   const evaluateIdle = async (sessionID) => {
     const s = state(sessionID)
-    const relevant = s.lastErrorName || s.lastResumeAt || s.continueCount || s.todos.length
+    const relevant =
+      s.lastErrorName || s.lastResumeAt || s.continueCount ||
+      s.todos.length || s.lastTurnHadText
     s.awaitingCompactionSince = 0
     if (!relevant) return
 
@@ -785,6 +860,21 @@ export const AutoResumePlugin = async ({ client }) => {
       const todos = s.todos ?? []
       const open = todos.filter((t) => t.status === "pending" || t.status === "in_progress")
       const finished = todos.filter((t) => t.status === "completed" || t.status === "cancelled")
+
+      // The agent ended its turn by asking a question instead of doing —
+      // answer it ourselves and keep the task moving.
+      if (open.length === 0 && cfg.autonomy && cfg.proceedOnAsk &&
+          s.proceedCount < cfg.maxProceeds && s.nudges < cfg.maxNudges && budgetLeft(s)) {
+        const text = (lastAssistant.parts ?? [])
+          .map((x) => (x?.type === "text" ? x.text : "")).join(" ")
+        if (text && QUESTION_PATTERNS.some((re) => re.test(text))) {
+          s.proceedCount += 1
+          s.nudges += 1
+          log("info", "agent asked a question — proceeding autonomously", { sessionID })
+          schedule(sessionID, cfg.nudgeDelayMs, { kind: "proceed", prompt: PROMPTS.proceed })
+          return
+        }
+      }
 
       // Full completion → self-improvement passes → wrap-up proposals → toast
       if (todos.length > 0 && open.length === 0) {
@@ -839,23 +929,122 @@ export const AutoResumePlugin = async ({ client }) => {
     }
   }
 
-  // ── stall watchdog ─────────────────────────────────────────────────
+  // ── stall + stuck-retry watchdog ───────────────────────────────────
+  const takeover = (sessionID, why, toastMsg) => {
+    const s = state(sessionID)
+    if (s.chain >= cfg.maxChain || s.stallResumes >= 2) return
+    s.stallResumes += 1
+    s.chain += 1
+    s.lastActivity = Date.now()
+    s.retryEnteredAt = 0
+    s.retryNext = 0
+    log("warn", why, { sessionID })
+    toast(toastMsg)
+    detach(async () => {
+      try { await client.session.abort({ path: { id: sessionID } }) } catch { /* already dead */ }
+      setTimeout(() => schedule(sessionID, 800, { kind: "resume", prompt: PROMPTS.resume }), 1_500).unref?.()
+    }, "takeover-abort")
+  }
+
   const checkStalls = () => {
     const nowMs = Date.now()
     for (const [sessionID, s] of sessions) {
+      if (s.child) continue
+
+      // A session parked in OpenCode's internal retry loop can wait for a
+      // provider-specified Retry-After of effectively unlimited length.
+      // If it sits there too long, or the next attempt is absurdly far in
+      // the future, take over: abort and resume on our own terms.
+      if (s.status === "retry") {
+        const enteredAt = s.retryEnteredAt || nowMs
+        const nextIn = s.retryNext ? s.retryNext - nowMs : 0
+        const absurdFuture = Boolean(s.retryNext) && nextIn > cfg.retryFutureCapMs
+        const tooLong = nowMs - enteredAt > cfg.retryTakeoverMs
+        if (absurdFuture || tooLong) {
+          takeover(sessionID,
+            absurdFuture
+              ? "retry loop scheduled absurdly far ahead — taking over"
+              : "retry loop exceeded takeover limit — taking over",
+            `${RESUME_TAG}: Retry loop is stuck — taking over.`)
+        }
+        continue
+      }
+
       if (s.status !== "busy") continue
       if (permissionPending.has(sessionID)) continue
-      if (nowMs - s.lastActivity < cfg.stallTimeoutMs) continue
-      if (s.chain >= cfg.maxChain || s.stallResumes >= 2) continue
-      s.stallResumes += 1
-      s.chain += 1
-      s.lastActivity = nowMs
-      log("warn", "stalled stream detected, aborting + resuming", { sessionID, silentMs: nowMs - s.lastActivity })
-      toast(`${RESUME_TAG}: Response appears stuck — restarting it.`)
-      detach(async () => {
-        try { await client.session.abort({ path: { id: sessionID } }) } catch { /* already dead */ }
-        setTimeout(() => schedule(sessionID, 2_000, { kind: "resume", prompt: PROMPTS.resume }), 2_500).unref?.()
-      }, "stall-abort")
+      // A genuinely running tool gets an extended grace window: quiet builds,
+      // installs, test suites are legitimate silence, not stalls.
+      const silenceLimit = s.toolRunning
+        ? cfg.stallTimeoutMs * cfg.runningToolFactor
+        : cfg.stallTimeoutMs
+      if (nowMs - s.lastActivity < silenceLimit) continue
+      takeover(sessionID, "stalled stream detected, aborting + resuming",
+        `${RESUME_TAG}: Response appears stuck — restarting it.`)
+    }
+  }
+
+  // ── crash recovery: revive sessions killed by a server/machine restart ──
+  // Recovery timers live in the server process, so a crash orphans any turn
+  // that was mid-recovery or awaiting its first reply. On startup we scan
+  // recent sessions and give those a fresh continuation.
+  const reanimate = async () => {
+    if (!cfg.reanimate) return
+    let list = []
+    try {
+      const res = await client.session.list()
+      list = (res?.data ?? res) ?? []
+    } catch (err) {
+      log("warn", "reanimation scan failed", { err: err?.message ?? String(err) })
+      return
+    }
+    if (!Array.isArray(list)) return
+    const cutoff = Date.now() - cfg.reanimateWindowMs
+    for (const sess of list) {
+      if (!sess?.id || sess.parentID) continue // subagents belong to parents
+      if ((sess.time?.updated ?? 0) < cutoff) continue // too old to be a crash victim
+      const s = state(sess.id)
+      if (s.reanimated) continue
+      s.reanimated = true
+
+      let entries = []
+      try {
+        const r = await client.session.messages({ path: { id: sess.id } })
+        entries = (r?.data ?? r) ?? []
+      } catch { continue }
+      if (!entries.length) continue
+      const lastEntry = entries[entries.length - 1]
+      const lastInfo = lastEntry?.info
+      if (!lastInfo) continue
+
+      resetTaskScope(s)
+
+      // A prompt that never received any reply: the turn died at submission.
+      if (lastInfo.role === "user") {
+        log("info", "reanimating session with unanswered prompt", { sessionID: sess.id })
+        schedule(sess.id, 1_500, { kind: "resume", prompt: PROMPTS.resume })
+        toast(`${RESUME_TAG}: Revived a session interrupted by the restart.`)
+        continue
+      }
+
+      if (lastInfo.role === "assistant" && lastInfo.error) {
+        const kind = classify(lastInfo.error)
+        if (["abort", "auth", "fatal", "overflow"].includes(kind)) continue
+        if (lastInfo.modelID) {
+          s.lastModel = { providerID: lastInfo.providerID, modelID: lastInfo.modelID }
+        }
+        if (kind === "quota" || kind === "rate_limit") {
+          await rotateAwayFrom(sess.id, "quota/rate limit (after restart)", true)
+        }
+        log("info", "reanimating interrupted session", { sessionID: sess.id, kind })
+        schedule(
+          sess.id,
+          1_500,
+          kind === "output_length"
+            ? { kind: "continue", prompt: PROMPTS.truncated }
+            : { kind: "resume", prompt: PROMPTS.resume },
+        )
+        toast(`${RESUME_TAG}: Revived a session interrupted by the restart.`)
+      }
     }
   }
 
@@ -863,6 +1052,7 @@ export const AutoResumePlugin = async ({ client }) => {
     const wd = setInterval(() => detach(checkStalls, "watchdog"), cfg.watchdogMs)
     wd.unref?.()
     detach(() => log("debug", "auto-resume plugin initialized"), "init-log")
+    detach(reanimate, "reanimate")
   } else {
     console.warn(`${RESUME_TAG} disabled via OPENCODE_RESUME_ENABLED`)
   }
@@ -907,6 +1097,7 @@ export const AutoResumePlugin = async ({ client }) => {
                 s0.currentModel = null
                 s0.emptyNudges = 0
               }
+              s0.lastTurnHadText = false // new turn begins
               break
             }
 
@@ -927,8 +1118,15 @@ export const AutoResumePlugin = async ({ client }) => {
             if (!part?.sessionID) break
             const s = state(part.sessionID)
             s.lastActivity = Date.now()
-            if (part.type === "tool") {
+            if (part.type === "text" && typeof part.text === "string" && part.text.trim()) {
+              s.lastTurnHadText = true
+            } else if (part.type === "tool") {
               const st = part.state?.status
+              if (st === "running") {
+                s.toolRunning = true // heartbeat: long-running tools get grace
+              } else if (st === "completed" || st === "error") {
+                s.toolRunning = false
+              }
               if (st === "error") {
                 s.toolErrs += 1
                 if (cfg.autonomy && cfg.debugNudge && s.toolErrs >= 3 && !s.debugArmed &&
@@ -958,6 +1156,14 @@ export const AutoResumePlugin = async ({ client }) => {
             const s = state(p.sessionID)
             s.status = p.status?.type ?? "unknown"
             s.lastActivity = Date.now()
+            if (s.status === "retry") {
+              if (!s.retryEnteredAt) s.retryEnteredAt = Date.now()
+              if (typeof p.status?.next === "number") s.retryNext = p.status.next
+            } else {
+              s.retryEnteredAt = 0
+              s.retryNext = 0
+            }
+            if (s.status === "busy") s.lastTurnHadText = false
             if (s.status === "idle") {
               s.pendingResume = false
               detach(evaluateIdle(p.sessionID), "evaluateIdle")
@@ -993,6 +1199,16 @@ export const AutoResumePlugin = async ({ client }) => {
             break
           }
 
+          case "session.created":
+          case "session.updated": {
+            const info = p.info
+            if (info?.id) {
+              const s = state(info.id)
+              if (info.parentID) s.child = true
+            }
+            break
+          }
+
           case "session.compacted": {
             const s = sessions.get(p.sessionID)
             if (s?.awaitingCompactionSince) {
@@ -1021,3 +1237,4 @@ export const AutoResumePlugin = async ({ client }) => {
     },
   }
 }
+

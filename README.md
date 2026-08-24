@@ -29,6 +29,10 @@ OpenCode already retries transient provider errors a few times internally. But w
 | Context-window overflow | Triggers compaction, resumes automatically afterwards |
 | Empty responses | Re-nudges once |
 | Silently stalled streams (busy but no events) | Aborts + restarts the turn |
+| Quiet-but-running tools (builds, test suites) | Extended grace window (×4) before any stall verdict |
+| Internal retry loops that never end (huge provider `Retry-After` values) | Taken over: aborted and resumed on the plugin's own schedule |
+| Server / machine crashes mid-task | On startup, recently-interrupted sessions are **re-animated** automatically |
+| Subagent sessions | Left alone — their parent orchestrator owns them |
 | User aborts / auth errors | Always respected / surfaced — never hammered |
 
 ### 2 — Model rotation
@@ -54,9 +58,10 @@ The walk-away loop:
 
 1. **Todo drive** — session idles with unfinished todos → nudged to continue (spin-detection stops pointless loops)
 2. **Debug nudge** — 3 consecutive failed tool calls → *"diagnose the root cause first"*
-3. **Autonomy directive** — every injected prompt tells the model to decide things itself, never wait for confirmation, document assumptions
-4. **Self-improvement passes** — when the model declares the task done, it's told to critically review its own output (correctness, performance, security, robustness, readability) and implement the improvements it's confident about — capped number of cycles
-5. **Wrap-up** — final message summarizes what was accomplished plus up to three follow-up proposals, success toast included
+3. **Auto-proceed** — agent ends its turn by asking *"Should I proceed…?"* → the plugin answers yes and keeps it moving (capped)
+4. **Autonomy directive** — every injected prompt tells the model to decide things itself, never wait for confirmation, document assumptions
+5. **Self-improvement passes** — when the model declares the task done, it's told to critically review its own output (correctness, performance, security, robustness, readability) and implement the improvements it's confident about — capped number of cycles
+6. **Wrap-up** — final message summarizes what was accomplished plus up to three follow-up proposals, success toast included
 
 ## Install
 
@@ -99,6 +104,11 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_OUTPUT_LENGTH_MAX` | `3` | Truncation continue-nudges |
 | `OPENCODE_RESUME_STALL_TIMEOUT_MS` | `240000` | Busy-without-events ⇒ stalled |
 | `OPENCODE_RESUME_WATCHDOG_MS` | `10000` | Stall check interval |
+| `OPENCODE_RESUME_RUNNING_TOOL_FACTOR` | `4` | Stall grace multiplier while a tool is running |
+| `OPENCODE_RESUME_RETRY_TAKEOVER_MS` | `900000` | Max time in OpenCode's internal retry loop before takeover |
+| `OPENCODE_RESUME_RETRY_FUTURE_CAP_MS` | `600000` | Next-retry scheduled further out ⇒ takeover |
+| `OPENCODE_RESUME_REANIMATE` | `true` | Revive crashed sessions on startup |
+| `OPENCODE_RESUME_REANIMATE_WINDOW_MS` | `600000` | Max age of sessions eligible for revival |
 | `OPENCODE_RESUME_BREAKER_THRESHOLD` / `_WINDOW_MS` / `_COOLDOWN_MS` | `6` / `900000` / `300000` | Global circuit breaker |
 | `OPENCODE_RESUME_COMPACT_ON_OVERFLOW` | `true` | Summarize + resume on overflow |
 | `OPENCODE_RESUME_SWITCH_ON_QUOTA` | `true` | Rotate on free-tier exhaustion |
@@ -118,6 +128,8 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_AUTOPILOT_IMPROVE` | `true` | Self-improvement pass after completion |
 | `OPENCODE_AUTOPILOT_IMPROVE_CYCLES` | `2` | Max improvement cycles |
 | `OPENCODE_AUTOPILOT_PROPOSALS` | `true` | Wrap-up proposals message |
+| `OPENCODE_AUTOPILOT_PROCEED` | `true` | Answer the agent's own questions and continue |
+| `OPENCODE_AUTOPILOT_MAX_PROCEEDS` | `3` | Self-answered questions per task |
 | `OPENCODE_AUTOPILOT_MAX_NUDGES` | `25` | Self-driven nudges per task |
 | `OPENCODE_AUTOPILOT_BUDGET_MS` | `28800000` (8h) | Wall-clock budget per task (`0` = off) |
 
