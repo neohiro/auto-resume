@@ -110,9 +110,9 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await sleep(500)
   ok(String(state.titles.t3 ?? "").includes("[auto-resume: 🟢 armed]"),
     "T3 precondition: tag was attached")
-  // turn it OFF via in-chat command
-  await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "t3", id: "off1" } }))
+  // turn it OFF via in-chat command (register text BEFORE dispatch)
   state.msgStore.off1 = "auto-resume off"
+  await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "t3", id: "off1" } }))
   await sleep(600)
   ok(state.titles.t3 === "Refactor auth flow",
     "T3: title restored exactly, no trace of auto-resume")
@@ -134,8 +134,8 @@ const ev = (type, properties) => ({ event: { type, properties } })
   // run #1: opt the session out
   const stateA = makeState()
   const hooksA = await AutoResumePlugin({ client: makeClient(stateA) })
-  await hooksA.event(ev("message.updated", { info: { role: "user", sessionID: "p9", id: "o1" } }))
   stateA.msgStore.o1 = "/auto-resume off"
+  await hooksA.event(ev("message.updated", { info: { role: "user", sessionID: "p9", id: "o1" } }))
   await sleep(500)
   ok(stateA.toasts.some((t) => t.includes("Off for this session")), "T4: run #1 opted the session out")
   // run #2: OpenCode restarted — persisted opt-out must hold
@@ -154,8 +154,8 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await sleep(400)
   ok(!stateB.prompts.some((p) => p.id === "p9"), "T4: still silent while opted out")
   // re-enable via in-chat command
-  await hooksB.event(ev("message.updated", { info: { role: "user", sessionID: "p9", id: "o2" } }))
   stateB.msgStore.o2 = "auto-resume on"
+  await hooksB.event(ev("message.updated", { info: { role: "user", sessionID: "p9", id: "o2" } }))
   await sleep(600)
   ok(stateB.titles.p9 === "Build the importer [auto-resume: 🟢 armed]",
     "T4: 'auto-resume on' re-arms and re-tags the title")
