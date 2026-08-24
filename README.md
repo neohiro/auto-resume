@@ -46,7 +46,8 @@ This is what auto-resume is for.
 | Internal retry loops that never end (huge provider `Retry-After` values) | Taken over: aborted and resumed on the plugin's own schedule |
 | Server / machine crashes mid-task | On startup, recently-interrupted sessions are **re-animated** automatically |
 | Subagent sessions | Left alone — their parent orchestrator owns them |
-| User aborts / auth errors | Always respected / surfaced — never hammered |
+| User aborts (**Stop**) | Detected — everything queued is cancelled and automation stays fully quiet until your next prompt |
+| Auth errors | Surfaced — never hammered |
 
 ### 2 — Model rotation
 Anything **model-specific** that keeps failing moves your session elsewhere:
@@ -134,6 +135,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_REANIMATE` | `true` | Revive crashed sessions on startup |
 | `OPENCODE_RESUME_REANIMATE_WINDOW_MS` | `600000` | Max age of sessions eligible for revival |
 | `OPENCODE_RESUME_AUTO_UPDATE` | `true` | Self-update daily from GitHub (applies on next OpenCode restart) |
+| `OPENCODE_RESUME_STOPSTORE` | `<plugin>/auto-resume.js.stopped.json` | Where user-stop markers are persisted across restarts |
 | `OPENCODE_RESUME_BREAKER_THRESHOLD` / `_WINDOW_MS` / `_COOLDOWN_MS` | `6` / `900000` / `300000` | Global circuit breaker |
 | `OPENCODE_RESUME_COMPACT_ON_OVERFLOW` | `true` | Summarize + resume on overflow |
 | `OPENCODE_RESUME_SWITCH_ON_QUOTA` | `true` | Rotate on free-tier exhaustion |
@@ -160,6 +162,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 
 ## Safety rails
 
+- **User Stop is absolute**: hitting Stop cancels every queued injection and pauses recovery, todo-drive, auto-proceed, improvement passes, proposals *and* permission autopilot until you send the next prompt — and the stop is **remembered across restarts** (small JSON sidecar file), so a stopped session is never automatically revived
 - Per-task resume chain cap, reset by any real user message or clean completion
 - Shared autopilot nudge budget + wall-clock budget per task
 - Spin detection (todo drive stops when nothing progresses)
@@ -172,7 +175,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 
 ## Compatibility
 
-Works anywhere OpenCode runs — **Windows, macOS, Linux**. The plugin is a single zero-dependency file using only the OpenCode SDK client, timers, and environment variables; no filesystem, shell, or OS-specific APIs. Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
+Works anywhere OpenCode runs — **Windows, macOS, Linux**. The plugin is a single zero-dependency file using only the OpenCode SDK client, timers, and environment variables, plus two tiny local files it manages itself: the self-update backup and the user-stop memory (`auto-resume.js.stopped.json`). Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
 
 Tested against OpenCode's event API: `session.error`, `session.status`, `session.idle`, `message.updated`, `message.part.updated`, `todo.updated`, `permission.updated/replied`, `session.compacted`.
 

@@ -21,7 +21,11 @@
  *   • server/machine crashes → on startup, recently-active interrupted
  *     sessions are re-animated automatically
  *   • subagent/child sessions are left to their parent orchestrator
- *   • user aborts are always respected; auth errors surfaced, never hammered
+ *   • user aborts ("Stop") are fully respected: the plugin detects the stop,
+ *     cancels everything already queued, and stays completely quiet — no
+ *     recovery, nudges, or autopilot — until the user sends a new prompt.
+ *     Stops are remembered on disk, so restarting OpenCode never auto-revives
+ *     a stopped session (the plugin's own takeover restarts are exempt)
  *
  * ══════════════════════════════════════════════════════════════════
  *  SUBSYSTEM 2 — MODEL ROTATION (no user input required)
@@ -123,12 +127,14 @@
  *  OPENCODE_AUTOPILOT_MAX_NUDGES         max self-driven nudges/task(25)
  *  OPENCODE_AUTOPILOT_BUDGET_MS          wall-clock budget per task (28800000 = 8h, 0=off)
  *  OPENCODE_RESUME_AUTO_UPDATE           self-update daily from GitHub (true)
+ *  OPENCODE_RESUME_STOPSTORE             user-stop memory file
+ *                                        (<plugin dir>/auto-resume.js.stopped.json)
  *  OPENCODE_AUTOPILOT_MAX_COST_USD       spend cap per task, USD     (10, 0=off)
  */
 
 import { writeFile, rename } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.4.3"
+const AUTO_RESUME_VERSION = "1.5.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -394,6 +400,54 @@ export const AutoResumePlugin = async ({ client }) => {
   let catalogCache = null
   let catalogFetchedAt = 0
 
+  // This file's own path on disk (also used by the self-updater below).
+  const selfPath = (() => {
+    try {
+      if (!import.meta.url.startsWith("file:")) return null
+      return decodeURIComponent(new URL(import.meta.url).pathname).replace(/^\/([A-Za-z]:)/, "$1")
+    } catch { return null }
+  })()
+
+  // ── persistent memory of user stops (survives OpenCode restarts) ──────
+  // A session the user stopped must never be auto-started again — not by
+  // recovery, not by re-animation after a crash/restart — until they send a
+  // new prompt. The markers live in a tiny JSON sidecar next to this file.
+  const STOP_STORE_PATH = str("OPENCODE_RESUME_STOPSTORE", selfPath ? `${selfPath}.stopped.json` : "")
+  const STOP_STORE_TTL_MS = 14 * 86_400_000 // forget ancient markers
+  const persistedStops = new Map() // sessionID -> stoppedAt
+  let stopStoreLoaded = false
+
+  const loadStoppedStore = async () => {
+    if (!STOP_STORE_PATH || stopStoreLoaded) return
+    stopStoreLoaded = true
+    try {
+      const { readFile } = await import("node:fs/promises")
+      const raw = JSON.parse(await readFile(STOP_STORE_PATH, "utf8"))
+      const cutoff = Date.now() - STOP_STORE_TTL_MS
+      if (raw && typeof raw === "object") {
+        for (const [id, ts] of Object.entries(raw)) {
+          if (typeof ts === "number" && ts > cutoff) persistedStops.set(id, ts)
+        }
+      }
+      log("info", "restored persisted user-stops", { count: persistedStops.size })
+    } catch { /* no store yet (or unreadable) — start empty */ }
+  }
+
+  const saveStoppedStore = () =>
+    detach(async () => {
+      if (!STOP_STORE_PATH) return
+      const out = {}
+      const cutoff = Date.now() - STOP_STORE_TTL_MS
+      for (const [id, ts] of persistedStops) if (ts > cutoff) out[id] = ts
+      const tmp = `${STOP_STORE_PATH}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
+      await writeFile(tmp, JSON.stringify(out, null, 2), "utf8")
+      await rename(tmp, STOP_STORE_PATH)
+    }, "stop-store-save")
+
+  /** Stopped = flagged live this run OR remembered from a previous run. */
+  const isUserStopped = (sessionID) =>
+    Boolean(sessions.get(sessionID)?.userStopped || persistedStops.has(sessionID))
+
   const state = (id) => {
     let s = sessions.get(id)
     if (!s) {
@@ -411,6 +465,7 @@ export const AutoResumePlugin = async ({ client }) => {
         toolErrs: 0, debugArmed: false, toolRunning: false,
         lastTurnHadText: false,
         retryEnteredAt: 0, retryNext: 0, child: false, reanimated: false,
+        userStopped: false, takeoverAt: 0,
         lastInjectKind: null,
         lastEvalSig: null,
         taskCost: 0, costToasted: false,
@@ -429,7 +484,7 @@ export const AutoResumePlugin = async ({ client }) => {
       lastDriveCompleted: -1, proposalSent: false, improveDone: 0,
       proceedCount: 0, taskStartAt: Date.now(), toolErrs: 0,
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
-      lastTurnHadText: false, taskCost: 0, costToasted: false,
+      userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costToasted: false,
       lastErrorName: null, lastErrorSig: null,
     })
     if (!keepTimers) s.stallResumes = 0
@@ -490,6 +545,13 @@ export const AutoResumePlugin = async ({ client }) => {
     }
     return "fatal"
   }
+
+  /** The Stop button (user abort) surfaces as MessageAbortedError. */
+  const isAbortError = (error) =>
+    Boolean(error) && (
+      error.name === "MessageAbortedError" ||
+      /abort/i.test(String(error?.data?.message ?? ""))
+    )
 
   const retryAfterMs = (error) => {
     const headers = error?.data?.responseHeaders
@@ -608,7 +670,30 @@ export const AutoResumePlugin = async ({ client }) => {
   }
 
   // ── scheduling / injection ─────────────────────────────────────────
+  /** User hit Stop: go fully quiet — cancel everything queued, inject nothing,
+   *  auto-answer no permissions — until a REAL user prompt starts a new task. */
+  const markUserStopped = (sessionID, why) => {
+    const s = state(sessionID)
+    if (s.userStopped) return
+    s.userStopped = true
+    persistedStops.set(sessionID, Date.now())
+    saveStoppedStore()
+    const t = timers.get(sessionID)
+    if (t) { clearTimeout(t); timers.delete(sessionID) }
+    log("info", "user stop detected — automation paused until next prompt", { sessionID, why })
+    toast(`${RESUME_TAG}: Stopped by you — staying quiet until your next prompt.`, "info")
+  }
+
+  /** Aborts issued by our own takeover (stall/retry restarts) must never read
+   *  as user stops — the takeover schedules its own resume right after. */
+  const isOwnTakeoverAbort = (s) =>
+    s.takeoverAt > 0 && Date.now() - s.takeoverAt < 10_000
+
   const schedule = (sessionID, delayMs, plan) => {
+    if (isUserStopped(sessionID)) {
+      log("info", `not scheduling "${plan.kind}" — session was stopped by the user`, { sessionID })
+      return
+    }
     const existing = timers.get(sessionID)
     if (existing) clearTimeout(existing)
     const t = setTimeout(() => {
@@ -638,6 +723,10 @@ export const AutoResumePlugin = async ({ client }) => {
   const runPlan = async (sessionID, plan) => {
     if (!injectionAllowed(sessionID)) return
     const s0 = state(sessionID)
+    if (isUserStopped(sessionID)) {
+      log("info", `suppressed "${plan.kind}" — session was stopped by the user`, { sessionID })
+      return
+    }
     if (cfg.maxTaskCostUsd > 0 && s0.taskCost >= cfg.maxTaskCostUsd) {
       if (!s0.costToasted) {
         s0.costToasted = true
@@ -702,6 +791,10 @@ export const AutoResumePlugin = async ({ client }) => {
       return
     }
     const s = state(sessionID)
+    if (isUserStopped(sessionID)) {
+      log("info", "ignoring error — session was stopped by the user", { sessionID })
+      return
+    }
     const nowMs = Date.now()
     // Dedupe only the SAME incident (session.error + message.updated both fire);
     // anything recurring after a dispatched resume is a new incident.
@@ -719,7 +812,14 @@ export const AutoResumePlugin = async ({ client }) => {
       sessionID, name: error?.name, statusCode: error?.data?.statusCode, message: error?.data?.message,
     })
 
-    if (kind === "abort") { toast(`${RESUME_TAG}: Turn aborted — not resuming (user request).`, "info"); return }
+    if (kind === "abort") {
+      if (isOwnTakeoverAbort(s)) {
+        log("info", "ignoring abort issued by our own takeover", { sessionID })
+        return
+      }
+      markUserStopped(sessionID, error?.name ?? "abort")
+      return
+    }
     if (kind === "auth") {
       // Auth is provider-scoped: rotate to another PROVIDER's model if possible.
       if (cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "authentication failed"))) {
@@ -893,6 +993,7 @@ export const AutoResumePlugin = async ({ client }) => {
 
   const evaluateIdle = async (sessionID) => {
     const s = state(sessionID)
+    if (isUserStopped(sessionID)) { s.awaitingCompactionSince = 0; return }
     const relevant =
       s.lastErrorName || s.lastResumeAt || s.continueCount ||
       s.todos.length || s.lastTurnHadText
@@ -921,6 +1022,15 @@ export const AutoResumePlugin = async ({ client }) => {
     if (info.modelID && !s.currentModel) {
       s.lastModel = { providerID: info.providerID, modelID: info.modelID }
       s.originalModel = s.originalModel ?? s.lastModel
+    }
+
+    // Stop-button presses that never raised session.error still leave a
+    // MessageAbortedError on the stored assistant message — honor those too.
+    if (isAbortError(info.error)) {
+      if (!isOwnTakeoverAbort(s)) {
+        markUserStopped(sessionID, "assistant message carries an abort error")
+      }
+      return
     }
 
     const hasContent = (lastAssistant.parts ?? []).some((p) => ["text", "tool", "reasoning"].includes(p?.type))
@@ -1025,6 +1135,7 @@ export const AutoResumePlugin = async ({ client }) => {
     s.stallResumes += 1
     s.chain += 1
     s.lastActivity = Date.now()
+    s.takeoverAt = Date.now() // our own abort — must not read as a user stop
     s.retryEnteredAt = 0
     s.retryNext = 0
     log("warn", why, { sessionID })
@@ -1043,7 +1154,7 @@ export const AutoResumePlugin = async ({ client }) => {
       if (nowMs - s.lastActivity > 21_600_000) sessions.delete(sessionID)
     }
     for (const [sessionID, s] of sessions) {
-      if (s.child) continue
+      if (s.child || isUserStopped(sessionID)) continue
 
       // A session parked in OpenCode's internal retry loop can wait for a
       // provider-specified Retry-After of effectively unlimited length.
@@ -1082,6 +1193,7 @@ export const AutoResumePlugin = async ({ client }) => {
   // that was mid-recovery or awaiting its first reply. On startup we scan
   // recent sessions and give those a fresh continuation.
   const reanimate = async () => {
+    await loadStoppedStore() // markers must be known before any revival decision
     if (!cfg.reanimate) return
     let list = []
     try {
@@ -1095,6 +1207,8 @@ export const AutoResumePlugin = async ({ client }) => {
     const cutoff = Date.now() - cfg.reanimateWindowMs
     for (const sess of list) {
       if (!sess?.id || sess.parentID) continue // subagents belong to parents
+      // The user stopped this session: never auto-start it, whatever happened.
+      if (persistedStops.has(sess.id)) continue
       if ((sess.time?.updated ?? 0) < cutoff) continue // too old to be a crash victim
       const s = state(sess.id)
       if (s.reanimated) continue
@@ -1122,7 +1236,11 @@ export const AutoResumePlugin = async ({ client }) => {
 
       if (lastInfo.role === "assistant" && lastInfo.error) {
         const kind = classify(lastInfo.error)
-        if (["abort", "auth", "fatal", "overflow"].includes(kind)) continue
+        if (["abort", "auth", "fatal", "overflow"].includes(kind)) {
+          // A session the user had stopped before the crash stays stopped.
+          if (kind === "abort") s.userStopped = true
+          continue
+        }
         if (lastInfo.modelID) {
           s.lastModel = { providerID: lastInfo.providerID, modelID: lastInfo.modelID }
         }
@@ -1154,12 +1272,6 @@ export const AutoResumePlugin = async ({ client }) => {
     }
     return false
   }
-  const selfPath = (() => {
-    try {
-      if (!import.meta.url.startsWith("file:")) return null
-      return decodeURIComponent(new URL(import.meta.url).pathname).replace(/^\/([A-Za-z]:)/, "$1")
-    } catch { return null }
-  })()
   const checkForUpdates = async () => {
     if (!cfg.autoUpdate || !selfPath) return
     if (Date.now() - lastUpdateCheckAt < 86_400_000) return
@@ -1266,6 +1378,9 @@ export const AutoResumePlugin = async ({ client }) => {
                 } catch { ours = false }
               }
               if (!ours) {
+                // A REAL prompt starts a new workflow — lift the stop, on
+                // disk too, so future runs automate this session again.
+                if (persistedStops.delete(info.sessionID)) saveStoppedStore()
                 resetTaskScope(s0)
                 s0.currentModel = null
                 s0.emptyNudges = 0
@@ -1360,7 +1475,8 @@ export const AutoResumePlugin = async ({ client }) => {
             if (!p.sessionID) break
             permissionPending.set(p.sessionID, Date.now()) // always: watchdog depends on it
             if (!p.id) break
-            const decision = decidePermission(p)
+            // After a user Stop, the human owns every decision again.
+            const decision = isUserStopped(p.sessionID) ? null : decidePermission(p)
             if (decision) {
               detach(respondToPermission(p.sessionID, p, decision,
                 decision === "reject" ? "dangerous pattern" : "autopilot"), "permission")
@@ -1379,7 +1495,8 @@ export const AutoResumePlugin = async ({ client }) => {
             const nowMs = Date.now()
             if (cfg.reanimate && nowMs - lastReanimateAt > 300_000) {
               lastReanimateAt = nowMs
-              detach(reanimate, "reanimate")
+    detach(loadStoppedStore, "stop-store-load")
+    detach(reanimate, "reanimate")
             }
             break
           }
@@ -1409,6 +1526,7 @@ export const AutoResumePlugin = async ({ client }) => {
             if (id) {
               sessions.delete(id)
               permissionPending.delete(id)
+              if (persistedStops.delete(id)) saveStoppedStore()
               const t = timers.get(id)
               if (t) clearTimeout(t)
               timers.delete(id)
