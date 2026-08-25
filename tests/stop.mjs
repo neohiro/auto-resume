@@ -284,6 +284,7 @@ process.env.OPENCODE_RESUME_STOPSTORE = join(tmpdir(), "ar-stop-after-s11.json")
 
 // ---- S13: silent thinking gets a fast, clearly-labelled automatic retry ------
 {
+  const dir = await mkdtemp(join(tmpdir(), "ar-think-"))
   process.env.OPENCODE_RESUME_THINK_STALL_MS = "150"
   process.env.OPENCODE_RESUME_WATCHDOG_MS = "40"
   const state = makeState()
@@ -300,6 +301,7 @@ process.env.OPENCODE_RESUME_STOPSTORE = join(tmpdir(), "ar-stop-after-s11.json")
   await hooks.event(ev("message.part.updated", { part: { type: "tool", sessionID: "toolx", state: { status: "running" }, tool: "bash" } }))
   await sleep(400)
   ok(!state.aborts.includes("toolx"), "S13: running tools keep their extended grace")
+  await rm(dir, { recursive: true, force: true })
   ;["OPENCODE_RESUME_THINK_STALL_MS", "OPENCODE_RESUME_WATCHDOG_MS"].forEach((k) => delete process.env[k])
 }
 
