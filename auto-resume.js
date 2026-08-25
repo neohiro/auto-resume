@@ -149,7 +149,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.8.3"
+const AUTO_RESUME_VERSION = "1.8.4"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -761,7 +761,7 @@ $x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Wi
 $t = $x.GetElementsByTagName('text')
 $t.Item(0).AppendChild($x.CreateTextNode(${q(title)})) | Out-Null
 $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('opencode.auto-resume').Show([Windows.UI.Notifications.ToastNotification]::new($x))`
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))`
         const encoded = Buffer.from(ps, "utf16le").toString("base64")
         await $`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`.quiet()
         return true
