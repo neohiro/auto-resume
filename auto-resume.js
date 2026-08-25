@@ -140,7 +140,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.7.1"
+const AUTO_RESUME_VERSION = "1.7.2"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -543,17 +543,30 @@ export const AutoResumePlugin = async ({ client }) => {
     return "armed"
   }
 
+  let titleApiCache // undefined = not yet resolved; false = unavailable
   const resolveSessionUpdate = () => {
+    if (titleApiCache !== undefined) return titleApiCache
     const ns = client.session ?? {}
-    return (
-      ns.update ?? ns.updateSessionById ?? ns.patchSessionById ?? ns.patchSessionId ?? null
-    )
+    const fn =
+      ns.update ?? ns.updateSessionById ?? ns.patchSessionById ?? ns.patchSessionId ??
+      Object.keys(ns)
+        .map((k) => ns[k])
+        .find((f) => typeof f === "function" && f.name && /(update|patch|rename)/i.test(f.name))
+    titleApiCache = typeof fn === "function" ? fn : false
+    log("info", titleApiCache
+      ? `title indicator bound to client.session.${titleApiCache.name || "(anonymous)"}`
+      : "title indicator unavailable: no session-update API found on this SDK")
+    return titleApiCache
   }
 
   const fetchSessionTitle = async (sessionID) => {
     const ns = client.session ?? {}
     try {
-      const get = ns.get ?? ns.getSessionById
+      const get =
+        ns.get ?? ns.getSessionById ??
+        Object.keys(ns)
+          .map((k) => ns[k])
+          .find((f) => typeof f === "function" && f.name && /^get/i.test(f.name))
       if (typeof get === "function") {
         const res = await get.call(ns, { path: { id: sessionID } })
         const data = res?.data ?? res
@@ -1454,13 +1467,24 @@ export const AutoResumePlugin = async ({ client }) => {
         continue
       }
 
-      if (lastInfo.role === "assistant" && lastInfo.error) {
-        const kind = classify(lastInfo.error)
-        if (["abort", "auth", "fatal", "overflow"].includes(kind)) {
-          // A session the user had stopped before the crash stays stopped.
-          if (kind === "abort") s.userStopped = true
-          continue
-        }
+      // Graceful shutdowns make core stamp the in-flight message with
+      // MessageAbortedError — identical to a Stop press in stored data.
+      // But genuine Stops were persisted LIVE at press time and filtered
+      // above via suppressed(); anything reaching this point is an
+      // INTERRUPTION (crash or client restart), not a user decision.
+      // A hard kill leaves no error at all — detect those via a missing
+      // completion timestamp (only trusted when time object exists).
+      const incomplete =
+        lastInfo.role === "assistant" &&
+        !lastInfo.error &&
+        typeof lastInfo.time === "object" &&
+        lastInfo.time !== null &&
+        !(lastInfo.time.completed > 0)
+
+      if (lastInfo.role === "assistant" && (lastInfo.error || incomplete)) {
+        let kind = lastInfo.error ? classify(lastInfo.error) : "interrupted"
+        if (kind === "abort") kind = "retryable" // shutdown artifact → revive
+        if (["auth", "fatal", "overflow"].includes(kind)) continue
         if (lastInfo.modelID) {
           s.lastModel = { providerID: lastInfo.providerID, modelID: lastInfo.modelID }
         }
@@ -1549,12 +1573,18 @@ export const AutoResumePlugin = async ({ client }) => {
         let acked = ""
         try { acked = await readFile(ackPath, "utf8").catch(() => "") } catch { }
         if (acked.trim() === AUTO_RESUME_VERSION) return
+        // Show BEFORE committing the ack: if the TUI isn't ready yet and the
+        // toast fails, the marker stays old and the next start tries again.
+        if (acked) {
+          const shown = await client.tui.showToast({
+            body: {
+              message: `${RESUME_TAG}: Now running v${AUTO_RESUME_VERSION} (previously ${acked.trim() || "unknown"}) — update fully applied.`,
+              variant: "info",
+            },
+          }).then(() => true).catch(() => false)
+          if (!shown) return
+        }
         await writeFile(ackPath, AUTO_RESUME_VERSION, "utf8")
-        if (!acked) return // first boot after clean install: nothing to confirm
-        toast(
-          `${RESUME_TAG}: Now running v${AUTO_RESUME_VERSION} (previously ${acked.trim() || "unknown"}) — update fully applied.`,
-          "info",
-        )
       } catch { /* cosmetic only */ }
     }, "update-notice")
     detach(reanimate, "reanimate")

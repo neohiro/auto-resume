@@ -248,4 +248,34 @@ const ev = (type, properties) => ({ event: { type, properties } })
   process.env.OPENCODE_RESUME_STOPSTORE = join(tmpdir(), "ar-stop-after-s11.json")
 }
 
+// ---- S12: restart-time aborts are interruptions, not user stops --------------
+{
+  const now = Date.now()
+  const state = makeState()
+  state.sessionList = [
+    { id: "sd", time: { updated: now - 2_000 } },      // graceful shutdown mid-turn
+    { id: "hk", time: { updated: now - 2_500 } },      // hard kill, no error written
+    { id: "done", time: { updated: now - 3_000 } },    // finished normally before restart
+  ]
+  state.messagesBySession.sd = [{
+    info: { role: "assistant", error: { name: "MessageAbortedError", data: { message: "aborted" } },
+            providerID: "provA", modelID: "a-max", time: { created: now - 5_000, completed: now - 4_000 } },
+    parts: [],
+  }]
+  state.messagesBySession.hk = [{
+    info: { role: "assistant", error: null, time: { created: now - 5_000 } },
+    parts: [{ type: "text", text: "partial..." }],
+  }]
+  state.messagesBySession.done = [{
+    info: { role: "assistant", error: null, time: { created: now - 9_000, completed: now - 8_000 } },
+    parts: [{ type: "text", text: "All done." }],
+  }]
+  await AutoResumePlugin({ client: makeClient(state) })
+  await sleep(2200)
+  ok(state.prompts.some((p) => p.id === "sd"), "S12: shutdown-abort revived as an interruption")
+  ok(!state.toasts.some((t) => t.includes("Stopped by you")), "S12: shutdown-abort NOT misread as a stop")
+  ok(state.prompts.some((p) => p.id === "hk"), "S12: hard-killed incomplete turn revived")
+  ok(!state.prompts.some((p) => p.id === "done"), "S12: normally finished session left alone")
+}
+
 console.log(process.exitCode ? "STOP TESTS FAILED" : "ALL STOP TESTS PASSED")

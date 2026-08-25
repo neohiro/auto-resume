@@ -45,7 +45,7 @@ This is what auto-resume is for.
 | Silently stalled streams (busy but no events) | Aborts + restarts the turn |
 | Quiet-but-running tools (builds, test suites) | Extended grace window (×4) before any stall verdict |
 | Internal retry loops that never end (huge provider `Retry-After` values) | Taken over: aborted and resumed on the plugin's own schedule |
-| Server / machine crashes mid-task | On startup, recently-interrupted sessions are **re-animated** automatically |
+| Client restarts / server crashes mid-task | On startup, recently-interrupted sessions ("Interrupted") are **re-animated** automatically — a restart is never mistaken for a Stop |
 | Subagent sessions | Left alone — their parent orchestrator owns them |
 | User aborts (**Stop**) | Detected — everything queued is cancelled and automation stays fully quiet until your next prompt |
 | Auth errors | Surfaced — never hammered |
