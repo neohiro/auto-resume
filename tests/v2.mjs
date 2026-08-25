@@ -91,6 +91,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await ask("bash", "Run command", { command: "rm -rf ./node_modules" })
   await ask("edit", "Edit file src/app.py")
   await ask("webfetch", "Fetch https://example.com")
+  await ask("external_directory", "Access directory", { patterns: ["C:\\proj\\data\\*"] })
   await ask("mystery_type", "Unknown thing")
   await sleep(300)
   const byPerm = Object.fromEntries(state.permResponses.map((r) => [r.permissionID, r.response]))
@@ -98,7 +99,8 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(byPerm.p2 === "reject", "M: dangerous bash rejected (agent unblocks)")
   ok(byPerm.p3 === "once", "M: edit approved")
   ok(byPerm.p4 === "once", "M: webfetch approved")
-  ok(byPerm.p5 === undefined, "M: unknown type left for human in safe mode")
+  ok(byPerm.p5 === "once", "M: external_directory approved so AFK runs proceed")
+  ok(byPerm.p6 === undefined, "M: unknown type left for human in safe mode")
 }
 
 // ---- N: todo drive -> improvement passes -> wrap-up proposals ---------------

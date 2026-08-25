@@ -53,6 +53,8 @@
  *     UNLESS they match a dangerous-pattern blocklist (rm -rf, force push,
  *     disk format, registry edits, pipe-to-shell ...) — matched ones are
  *     REJECTED so the agent adapts instead of hanging
+ *   • workspace-external directory grants ("Allow always / once" pop-ups)
+ *     are answered automatically so AFK runs never stall on them
  *   • unknown permission types are left for the user in safe mode
  *
  * ══════════════════════════════════════════════════════════════════
@@ -140,7 +142,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.7.4"
+const AUTO_RESUME_VERSION = "1.7.5"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1197,6 +1199,9 @@ export const AutoResumePlugin = async ({ client }) => {
   const EDIT_TYPES = ["edit", "write", "patch", "file", "apply_patch"]
   const SHELL_TYPES = ["bash", "shell", "command", "terminal", "execute"]
   const WEB_TYPES = ["webfetch", "fetch", "web", "url"]
+  // Workspace-external directory grants ("Allow always / Allow once" pop-ups):
+  // without an answer the session stalls forever — a show-stopper when AFK.
+  const DIR_TYPES = ["external_directory", "directory", "path"]
 
   const decidePermission = (perm) => {
     if (!cfg.autonomy || !cfg.permissions) return null
@@ -1204,6 +1209,10 @@ export const AutoResumePlugin = async ({ client }) => {
     const type = String(perm.type ?? "").toLowerCase()
     if (looksDangerous(perm)) return "reject"
     if (EDIT_TYPES.includes(type) || WEB_TYPES.includes(type)) return "once"
+    // Answered "once" so unattended runs proceed; repeated asks for the same
+    // directory are each answered automatically. Paths can be deny-listed via
+    // OPENCODE_AUTOPILOT_EXTRA_DENY (the directory pattern is in metadata).
+    if (DIR_TYPES.includes(type)) return "once"
     if (SHELL_TYPES.includes(type)) return "once" // danger already checked above
     if (cfg.permissionMode === "all") return "once"
     return null // safe mode: unknown types stay human-decided

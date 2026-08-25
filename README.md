@@ -66,6 +66,7 @@ Anything **model-specific** that keeps failing moves your session elsewhere:
 Never comes back from lunch to a session stuck on *"Allow bash command?"*:
 
 - **Safe mode** (default): edits & web fetches approved; shell commands approved *unless* they match a danger blocklist (`rm -rf`, force-push, disk formatting, pipe-to-shell, registry edits…). Matched commands are **rejected** so the agent adapts instead of hanging.
+- **Workspace-external directory grants** ("Allow always / Allow once" pop-ups) are answered automatically so AFK runs never stall on them — deny-list sensitive paths via `OPENCODE_AUTOPILOT_EXTRA_DENY`.
 - Unknown permission types stay human-decided in safe mode; `all` mode approves everything.
 
 ### 4 — Task driver ("beyond expectations")
