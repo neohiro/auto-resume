@@ -140,7 +140,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.6.1"
+const AUTO_RESUME_VERSION = "1.7.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -192,33 +192,38 @@ const DEFAULTS = {
 const RESUME_TAG = "[auto-resume]"
 
 const AUTONOMY_DIRECTIVE =
-  " You are running unattended: make reasonable decisions yourself, never wait for confirmation or ask questions, prefer completing the task over asking, choose sensible defaults, verify your own work, and document any assumptions you made."
+  " You are a senior software engineer working fully unattended — hold every output ABOVE INDUSTRY STANDARDS and EXCEED EXPECTATIONS." +
+  " Make reasonable decisions yourself and document them; never wait for confirmation or ask questions; prefer completing the task over asking; choose sensible defaults." +
+  " Your definition of done is production-grade, not merely plausible: the project builds, tests and linters/type-checks pass, edge cases and error handling are covered, security and performance were considered, public behavior stays backward-compatible, and docs/comments match reality — zero leftover TODO/FIXME or dead code." +
+  " Verify your own work with real toolchain runs before declaring completion: perfect finalization always beats a fast partial."
 
 const PROMPTS = {
   resume: (auto) =>
-    `${RESUME_TAG} The previous attempt was interrupted by a transient infrastructure error (network outage, provider error, rate limit, or timeout). Continue the interrupted task from exactly where you left off. Do not apologize, do not repeat completed work, do not summarize unless asked.` +
+    `${RESUME_TAG} Your run was interrupted by a transient infrastructure error (network outage, provider error, rate limit, or timeout). Re-enter like a senior engineer: silently reconstruct the exact task state from the conversation and codebase (re-read the files you touched, re-run quick checks if unsure), then continue from precisely where you stopped.` +
+    " Do not apologize, do not repeat finished work, do not summarize unless asked — deliver the remaining work to production-grade completion: builds/tests/linters green, edge cases handled, docs consistent." +
     (auto ? AUTONOMY_DIRECTIVE : ""),
   truncated: (auto) =>
-    `${RESUME_TAG} Your previous reply hit the maximum output length and was cut off mid-response. Continue seamlessly from the exact point where you stopped, without repeating any earlier content.` +
+    `${RESUME_TAG} Your previous reply hit the maximum output length and was cut off mid-response. Continue seamlessly from the exact point you stopped — never repeat earlier content. Close any half-open code block or sentence first, then finish the remainder completely; when the artifact is code, deliver it whole, runnable, and up to standard rather than fragmentary.` +
     (auto ? AUTONOMY_DIRECTIVE : ""),
   empty: (auto) =>
-    `${RESUME_TAG} Your previous response arrived empty, likely due to a transient provider issue. Please produce your answer to the original request now.` +
+    `${RESUME_TAG} Your previous response arrived empty, likely due to a transient provider issue. Produce the full answer to the original request now — substantive, precise, and held to a production-grade bar.` +
     (auto ? AUTONOMY_DIRECTIVE : ""),
   todos: () =>
-    `${RESUME_TAG} This session went idle while the todo list still has unfinished items. Continue working through them autonomously now, one by one, marking each completed as you go.`,
+    `${RESUME_TAG} This session went idle while the todo list still has unfinished items. Work them off autonomously now, one by one, like a staff engineer shipping a release: implement each item completely (code + tests + docs where they matter), actually VERIFY it (run the relevant build/tests/linters), and only then mark it completed. Hold every item to a quality bar above industry standards — edge cases, error handling, clean integration — until the list reaches flawless completion.`,
   proceed: () =>
     `${RESUME_TAG} Proceed autonomously with exactly what you just proposed or asked about — the answer is yes. Do not ask again; decide and continue.` +
+    " Execute it end-to-end at senior level: complete implementation including tests, error handling, and doc touches, verified against the real toolchain — aim to exceed expectations, not merely satisfy the request." +
     AUTONOMY_DIRECTIVE,
   keepGoing: () =>
-    `${RESUME_TAG} You ended your reply indicating there is still work to do ("continue", "finalize", etc.) but the turn stopped. Pick up exactly where you left off right now and finish it. Do not restate what is already done.` +
+    `${RESUME_TAG} You ended your reply indicating there is still work to do ("continue", "finalize", etc.) but the turn stopped. Pick up exactly where you left off right now and drive it to perfect finalization: finish the remaining steps, verify with builds/tests/linters, and leave nothing half-done — no stray TODOs, no loose ends, no unverified claims.` +
     AUTONOMY_DIRECTIVE,
   debug: () =>
-    `${RESUME_TAG} The last several tool calls failed repeatedly. Stop repeating the same failing approach. Diagnose the actual root cause first (read the full error output, inspect relevant files/state), form a hypothesis, then apply a targeted fix.`,
+    `${RESUME_TAG} The last several tool calls failed repeatedly. Stop repeating the same failing approach — switch to disciplined root-cause analysis: read the FULL error output (not just the first line), inspect the actual files/state involved, form ONE concrete hypothesis, apply the smallest targeted fix that addresses the true cause, then prove it: re-run the failing command and add a regression test so this class of failure stays dead.`,
   improve: (cycle, total) =>
-    `${RESUME_TAG} Self-improvement pass ${cycle}/${total}: critically review ALL work produced in this session. Hunt for concrete improvements in correctness, performance, security, robustness, and readability — edge cases, missing error handling, stale docs or comments, gaps in test coverage, inefficient hot spots. Directly implement every improvement you are confident about and validate it (run the relevant builds/tests/linters). Explicitly skip anything ambiguous or risky and note why in one line. Do NOT introduce new features.` +
+    `${RESUME_TAG} Self-improvement pass ${cycle}/${total}: critically review ALL work produced in this session the way a principal engineer signs off a release. Hunt for concrete gains in correctness, performance, security, robustness, and readability — unhandled edge cases, missing input validation, race conditions, resource leaks, stale docs/comments, thin test coverage on critical paths, inefficient hot spots, inconsistent style. Directly implement every improvement you are confident about and VALIDATE it (run builds, tests, linters, type-checks); explicitly skip anything ambiguous or risky and note why in one line. Do NOT introduce new features — raise the existing work clearly above industry standards.` +
     AUTONOMY_DIRECTIVE,
   propose: () =>
-    `${RESUME_TAG} The todo list is fully complete. Do NOT implement anything further. Instead reply with a short wrap-up: what was accomplished, plus up to 3 concrete follow-up improvement proposals as bullet points.`,
+    `${RESUME_TAG} The todo list is fully complete — flawless execution. Do NOT implement anything further. Reply with a short wrap-up instead: what was accomplished together with proof of quality (passing builds/tests/linters), plus up to 3 concrete follow-up improvement proposals as bullet points, each with its expected payoff.`,
 }
 
 const NETWORK_PATTERNS = [
