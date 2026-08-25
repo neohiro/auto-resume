@@ -217,8 +217,10 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.idle", { sessionID: "t7" }))
   await sleep(450)
   ok(String(state.titles.t7 ?? "").includes("🟢 armed"), "T7 precondition: armed baseline")
-  // transient error mid-task -> actively recovering
+  // transient error mid-task -> core enters its own retry loop -> actively
+  // recovering (status stays "retry" while core works)
   await hooks.event(ev("session.error", { sessionID: "t7", error: { name: "APIError", data: { statusCode: 503, message: "unavailable" } } }))
+  await hooks.event(ev("session.status", { sessionID: "t7", status: { type: "retry", attempt: 1, message: "unavailable", next: Date.now() + 5_000 } }))
   await sleep(500)
   ok(String(state.titles.t7 ?? "").includes("🔁 recovering"), "T7: active recovery shows 🔁")
   // clean successful turn afterwards -> back to 🟢 armed (not stuck on 🔁)
