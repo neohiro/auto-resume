@@ -54,7 +54,9 @@
  *     disk format, registry edits, pipe-to-shell ...) — matched ones are
  *     REJECTED so the agent adapts instead of hanging
  *   • workspace-external directory grants ("Allow always / once" pop-ups)
- *     are answered automatically so AFK runs never stall on them
+ *     are answered automatically so AFK runs never stall on them; a built-in
+ *     cross-OS regex denylist rejects sensitive system areas (Windows, Linux
+ *     and macOS conventions alike) no matter which path style the grant uses
  *   • unknown permission types are left for the user in safe mode
  *
  * ══════════════════════════════════════════════════════════════════
@@ -142,7 +144,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.7.5"
+const AUTO_RESUME_VERSION = "1.7.6"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1203,6 +1205,25 @@ export const AutoResumePlugin = async ({ client }) => {
   // without an answer the session stalls forever — a show-stopper when AFK.
   const DIR_TYPES = ["external_directory", "directory", "path"]
 
+  /** Sensitive system areas that must never be auto-granted, expressed for
+   *  ALL major path conventions (Windows / Linux / macOS) so a grant is
+   *  rejected no matter which OS style the pattern uses on any host.
+   *  Segment-anchored to avoid false hits like "\network" or "cabinet".
+   *  Applied against the JSON payload, where backslashes are escaped —
+   *  the [\\/] character class matches either separator form. */
+  const SENSITIVE_DIR_RES = [
+    /[\\/]windows([\\/"'*]|$)/i,
+    /system32([\\/"'*]|$)/i,
+    /[\\/]program files(\s*\(x86\))?([\\/"']|$)/i,
+    /[\\/](etc|proc|sys|dev|boot|root|usr|bin|sbin|lib|var)([\\/"'*]|$)/i,
+    /[\\/]\.(ssh|gnupg|aws|kube|docker|azure|gcp)([\\/"']|$)/i,
+    /[\\/]library[\\/]keychains?([\\/"']|$)/i,
+  ]
+  const sensitiveDirHit = (perm) => {
+    const blob = JSON.stringify({ t: perm.title, m: perm.metadata }).toLowerCase()
+    return SENSITIVE_DIR_RES.some((re) => re.test(blob))
+  }
+
   const decidePermission = (perm) => {
     if (!cfg.autonomy || !cfg.permissions) return null
     if (cfg.permissionMode === "off") return null
@@ -1210,9 +1231,10 @@ export const AutoResumePlugin = async ({ client }) => {
     if (looksDangerous(perm)) return "reject"
     if (EDIT_TYPES.includes(type) || WEB_TYPES.includes(type)) return "once"
     // Answered "once" so unattended runs proceed; repeated asks for the same
-    // directory are each answered automatically. Paths can be deny-listed via
+    // directory are each answered automatically. Cross-OS sensitive areas are
+    // rejected outright; paths can additionally be deny-listed via
     // OPENCODE_AUTOPILOT_EXTRA_DENY (the directory pattern is in metadata).
-    if (DIR_TYPES.includes(type)) return "once"
+    if (DIR_TYPES.includes(type)) return sensitiveDirHit(perm) ? "reject" : "once"
     if (SHELL_TYPES.includes(type)) return "once" // danger already checked above
     if (cfg.permissionMode === "all") return "once"
     return null // safe mode: unknown types stay human-decided
