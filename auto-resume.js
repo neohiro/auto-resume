@@ -149,7 +149,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.8.4"
+const AUTO_RESUME_VERSION = "1.8.5"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -767,9 +767,12 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
         return true
       }
       if (platform === "darwin") {
-        await $`osascript -e ${`display notification ${JSON.stringify(message)} with title ${JSON.stringify(title)}`}`
+        // AppleScript double-quoted strings: escape backslashes first, then quotes
+        const q = (s) => `"${String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+        await $`osascript -e ${`display notification ${q(message)} with title ${q(title)}`}`
         return true
       }
+      // Linux and everything else: libnotify
       await $`notify-send ${title} ${message}`.quiet()
       return true
     } catch {
