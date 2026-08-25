@@ -216,20 +216,21 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t7", text: "working" } }))
   await hooks.event(ev("session.idle", { sessionID: "t7" }))
   await sleep(450)
-  ok(String(state.titles.t7 ?? "").includes("🟢 armed"), "T7 precondition: armed baseline")
+  const t7Title = () => String(state.titles.t7 ?? "")
+  ok(t7Title().includes("[auto-resume: armed]") && t7Title().includes("🟢"), "T7 precondition: armed baseline")
   // transient error mid-task -> core enters its own retry loop -> actively
   // recovering (status stays "retry" while core works)
   await hooks.event(ev("session.error", { sessionID: "t7", error: { name: "APIError", data: { statusCode: 503, message: "unavailable" } } }))
   await hooks.event(ev("session.status", { sessionID: "t7", status: { type: "retry", attempt: 1, message: "unavailable", next: Date.now() + 5_000 } }))
   await sleep(500)
-  ok(String(state.titles.t7 ?? "").includes("🔁 recovering"), "T7: active recovery shows 🔁")
+  ok(t7Title().includes("[auto-resume: recovering]") && t7Title().includes("🔁"), "T7: active recovery shows 🔁")
   // clean successful turn afterwards -> back to 🟢 armed (not stuck on 🔁)
   state.messagesBySession.t7 = [{ info: { role: "assistant", error: null }, parts: [{ type: "text", text: "recovered fine" }] }]
   await hooks.event(ev("session.status", { sessionID: "t7", status: { type: "idle" } })) // core finished: exits retry state
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t7", text: "recovered fine" } }))
   await hooks.event(ev("session.idle", { sessionID: "t7" }))
   await sleep(450)
-  ok(String(state.titles.t7 ?? "").includes("🟢 armed"), "T7: clean turn returns tag to 🟢 armed")
+  ok(t7Title().includes("[auto-resume: armed]") && t7Title().includes("🟢"), "T7: clean turn returns tag to 🟢 armed")
 }
 
 console.log(process.exitCode ? "TITLE TESTS FAILED" : "ALL TITLE TESTS PASSED")
