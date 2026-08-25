@@ -278,10 +278,6 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(!state.prompts.some((p) => p.id === "done"), "S12: normally finished session left alone")
 }
 
-await rm(dir, { recursive: true, force: true })
-// keep a valid store path for any later suites
-process.env.OPENCODE_RESUME_STOPSTORE = join(tmpdir(), "ar-stop-after-s11.json")
-
 // ---- S13: silent thinking gets a fast, clearly-labelled automatic retry ------
 {
   const dir = await mkdtemp(join(tmpdir(), "ar-think-"))
