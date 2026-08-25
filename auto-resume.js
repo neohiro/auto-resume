@@ -100,6 +100,8 @@
  *  OPENCODE_RESUME_NUDGE_DELAY_MS        continue-nudge delay       (1500)
  *  OPENCODE_RESUME_STALL_TIMEOUT_MS      busy-silence => stalled    (240000)
  *  OPENCODE_RESUME_THINK_STALL_MS        thinking-silence => retry  (60000)
+ *  OPENCODE_RESUME_REARM_MS              give-up cool-down before one
+ *                                        bounded recovery re-arm     (600000)
  *  OPENCODE_RESUME_WATCHDOG_MS           stall check interval       (10000)
  *  OPENCODE_RESUME_RUNNING_TOOL_FACTOR   grace multiplier while a
  *                                        tool is running            (4)
@@ -147,7 +149,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.8.0"
+const AUTO_RESUME_VERSION = "1.8.1"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -161,6 +163,7 @@ const DEFAULTS = {
   nudgeDelayMs: 1_500,
   stallTimeoutMs: 240_000,
   thinkStallMs: 60_000,
+  rearmMs: 600_000,
   watchdogMs: 10_000,
   runningToolFactor: 4,
   retryTakeoverMs: 900_000,
@@ -368,6 +371,7 @@ function loadConfig() {
     nudgeDelayMs: num("OPENCODE_RESUME_NUDGE_DELAY_MS", DEFAULTS.nudgeDelayMs),
     stallTimeoutMs: num("OPENCODE_RESUME_STALL_TIMEOUT_MS", DEFAULTS.stallTimeoutMs),
     thinkStallMs: num("OPENCODE_RESUME_THINK_STALL_MS", DEFAULTS.thinkStallMs),
+    rearmMs: num("OPENCODE_RESUME_REARM_MS", DEFAULTS.rearmMs),
     watchdogMs: num("OPENCODE_RESUME_WATCHDOG_MS", DEFAULTS.watchdogMs),
     runningToolFactor: Math.max(1, num("OPENCODE_RESUME_RUNNING_TOOL_FACTOR", DEFAULTS.runningToolFactor)),
     retryTakeoverMs: num("OPENCODE_RESUME_RETRY_TAKEOVER_MS", DEFAULTS.retryTakeoverMs),
@@ -698,7 +702,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         userStopped: false, takeoverAt: 0,
         lastInjectKind: null,
         lastEvalSig: null,
-        taskCost: 0, costToasted: false,
+        taskCost: 0, costToasted: false, budgetToasted: false, gaveUpRearmed: false,
       }
       sessions.set(id, s)
     }
@@ -715,6 +719,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       proceedCount: 0, taskStartAt: Date.now(), toolErrs: 0,
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
       userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costToasted: false,
+      budgetToasted: false, gaveUpRearmed: false,
       lastErrorName: null, lastErrorSig: null,
     })
     if (!keepTimers) s.stallResumes = 0
@@ -1056,7 +1061,9 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
       })
       queueTitleRefresh(sessionID)
     } catch (err) {
-      log("error", "resume prompt rejected", { sessionID, err: err?.message ?? String(err) })
+      const ns = client.session ?? {}
+      const mode = typeof (ns.promptAsync ?? ns.postSessionByIdPromptAsync) === "function" ? "async" : "sync"
+      log("error", `resume prompt rejected (${mode})`, { sessionID, err: err?.message ?? String(err) })
       noteResumeFailure()
       if (plan.kind === "resume" && s.chain < cfg.maxChain) {
         s.chain += 1
@@ -1207,6 +1214,22 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     if (s.chain >= cfg.maxChain) {
       noteResumeFailure()
       toast(`${RESUME_TAG}: Gave up after ${s.chain} recovery attempts (${kind}). Send a message to try manually.`, "error")
+      // Bounded self-re-arm for unattended runs: after a cool-down, reset the
+      // chain and try ONCE more — long outages (502 storms, provider blips)
+      // must not permanently kill recovery until the user returns.
+      if (!s.gaveUpRearmed && !suppressed(sessionID)) {
+        s.gaveUpRearmed = true
+        const t = setTimeout(() => {
+          const cur = state(sessionID)
+          if (cur.chain >= cfg.maxChain &&
+              cur.lastResumeAt <= s.lastErrorAt && !suppressed(sessionID)) {
+            cur.chain = 0
+            log("info", "post-give-up re-arm — retrying recovery", { sessionID })
+            schedule(sessionID, jitter(cfg.baseDelayMs), { kind: "resume", prompt: PROMPTS.resume })
+          }
+        }, cfg.rearmMs)
+        t.unref?.()
+      }
       return
     }
     s.pendingResume = true
@@ -1354,6 +1377,8 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     if (!errored && hasContent) {
       noteSuccess()
       s.toolErrs = 0
+      s.gaveUpRearmed = false
+      s.budgetToasted = false
 
       const todos = s.todos ?? []
       const open = todos.filter((t) => t.status === "pending" || t.status === "in_progress")
@@ -1389,10 +1414,12 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
         }
       }
 
-      // Full completion → self-improvement passes → wrap-up proposals → toast
+        // Full completion → self-improvement passes → wrap-up proposals → toast
       if ((todos.length > 0 || boxes.length > 0) && open.length === 0 && cbOpen === 0) {
-        if (cfg.autonomy && cfg.improveLoop && s.improveDone < cfg.improveCycles &&
-            s.nudges < cfg.maxNudges && budgetLeft(s)) {
+        // Quality passes are EXEMPT from the shared nudge budget: they have
+        // their own hard caps (improveCycles / proposalSent), and burning the
+        // drive budget must never silence final-quality passes on long runs.
+        if (cfg.autonomy && cfg.improveLoop && s.improveDone < cfg.improveCycles && budgetLeft(s)) {
           s.improveDone += 1
           s.nudges += 1
           log("info", "improvement pass", { sessionID, cycle: `${s.improveDone}/${cfg.improveCycles}` })
@@ -1402,7 +1429,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
           })
           return
         }
-        if (cfg.autonomy && cfg.proposals && !s.proposalSent && s.nudges < cfg.maxNudges && budgetLeft(s)) {
+        if (cfg.autonomy && cfg.proposals && !s.proposalSent && budgetLeft(s)) {
           s.proposalSent = true
           s.nudges += 1
           schedule(sessionID, cfg.nudgeDelayMs, { kind: "propose", prompt: PROMPTS.propose })
@@ -1432,6 +1459,12 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
         log("warn", "todo-drive stopped: no progress across nudges", { sessionID })
         toast(`${RESUME_TAG}: Todos stalled without progress — stopping auto-drive.`, "warning")
         return
+      }
+      // Nudge budget exhausted on drives/proceeds: say so ONCE instead of
+      // silently going dark — quality passes (improve/propose) still run.
+      if ((open.length > 0 || cbOpen > 0) && !s.budgetToasted) {
+        s.budgetToasted = true
+        toast(`${RESUME_TAG}: Drive-nudge budget (${cfg.maxNudges}) reached — pausing todo-drives. Self-improvement passes still run. Send a new prompt to refill.`, "warning")
       }
       return
     }

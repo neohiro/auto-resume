@@ -143,6 +143,35 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(asyncCalls === 1 && syncCalls === 0, "P2: fire-and-forget async dispatch preferred")
 }
 
+// ---- Q2: quality passes (improve/propose) exempt from drive-nudge budget ------
+{
+  process.env.OPENCODE_AUTOPILOT_MAX_NUDGES = "1"
+  const todosPending = [
+    { id: "t1", status: "pending", content: "work", priority: "high" },
+  ]
+  const todosDone = [
+    { id: "t1", status: "completed", content: "work", priority: "high" },
+  ]
+  const { state, hooks } = await fresh(["qS"])
+  await hooks.event(ev("todo.updated", { sessionID: "qS", todos: todosPending }))
+  await hooks.event(ev("session.idle", { sessionID: "qS" })) // consumes nudge #1 on a drive
+  await sleep(350)
+  ok(state.prompts.some((p) => p.text.includes("unfinished items")), "Q2: drive fired with budget")
+  // budget now exhausted; another idle with pending todos -> one-time toast
+  await hooks.event(ev("session.idle", { sessionID: "qS" }))
+  await sleep(300)
+  ok(state.toasts.some((t) => t.includes("Drive-nudge budget") && t.includes("Self-improvement passes still run")),
+    "Q2: budget exhaustion surfaced with a clear toast")
+  // complete the todos -> improve MUST fire despite exhausted drive budget
+  await hooks.event(ev("todo.updated", { sessionID: "qS", todos: todosDone }))
+  await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "qS", text: "all done" } }))
+  await hooks.event(ev("session.idle", { sessionID: "qS" }))
+  await sleep(400)
+  ok(state.prompts.some((p) => p.text.includes("Self-improvement pass 1/2")),
+    "Q2: improvement pass fires despite exhausted drive budget")
+  delete process.env.OPENCODE_AUTOPILOT_MAX_NUDGES
+}
+
 // ---- N: todo drive -> improvement passes -> wrap-up proposals ---------------
 {
   const todosOpen = [
