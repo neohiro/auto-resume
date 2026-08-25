@@ -83,10 +83,11 @@
  * wall-clock budget, spin detection, circuit breaker with cool-down,
  * incident-signature dedupe, idle-status check before every injection.
  * All injected user messages are tagged "[auto-resume]" for visibility.
- * Each engaged session also carries a live title tag —
- *   "<title> [auto-resume: 🟢 armed | 🔁 recovering | ⏸️ stopped | 🚫 paused]"
- * Turning auto-resume off for a session ("auto-resume off" in chat) removes
- * every trace of it from the title until "auto-resume on" is sent.
+ * Each engaged session also carries a live status decoration —
+ *   "🟢 <title> [auto-resume: armed]"   (🔁 recovering / ⏸️ stopped / 🚫 paused)
+ * with the glyph leading and the bracket tag trailing. Turning auto-resume off
+ * for a session ("auto-resume off" in chat) removes every trace of it from
+ * the title until "auto-resume on" is sent.
  *
  * ══════════════════════════════════════════════════════════════════
  *  CONFIGURATION (env vars, all optional)
@@ -149,7 +150,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.8.6"
+const AUTO_RESUME_VERSION = "1.9.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -530,11 +531,13 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   const suppressed = (sessionID) => isUserStopped(sessionID) || isOptedOut(sessionID)
 
   // ── per-session title indicator ────────────────────────────────────────
-  // While auto-resume is enabled for a session, its title carries a trailing
-  // "[auto-resume: <icon> <status>]" tag. Turning it off restores the exact
-  // previous title — no trace of the plugin remains.
+  // While auto-resume is enabled for a session, its title is decorated as:
+  //   "<glyph> <base title> [auto-resume: <status>]"
+  // (leading status glyph + trailing bracket tag). Turning auto-resume off
+  // restores the exact previous title — no trace of the plugin remains.
   const TITLE_MARK_TEST = /\[auto-resume:/i
   const TITLE_MARK_STRIP = /\s*\[auto-resume:[^\]]*\]/gi
+  const GLYPH_LEAD_RE = /^\s*(?:🟢|🔁|⏸️|🚫)\s+/u
   const STATUS_STYLE = {
     armed:      { glyph: "🟢", label: "armed" },
     recovering: { glyph: "🔁", label: "recovering" },
@@ -543,7 +546,18 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   }
   const knownTitles = new Map()   // sessionID -> latest raw title we saw
   const writtenTitles = new Map() // sessionID -> last title this plugin wrote
+  const baseTitles = new Map()    // sessionID -> clean base title (no decorations)
   const titleTimers = new Map()   // sessionID -> debounce timer
+
+  /** Remove our trailing tag; strip a leading STATUS glyph if present — those
+   *  four glyphs are ours exclusively, so decoration never accumulates even
+   *  when OpenCode's auto-titler echoes decorated text back. */
+  const extractBaseTitle = (raw) => {
+    let s = String(raw).replace(TITLE_MARK_STRIP, "").trimEnd()
+    const m = GLYPH_LEAD_RE.exec(s)
+    if (m) s = s.slice(m[0].length)
+    return s.trimEnd()
+  }
 
   const statusKeyOf = (sessionID) => {
     const s = sessions.get(sessionID)
@@ -622,7 +636,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         if (raw == null) return
         knownTitles.set(sessionID, raw)
       }
-      const base = raw.replace(TITLE_MARK_STRIP, "").trimEnd()
+      const base = extractBaseTitle(raw)
+      baseTitles.set(sessionID, base)
       if (isOptedOut(sessionID)) {
         // Off: restore the pristine title — remove every trace of us.
         if (base !== raw) {
@@ -634,7 +649,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         return
       }
       const style = STATUS_STYLE[statusKeyOf(sessionID)]
-      const target = `${base} [auto-resume: ${style.glyph} ${style.label}]`
+      const target = `${style.glyph} ${base} [auto-resume: ${style.label}]`
       if (target === raw || target === writtenTitles.get(sessionID)) return
       await update.call(client.session, { path: { id: sessionID }, body: { title: target } })
       writtenTitles.set(sessionID, target)
@@ -1551,6 +1566,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
         sessions.delete(sessionID)
         knownTitles.delete(sessionID)
         writtenTitles.delete(sessionID)
+        baseTitles.delete(sessionID)
         const tt = titleTimers.get(sessionID)
         if (tt) clearTimeout(tt)
         titleTimers.delete(sessionID)
@@ -2042,6 +2058,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
               }
               knownTitles.delete(id)
               writtenTitles.delete(id)
+              baseTitles.delete(id)
               const tt = titleTimers.get(id)
               if (tt) clearTimeout(tt)
               titleTimers.delete(id)

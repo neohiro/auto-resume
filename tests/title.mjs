@@ -77,7 +77,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t1", text: "Plan:" } }))
   await hooks.event(ev("session.idle", { sessionID: "t1" })) // open checkbox -> drive
   await sleep(600)
-  ok(state.titles.t1 === "Fix the parser bug [auto-resume: 🟢 armed]",
+  ok(state.titles.t1 === "🟢 Fix the parser bug [auto-resume: armed]",
     "T1: armed tag appended after the original title")
 }
 
@@ -92,7 +92,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.error", { sessionID: "t2", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
   await hooks.event(ev("session.idle", { sessionID: "t2" }))
   await sleep(600)
-  ok(state.titles.t2 === "Migrate database [auto-resume: ⏸️ stopped]",
+  ok(state.titles.t2 === "⏸️ Migrate database [auto-resume: stopped]",
     "T2: stop switches the indicator to ⏸️ stopped")
 }
 
@@ -108,7 +108,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t3", text: "Plan:" } }))
   await hooks.event(ev("session.idle", { sessionID: "t3" })) // attaches 🟢 + drives
   await sleep(500)
-  ok(String(state.titles.t3 ?? "").includes("[auto-resume: 🟢 armed]"),
+  ok(String(state.titles.t3 ?? "").includes("[auto-resume: armed]"),
     "T3 precondition: tag was attached")
   // turn it OFF via in-chat command (register text BEFORE dispatch)
   state.msgStore.off1 = "auto-resume off"
@@ -157,7 +157,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   stateB.msgStore.o2 = "auto-resume on"
   await hooksB.event(ev("message.updated", { info: { role: "user", sessionID: "p9", id: "o2" } }))
   await sleep(600)
-  ok(stateB.titles.p9 === "Build the importer [auto-resume: 🟢 armed]",
+  ok(stateB.titles.p9 === "🟢 Build the importer [auto-resume: armed]",
     "T4: 'auto-resume on' re-arms and re-tags the title")
   await sleep(200)
   const offRaw = JSON.parse(await readFile(process.env.OPENCODE_RESUME_OFFSTORE, "utf8"))
@@ -184,7 +184,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   // core renames the session (tag dropped by whoever renamed)
   await hooks.event(ev("session.updated", { info: { id: "t5", title: "Rename: parser work" } }))
   await sleep(500)
-  ok(state.titles.t5 === "Rename: parser work [auto-resume: 🟢 armed]",
+  ok(state.titles.t5 === "🟢 Rename: parser work [auto-resume: armed]",
     "T5: external rename adopted, tag re-attached to the new base")
 }
 
