@@ -149,7 +149,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.8.2"
+const AUTO_RESUME_VERSION = "1.8.3"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -696,7 +696,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         lastErrorAt: 0, lastErrorSig: null, lastErrorName: null,
         chain: 0, continueCount: 0, stallResumes: 0, emptyNudges: 0,
         compactAttempted: false, awaitingCompactionSince: 0,
-        pendingResume: false, lastResumeAt: 0, lastInjectAt: 0,
+        pendingResume: false, lastResumeAt: 0, lastInjectAt: 0, lastSuccessAt: 0,
         lastModel: null, currentModel: null, originalModel: null,
         rlStreak: 0, failStreak: 0, rotations: 0,
         todos: [], nudges: 0, driveCount: 0, staleDrives: -1,
@@ -983,6 +983,9 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
       log("info", `not scheduling "${plan.kind}" — session was stopped by the user`, { sessionID })
       return
     }
+    // Stamp creation time once: recovery plans dispatched after a later clean
+    // turn are stale and get dropped (see runPlan).
+    if (!plan.createdTs) plan.createdTs = Date.now()
     const existing = timers.get(sessionID)
     if (existing) clearTimeout(existing)
     const t = setTimeout(() => {
@@ -1022,6 +1025,14 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
         log("warn", "task cost cap reached - stopping auto-injections", { sessionID, spent: Math.round(s0.taskCost * 100) / 100 })
         toast(`${RESUME_TAG}: Task cost $${s0.taskCost.toFixed(2)} reached the $${cfg.maxTaskCostUsd} cap - pausing auto-drive. Raise OPENCODE_AUTOPILOT_MAX_COST_USD to continue.`, "warning")
       }
+      return
+    }
+    // Stale-recovery guard: if the session already had a clean turn AFTER
+    // this plan was scheduled, core self-healed and the injection would be
+    // a spurious "transient error" prompt on a healthy session — drop it.
+    if (plan.kind === "resume" && plan.createdTs &&
+        s0.lastSuccessAt >= plan.createdTs) {
+      log("info", "dropping recovery — session already recovered on its own", { sessionID })
       return
     }
     const s = state(sessionID)
@@ -1397,6 +1408,10 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
 
     if (!errored && hasContent) {
       noteSuccess()
+      // A clean turn supersedes any recovery still waiting to fire: without
+      // this, error→scheduled resume + core's own successful retry produced
+      // spurious "transient infrastructure error" prompts on healthy turns.
+      s.lastSuccessAt = Date.now()
       s.toolErrs = 0
       s.gaveUpRearmed = false
       s.budgetToasted = false

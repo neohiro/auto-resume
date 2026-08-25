@@ -143,6 +143,22 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(asyncCalls === 1 && syncCalls === 0, "P2: fire-and-forget async dispatch preferred")
 }
 
+// ---- Q4: recovery self-cancels when the session already recovered ------------
+{
+  // widen the dispatch window so the test controls ordering deterministically
+  process.env.OPENCODE_RESUME_BASE_DELAY_MS = "300"
+  const { state, hooks } = await fresh(["qR"])
+  await hooks.event(ev("session.error", { sessionID: "qR", error: { name: "APIError", data: { statusCode: 502, message: "bad gateway" } } }))
+  // core recovers on its own and completes a clean turn BEFORE our timer fires
+  await sleep(80)
+  await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "qR", text: "done fine" } }))
+  await hooks.event(ev("session.idle", { sessionID: "qR" }))
+  await sleep(500) // past the 300ms dispatch moment
+  ok(!state.prompts.some((p) => p.id === "qR"),
+    "Q4: no spurious resume after the session already recovered")
+  process.env.OPENCODE_RESUME_BASE_DELAY_MS = "30" // restore for later blocks
+}
+
 // ---- Q3: upstream/unavailable phrasing + AbortError are captured, with cause --
 {
   const { state, hooks } = await fresh(["qE"])
