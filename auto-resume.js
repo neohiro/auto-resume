@@ -16,6 +16,8 @@
  *   • empty responses → re-nudge
  *   • stalled streams (busy w/o events) → abort + restart (skips pending perms,
  *     extended grace while a long tool legitimately runs)
+ *   • model "thinking" with zero events → labelled automatic retry (~60s, abort
+ *     + resume, labelled as self-healing, not error) before the full stall
  *   • internal retry loops that never end (huge provider Retry-After values)
  *     → taken over: aborted and resumed by the plugin
  *   • server/machine crashes → on startup, recently-active interrupted
@@ -97,6 +99,7 @@
  *  OPENCODE_RESUME_OUTPUT_LENGTH_MAX     truncation nudges          (3)
  *  OPENCODE_RESUME_NUDGE_DELAY_MS        continue-nudge delay       (1500)
  *  OPENCODE_RESUME_STALL_TIMEOUT_MS      busy-silence => stalled    (240000)
+ *  OPENCODE_RESUME_THINK_STALL_MS        thinking-silence => retry  (60000)
  *  OPENCODE_RESUME_WATCHDOG_MS           stall check interval       (10000)
  *  OPENCODE_RESUME_RUNNING_TOOL_FACTOR   grace multiplier while a
  *                                        tool is running            (4)
@@ -144,7 +147,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.7.8"
+const AUTO_RESUME_VERSION = "1.8.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -157,6 +160,7 @@ const DEFAULTS = {
   outputLengthMax: 3,
   nudgeDelayMs: 1_500,
   stallTimeoutMs: 240_000,
+  thinkStallMs: 60_000,
   watchdogMs: 10_000,
   runningToolFactor: 4,
   retryTakeoverMs: 900_000,
@@ -220,6 +224,9 @@ const PROMPTS = {
     AUTONOMY_DIRECTIVE,
   keepGoing: () =>
     `${RESUME_TAG} You ended your reply indicating there is still work to do ("continue", "finalize", etc.) but the turn stopped. Pick up exactly where you left off right now and drive it to perfect finalization: finish the remaining steps, verify with builds/tests/linters, and leave nothing half-done — no stray TODOs, no loose ends, no unverified claims.` +
+    AUTONOMY_DIRECTIVE,
+  retry: (attempt) =>
+    `${RESUME_TAG} Automatic retry #${attempt} — this is routine self-healing, not an error on your part. Your previous attempt was stopped because it produced no output for ~60 seconds while marked busy. Resume the task exactly where it visibly stopped and continue straight to production-grade completion.` +
     AUTONOMY_DIRECTIVE,
   debug: () =>
     `${RESUME_TAG} The last several tool calls failed repeatedly. Stop repeating the same failing approach — switch to disciplined root cause analysis: read the FULL error output (not just the first line), inspect the actual files/state involved, form ONE concrete hypothesis, apply the smallest targeted fix that addresses the true cause, then prove it: re-run the failing command and add a regression test so this class of failure stays dead.`,
@@ -360,6 +367,7 @@ function loadConfig() {
     outputLengthMax: num("OPENCODE_RESUME_OUTPUT_LENGTH_MAX", DEFAULTS.outputLengthMax),
     nudgeDelayMs: num("OPENCODE_RESUME_NUDGE_DELAY_MS", DEFAULTS.nudgeDelayMs),
     stallTimeoutMs: num("OPENCODE_RESUME_STALL_TIMEOUT_MS", DEFAULTS.stallTimeoutMs),
+    thinkStallMs: num("OPENCODE_RESUME_THINK_STALL_MS", DEFAULTS.thinkStallMs),
     watchdogMs: num("OPENCODE_RESUME_WATCHDOG_MS", DEFAULTS.watchdogMs),
     runningToolFactor: Math.max(1, num("OPENCODE_RESUME_RUNNING_TOOL_FACTOR", DEFAULTS.runningToolFactor)),
     retryTakeoverMs: num("OPENCODE_RESUME_RETRY_TAKEOVER_MS", DEFAULTS.retryTakeoverMs),
@@ -1436,7 +1444,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
   }
 
   // ── stall + stuck-retry watchdog ───────────────────────────────────
-  const takeover = (sessionID, why, toastMsg) => {
+  const takeover = (sessionID, why, toastMsg, plan = { kind: "resume", prompt: PROMPTS.resume }) => {
     const s = state(sessionID)
     if (s.chain >= cfg.maxChain || s.stallResumes >= 2) return
     s.stallResumes += 1
@@ -1450,7 +1458,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     queueTitleRefresh(sessionID)
     detach(async () => {
       try { await client.session.abort({ path: { id: sessionID } }) } catch { /* already dead */ }
-      setTimeout(() => schedule(sessionID, 800, { kind: "resume", prompt: PROMPTS.resume }), 1_500).unref?.()
+      setTimeout(() => schedule(sessionID, 800, plan), 1_500).unref?.()
     }, "takeover-abort")
   }
 
@@ -1492,6 +1500,17 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
 
       if (s.status !== "busy") continue
       if (permissionPending.has(sessionID)) continue
+      const silentFor = nowMs - s.lastActivity
+      // Fast lane: model "thinking" with zero events for a short window -> labelled
+      // automatic retry (abort + resume). Tool activity keeps its own longer grace below.
+      if (!s.toolRunning && cfg.thinkStallMs > 0 && silentFor >= cfg.thinkStallMs) {
+        const attempt = Math.min(s.stallResumes + 1, 9)
+        takeover(sessionID,
+          `thinking stalled ${Math.round(silentFor / 1000)}s with no output — automatic retry #${attempt}`,
+          `${RESUME_TAG}: No output for ~${Math.round(cfg.thinkStallMs / 1000)}s — automatic retry #${attempt}.`,
+          { kind: "retry", prompt: () => PROMPTS.retry(attempt) })
+        continue
+      }
       // A genuinely running tool gets an extended grace window: quiet builds,
       // installs, test suites are legitimate silence, not stalls.
       const silenceLimit = s.toolRunning

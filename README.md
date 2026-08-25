@@ -42,7 +42,7 @@ This is what auto-resume is for.
 | Truncated output (`MessageOutputLengthError`) | Seamless *"continue exactly where you stopped"* nudge |
 | Context-window overflow | Triggers compaction, resumes automatically afterwards |
 | Empty responses | Re-nudges once |
-| Silently stalled streams (busy but no events) | Aborts + restarts the turn |
+| Silently stalled streams (busy but no events) | Fast automatic retry after ~60s of silent "thinking" (labelled as such), full restart after the extended stall window |
 | Quiet-but-running tools (builds, test suites) | Extended grace window (×4) before any stall verdict |
 | Internal retry loops that never end (huge provider `Retry-After` values) | Taken over: aborted and resumed on the plugin's own schedule |
 | Client restarts / server crashes mid-task | On startup, recently-interrupted sessions ("Interrupted") are **re-animated** automatically — a restart is never mistaken for a Stop |
@@ -130,6 +130,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_RATE_LIMIT_BASE_MS` | `20000` | Backoff base for 429s |
 | `OPENCODE_RESUME_OUTPUT_LENGTH_MAX` | `3` | Truncation continue-nudges |
 | `OPENCODE_RESUME_STALL_TIMEOUT_MS` | `240000` | Busy-without-events ⇒ stalled |
+| `OPENCODE_RESUME_THINK_STALL_MS` | `60000` | Busy "thinking" silence ⇒ labelled automatic retry |
 | `OPENCODE_RESUME_WATCHDOG_MS` | `10000` | Stall check interval |
 | `OPENCODE_RESUME_RUNNING_TOOL_FACTOR` | `4` | Stall grace multiplier while a tool is running |
 | `OPENCODE_RESUME_RETRY_TAKEOVER_MS` | `900000` | Max time in OpenCode's internal retry loop before takeover |

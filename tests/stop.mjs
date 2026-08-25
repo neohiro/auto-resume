@@ -278,4 +278,30 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(!state.prompts.some((p) => p.id === "done"), "S12: normally finished session left alone")
 }
 
+await rm(dir, { recursive: true, force: true })
+  // keep a valid store path for any later suites
+  process.env.OPENCODE_RESUME_STOPSTORE = join(tmpdir(), "ar-stop-after-s11.json")
+}
+
+// ---- S13: silent thinking gets a fast, clearly-labelled automatic retry ------
+{
+  process.env.OPENCODE_RESUME_THINK_STALL_MS = "150"
+  process.env.OPENCODE_RESUME_WATCHDOG_MS = "40"
+  const state = makeState()
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  await hooks.event(ev("session.status", { sessionID: "think", status: { type: "busy" } }))
+  await sleep(300) // past the 150ms think-stall window
+  ok(state.aborts.includes("think"), "S13: silent thinking aborted at the fast threshold")
+  await sleep(2500)
+  ok(state.prompts.some((p) => p.id === "think" && p.text.includes("Automatic retry")),
+    "S13: retry prompt is explicitly labelled")
+  ok(state.toasts.some((t) => t.includes("automatic retry")), "S13: toast says 'automatic retry'")
+  // tool activity keeps its grace: no fast abort for quiet-but-running tools
+  await hooks.event(ev("session.status", { sessionID: "toolx", status: { type: "busy" } }))
+  await hooks.event(ev("message.part.updated", { part: { type: "tool", sessionID: "toolx", state: { status: "running" }, tool: "bash" } }))
+  await sleep(400)
+  ok(!state.aborts.includes("toolx"), "S13: running tools keep their extended grace")
+  ;["OPENCODE_RESUME_THINK_STALL_MS", "OPENCODE_RESUME_WATCHDOG_MS"].forEach((k) => delete process.env[k])
+}
+
 console.log(process.exitCode ? "STOP TESTS FAILED" : "ALL STOP TESTS PASSED")
