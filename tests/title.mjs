@@ -225,6 +225,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(String(state.titles.t7 ?? "").includes("🔁 recovering"), "T7: active recovery shows 🔁")
   // clean successful turn afterwards -> back to 🟢 armed (not stuck on 🔁)
   state.messagesBySession.t7 = [{ info: { role: "assistant", error: null }, parts: [{ type: "text", text: "recovered fine" }] }]
+  await hooks.event(ev("session.status", { sessionID: "t7", status: { type: "idle" } })) // core finished: exits retry state
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t7", text: "recovered fine" } }))
   await hooks.event(ev("session.idle", { sessionID: "t7" }))
   await sleep(450)
