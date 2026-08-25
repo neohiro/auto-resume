@@ -144,7 +144,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.7.7"
+const AUTO_RESUME_VERSION = "1.7.8"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1008,13 +1008,18 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
         status = (res?.data ?? res)?.[sessionID]?.type
       } catch { status = "unknown" }
       if (status && status !== "idle") {
+        // Core is mid-turn (often retrying through a provider outage).
+        // Poll patiently — but NEVER force-inject onto a live turn: a queued
+        // prompt would fire right after and duplicate the work. If the busy
+        // turn dies on its own, its session.error re-arms recovery anyway.
         plan.polls = (plan.polls || 0) + 1
-        if (plan.polls > 12) {
-          log("warn", "session never went idle; injecting anyway", { sessionID })
-        } else {
+        const maxPolls = plan.kind === "resume" ? 60 : 12
+        if (plan.polls <= maxPolls) {
           schedule(sessionID, 5_000, plan) // core busy/retrying — check again shortly
           return
         }
+        log("info", "session stayed busy — dropping stale injection", { sessionID, kind: plan.kind })
+        return
       }
     }
 
@@ -1026,8 +1031,21 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     s.lastInjectAt = Date.now() // mark BEFORE dispatch: user-message event arrives at turn start
     s.lastResumeAt = s.lastInjectAt
     try {
-      await client.session.prompt({ path: { id: sessionID }, body })
-      log("info", `injected "${plan.kind}"`, { sessionID, model: model ? modelKey(model) : undefined })
+      // Fire-and-forget when the server supports it: the sync prompt BLOCKS
+      // until the AI reply completes, so provider outages turned each resume
+      // into a minutes-long hang followed by "fetch failed" and retry storms.
+      const ns = client.session ?? {}
+      const asyncPrompt = ns.promptAsync ?? ns.postSessionByIdPromptAsync
+      if (typeof asyncPrompt === "function") {
+        await asyncPrompt.call(ns, { path: { id: sessionID }, body })
+      } else {
+        await ns.prompt({ path: { id: sessionID }, body })
+      }
+      log("info", `injected "${plan.kind}"`, {
+        sessionID,
+        model: model ? modelKey(model) : undefined,
+        mode: typeof asyncPrompt === "function" ? "async" : "sync",
+      })
       queueTitleRefresh(sessionID)
     } catch (err) {
       log("error", "resume prompt rejected", { sessionID, err: err?.message ?? String(err) })
@@ -1226,6 +1244,8 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
       return true
     } catch (err) {
       log("warn", "permission respond failed", { sessionID, err: err?.message ?? String(err) })
+      // A silent failure strands AFK runs on a popup — surface it.
+      toast(`${RESUME_TAG}: Could not auto-answer a ${perm.type} permission — it needs your attention.`, "warning")
       return false
     }
   }
@@ -1848,13 +1868,18 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
 
           case "permission.updated":
           case "permission.asked": {
-            if (!p.sessionID) break
-            permissionPending.set(p.sessionID, Date.now()) // always: watchdog depends on it
-            if (!p.id) break
+            // Tolerate both payload shapes: flat fields and a nested
+            // p.permission object (seen on newer cores) — without this the
+            // autopilot silently ignored every ask.
+            const perm = p.permission ?? p
+            const sessionID = perm.sessionID ?? p.sessionID
+            if (!sessionID) break
+            permissionPending.set(sessionID, Date.now()) // always: watchdog depends on it
+            if (!perm.id) break
             // After a user Stop, the human owns every decision again.
-            const decision = suppressed(p.sessionID) ? null : decidePermission(p)
+            const decision = suppressed(sessionID) ? null : decidePermission(perm)
             if (decision) {
-              detach(respondToPermission(p.sessionID, p, decision,
+              detach(respondToPermission(sessionID, perm, decision,
                 decision === "reject" ? "dangerous pattern" : "autopilot"), "permission")
             }
             break

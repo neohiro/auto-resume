@@ -111,6 +111,35 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(byPerm.p10 === undefined, "M: unknown type left for human in safe mode")
 }
 
+// ---- P2: nested permission payloads + async prompt dispatch -------------------
+{
+  const { state, hooks } = await fresh([])
+  // newer cores nest the ask payload under p.permission
+  await hooks.event(ev("permission.asked", {
+    sessionID: "permSess2",
+    permission: { id: "nested1", type: "external_directory", metadata: { patterns: ["D:\\data\\*"] } },
+  }))
+  await sleep(250)
+  ok(state.permResponses.some((r) => r.permissionID === "nested1" && r.response === "once"),
+    "P2: nested permission payload answered")
+}
+{
+  let asyncCalls = 0
+  let syncCalls = 0
+  const state = makeState()
+  const client = makeClient(state)
+  client.session.promptAsync = async ({ path }) => {
+    asyncCalls += 1
+    state.prompts.push({ id: path.id, text: "[auto-resume] async" })
+    return true
+  }
+  client.session.prompt = async () => { syncCalls += 1; return true }
+  const hooks = await AutoResumePlugin({ client })
+  await hooks.event(ev("session.error", { sessionID: "asyn", error: { name: "APIError", data: { statusCode: 503, message: "down" } } }))
+  await sleep(400)
+  ok(asyncCalls === 1 && syncCalls === 0, "P2: fire-and-forget async dispatch preferred")
+}
+
 // ---- N: todo drive -> improvement passes -> wrap-up proposals ---------------
 {
   const todosOpen = [
