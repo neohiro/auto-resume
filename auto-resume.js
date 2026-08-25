@@ -140,7 +140,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.7.0"
+const AUTO_RESUME_VERSION = "1.7.1"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -223,7 +223,10 @@ const PROMPTS = {
     `${RESUME_TAG} Self-improvement pass ${cycle}/${total}: critically review ALL work produced in this session the way a principal engineer signs off a release. Hunt for concrete gains in correctness, performance, security, robustness, and readability — unhandled edge cases, missing input validation, race conditions, resource leaks, stale docs/comments, thin test coverage on critical paths, inefficient hot spots, inconsistent style. Directly implement every improvement you are confident about and VALIDATE it (run builds, tests, linters, type-checks); explicitly skip anything ambiguous or risky and note why in one line. Do NOT introduce new features — raise the existing work clearly above industry standards.` +
     AUTONOMY_DIRECTIVE,
   propose: () =>
-    `${RESUME_TAG} The todo list is fully complete — flawless execution. Do NOT implement anything further. Reply with a short wrap-up instead: what was accomplished together with proof of quality (passing builds/tests/linters), plus up to 3 concrete follow-up improvement proposals as bullet points, each with its expected payoff.`,
+    `${RESUME_TAG} The todo list is fully complete — flawless execution. Do NOT implement anything further. Your previous reply already described the work, so do NOT summarize or repeat it. Instead deliver a short wrap-up containing NEW information only:` +
+    " 1. Verification status — what you actually ran (build/tests/linters/type-checks) and the results; state plainly if anything was NOT verified." +
+    " 2. Known limitations, risks, or assumptions a reviewer should know before relying on this." +
+    " 3. Up to 3 concrete follow-up improvement proposals as bullet points, each with its expected payoff.",
 }
 
 const NETWORK_PATTERNS = [
