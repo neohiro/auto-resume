@@ -126,7 +126,10 @@ const ev = (type, properties) => ({ event: { type, properties } })
 {
   let asyncCalls = 0
   let syncCalls = 0
-  const state = makeState()
+  const state = {
+    prompts: [], aborts: [], summarizes: [], toasts: [], permResponses: [],
+    idleIds: new Set(), msgStore: {}, msgN: 0,
+  }
   const client = makeClient(state)
   client.session.promptAsync = async ({ path }) => {
     asyncCalls += 1
