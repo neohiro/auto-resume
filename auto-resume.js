@@ -140,7 +140,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.7.2"
+const AUTO_RESUME_VERSION = "1.7.3"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1557,7 +1557,13 @@ export const AutoResumePlugin = async ({ client }) => {
   if (cfg.enabled) {
     const wd = setInterval(() => detach(checkStalls, "watchdog"), cfg.watchdogMs)
     wd.unref?.()
-    detach(() => log("debug", "auto-resume plugin initialized"), "init-log")
+    detach(() => log("info", `auto-resume v${AUTO_RESUME_VERSION} initialized`), "init-log")
+    detach(stopStore.load, "stop-store-load")
+    detach(offStore.load, "off-store-load")
+    detach(async () => {
+      await Promise.all([stopStore.load(), offStore.load()])
+      restoreOptedOutTitles()
+    }, "optout-title-restore")
     detach(checkForUpdates, "update-check")
     // Long-lived processes: re-probe hourly; the built-in 24h window makes
     // this an actual daily check while OpenCode stays open.
@@ -1757,13 +1763,7 @@ export const AutoResumePlugin = async ({ client }) => {
             const nowMs = Date.now()
             if (cfg.reanimate && nowMs - lastReanimateAt > 300_000) {
               lastReanimateAt = nowMs
-    detach(stopStore.load, "stop-store-load")
-    detach(offStore.load, "off-store-load")
-    detach(async () => {
-      await Promise.all([stopStore.load(), offStore.load()])
-      restoreOptedOutTitles()
-    }, "optout-title-restore")
-    detach(reanimate, "reanimate")
+              detach(reanimate, "reanimate")
             }
             break
           }
