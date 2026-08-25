@@ -279,9 +279,8 @@ const ev = (type, properties) => ({ event: { type, properties } })
 }
 
 await rm(dir, { recursive: true, force: true })
-  // keep a valid store path for any later suites
-  process.env.OPENCODE_RESUME_STOPSTORE = join(tmpdir(), "ar-stop-after-s11.json")
-}
+// keep a valid store path for any later suites
+process.env.OPENCODE_RESUME_STOPSTORE = join(tmpdir(), "ar-stop-after-s11.json")
 
 // ---- S13: silent thinking gets a fast, clearly-labelled automatic retry ------
 {
