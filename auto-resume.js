@@ -140,7 +140,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.6.0"
+const AUTO_RESUME_VERSION = "1.6.1"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -606,6 +606,14 @@ export const AutoResumePlugin = async ({ client }) => {
     }, 250)
     t.unref?.()
     titleTimers.set(sessionID, t)
+  }
+
+  /** Zero-trace guarantee after restarts: if a crash landed between an opt-out
+   *  and its restore PATCH, the stored title may still carry a stale tag —
+   *  sweep every opted-out session once the stores are loaded. Idempotent
+   *  (clean titles produce no PATCH). */
+  const restoreOptedOutTitles = () => {
+    for (const id of [...offStore.map.keys()]) queueTitleRefresh(id)
   }
 
   /** In-chat switch: "auto-resume off" disables everything for THIS session;
@@ -1462,6 +1470,8 @@ export const AutoResumePlugin = async ({ client }) => {
         toast(`${RESUME_TAG}: Revived a session interrupted by the restart.`)
       }
     }
+    // reconnect rescans double as zero-trace sweeps for opted-out sessions
+    restoreOptedOutTitles()
   }
 
 
@@ -1711,6 +1721,10 @@ export const AutoResumePlugin = async ({ client }) => {
               lastReanimateAt = nowMs
     detach(stopStore.load, "stop-store-load")
     detach(offStore.load, "off-store-load")
+    detach(async () => {
+      await Promise.all([stopStore.load(), offStore.load()])
+      restoreOptedOutTitles()
+    }, "optout-title-restore")
     detach(reanimate, "reanimate")
             }
             break

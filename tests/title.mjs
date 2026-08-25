@@ -8,7 +8,7 @@ process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
 process.env.OPENCODE_RESUME_STOPSTORE = join(tmpdir(), "ar-title-stops.json")
 process.env.OPENCODE_RESUME_OFFSTORE = join(tmpdir(), "ar-title-off.json")
 
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { AutoResumePlugin } from "../auto-resume.js"
@@ -186,6 +186,25 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await sleep(500)
   ok(state.titles.t5 === "Rename: parser work [auto-resume: 🟢 armed]",
     "T5: external rename adopted, tag re-attached to the new base")
+}
+
+// ---- T6: stale tags on opted-out sessions are stripped after a restart -------
+{
+  const dir = await mkdtemp(join(tmpdir(), "ar-t6-"))
+  process.env.OPENCODE_RESUME_OFFSTORE = join(dir, "off.json")
+  // simulate an older run that opted t6 out but crashed before restoring the title
+  const store = join(dir, "off.json")
+  await writeFile(store, JSON.stringify({ t6: Date.now() }), "utf8")
+  const state = makeState()
+  state.baseTitles.t6 = "Old task [auto-resume: 🟢 armed]" // stale tag baked in
+  state.sessionList = [{ id: "t6", time: { updated: Date.now() - 1_000 } }]
+  state.messagesBySession.t6 = [{ info: { role: "user", sessionID: "t6" }, parts: [] }]
+  await AutoResumePlugin({ client: makeClient(state) })
+  await sleep(2200) // init load + zero-trace sweep
+  ok(state.titles.t6 === "Old task", "T6: stale tag stripped on startup for opted-out session")
+  ok(state.prompts.length === 0, "T6: sweep never revives the session")
+  await rm(dir, { recursive: true, force: true })
+  process.env.OPENCODE_RESUME_OFFSTORE = join(tmpdir(), "ar-title-off.json")
 }
 
 console.log(process.exitCode ? "TITLE TESTS FAILED" : "ALL TITLE TESTS PASSED")
