@@ -143,6 +143,25 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(asyncCalls === 1 && syncCalls === 0, "P2: fire-and-forget async dispatch preferred")
 }
 
+// ---- Q3: upstream/unavailable phrasing + AbortError are captured, with cause --
+{
+  const { state, hooks } = await fresh(["qE"])
+  // real-world shape seen in logs: "Upstream request failed: Endpoint is unavailable."
+  await hooks.event(ev("session.error", { sessionID: "qE", error: { name: "UnknownError", data: { message: "AI_APICallError: Upstream request failed: Endpoint is unavailable." } } }))
+  await sleep(400)
+  const resume = state.prompts.find((p) => p.id === "qE")
+  ok(Boolean(resume) && resume.text.includes("transient infrastructure error"),
+    "Q3: upstream-unavailable error triggers recovery")
+  ok(Boolean(resume) && resume.text.includes("Endpoint is unavailable"),
+    "Q3: injected prompt names the detected cause")
+  // fetch-level aborts/timeouts (NOT user stops) retry too
+  await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "qE2", id: "x" } }))
+  state.msgStore.x = "go"
+  await hooks.event(ev("session.error", { sessionID: "qE2", error: { name: "AbortError", data: { message: "The operation was aborted" } } }))
+  await sleep(400)
+  ok(state.prompts.some((p) => p.id === "qE2"), "Q3: fetch-level AbortError retried")
+}
+
 // ---- Q2: quality passes (improve/propose) exempt from drive-nudge budget ------
 {
   process.env.OPENCODE_AUTOPILOT_MAX_NUDGES = "1"

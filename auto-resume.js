@@ -149,7 +149,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.8.1"
+const AUTO_RESUME_VERSION = "1.8.2"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -209,8 +209,13 @@ const AUTONOMY_DIRECTIVE =
   " Verify your own work with real toolchain runs before declaring completion: perfect finalization always beats a fast partial."
 
 const PROMPTS = {
-  resume: (auto) =>
-    `${RESUME_TAG} Your run was interrupted by a transient infrastructure error (network outage, provider error, rate limit, or timeout). Re-enter like a senior engineer: silently reconstruct the exact task state from the conversation and codebase (re-read the files you touched, re-run quick checks if unsure), then continue from precisely where you stopped.` +
+  retry: (attempt) =>
+    `${RESUME_TAG} Automatic retry #${attempt} — this is routine self-healing, not an error on your part. Your previous attempt was stopped because it produced no output for ~60 seconds while marked busy. Resume the task exactly where it visibly stopped and continue straight to production-grade completion.` +
+    AUTONOMY_DIRECTIVE,
+  resume: (auto, detail) =>
+    `${RESUME_TAG} Your run was interrupted by a transient infrastructure error (network outage, provider error, rate limit, or timeout).` +
+    (detail ? ` Detected issue: ${detail}.` : "") +
+    ` Re-enter like a senior engineer: silently reconstruct the exact task state from the conversation and codebase (re-read the files you touched, re-run quick checks if unsure), then continue from precisely where you stopped.` +
     " Do not apologize, do not repeat finished work, do not summarize unless asked — deliver the remaining work to production-grade completion: builds/tests/linters green, edge cases handled, docs consistent." +
     (auto ? AUTONOMY_DIRECTIVE : ""),
   truncated: (auto) =>
@@ -250,7 +255,8 @@ const NETWORK_PATTERNS = [
   "premature close", "terminated", "stream ended unexpectedly", "network",
   "enotfound", "eai_again", "dns", "tls", "ssl", "handshake", "gateway",
   "overloaded_error", "overloaded", "bad gateway", "service unavailable",
-  "internal server error",
+  "internal server error", "unavailable", "upstream", "unable to connect",
+  "load failed", "epipe", "too many requests",
 ]
 
 const OVERFLOW_PATTERNS = [
@@ -792,6 +798,9 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     const data = error?.data ?? {}
     const text = `${data.message ?? ""} ${data.responseBody ?? ""}`
     if (name === "MessageAbortedError") return "abort"
+    // Fetch-level timeouts/aborts carry different names than user stops
+    // (MessageAbortedError) — they are transient infrastructure, retryable.
+    if (name === "AbortError" || name === "TimeoutError") return "retryable"
     if (name === "ProviderAuthError") return "auth"
     if (name === "MessageOutputLengthError") return "output_length"
     if (matchesAny(text, QUOTA_PATTERNS)) return "quota"
@@ -811,6 +820,17 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
       return "fatal"
     }
     return "fatal"
+  }
+
+  /** Short human-readable cause for injected prompts/log lines: e.g.
+   *  "APIError HTTP 502 — bad gateway" or "UnknownError — upstream request failed". */
+  const describeErr = (error) => {
+    if (!error) return ""
+    const name = error.name ?? "Error"
+    const code = error.data?.statusCode
+    const msg = String(error.data?.message ?? error.message ?? "").replace(/\s+/g, " ").trim().slice(0, 120)
+    const parts = [name, typeof code === "number" ? `HTTP ${code}` : "", msg].filter(Boolean)
+    return parts.join(" — ")
   }
 
   /** The Stop button (user abort) surfaces as MessageAbortedError. */
@@ -1098,6 +1118,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     if (error?.name) s.lastErrorName = error.name
 
     const kind = classify(error)
+    const detail = describeErr(error)
     log("warn", `session error (${kind})`, {
       sessionID, name: error?.name, statusCode: error?.data?.statusCode, message: error?.data?.message,
     })
@@ -1115,7 +1136,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
       // Auth is provider-scoped: rotate to another PROVIDER's model if possible.
       if (cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "authentication failed"))) {
         s.chain += 1
-        if (s.chain <= cfg.maxChain) { schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: PROMPTS.resume }); return }
+        if (s.chain <= cfg.maxChain) { schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) }); return }
       }
       toast(`${RESUME_TAG}: Provider authentication failed — run \`opencode auth login\`.`, "error")
       return
@@ -1124,7 +1145,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     // ── quota / free-tier exhaustion → rotate model, no user input ──
     if (kind === "quota") {
       if (cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "quota/free tier exhausted"))) {
-        schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: PROMPTS.resume })
+        schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) })
         return
       }
       toast(`${RESUME_TAG}: Quota exhausted and no alternate model available — manual action needed.`, "error")
@@ -1135,7 +1156,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     if (kind === "rate_limit" && s.rlStreak + 1 >= cfg.rlSwitchAfter &&
         cfg.switchOnRateLimit && (await rotateAwayFrom(sessionID, "repeated rate limits"))) {
       s.rlStreak = 0
-      schedule(sessionID, jitter(Math.min(cfg.baseDelayMs, 15_000)), { kind: "resume", prompt: PROMPTS.resume })
+      schedule(sessionID, jitter(Math.min(cfg.baseDelayMs, 15_000)), { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) })
       return
     }
 
@@ -1205,7 +1226,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
       if (cfg.switchOnFailures && s.failStreak >= cfg.rotateAfterFailures &&
           (await rotateAwayFrom(sessionID, "persistent failures", false))) {
         s.failStreak = 0
-        schedule(sessionID, jitter(Math.min(cfg.baseDelayMs, 15_000)), { kind: "resume", prompt: PROMPTS.resume })
+    schedule(sessionID, jitter(Math.min(cfg.baseDelayMs, 15_000)), { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) })
         return
       }
     }
@@ -1237,7 +1258,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     const delay = kind === "rate_limit"
       ? (retryAfterMs(error) ?? backoff(s.chain, cfg.rateLimitBaseMs))
       : backoff(s.chain, cfg.baseDelayMs)
-    schedule(sessionID, delay, { kind: "resume", prompt: PROMPTS.resume })
+    schedule(sessionID, delay, { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) })
   }
 
   // ── permission autopilot ───────────────────────────────────────────
