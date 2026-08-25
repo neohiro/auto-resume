@@ -1,0 +1,88 @@
+{
+  "comment": "Source of truth for OpenCode permission payload shapes. Tests drive every entry through the autopilot and assert `expect`; README's payload-shape table is generated from this file. When a future core drifts again, add/adjust an entry here first.",
+  "shapes": [
+    {
+      "name": "core-flat-directory",
+      "docs": "current cores: properties ARE the Permission info and `permission` holds the tool-name string",
+      "event": "permission.updated",
+      "nested": false,
+      "ask": {
+        "id": "<id>",
+        "sessionID": "<sid>",
+        "permission": "external_directory",
+        "title": "Access external directory",
+        "metadata": { "pattern": "~/projects/reference/**" }
+      },
+      "expect": "once"
+    },
+    {
+      "name": "core-flat-directory-sensitive",
+      "docs": "same flat shape, but the requested boundary hits the cross-OS sensitive denylist",
+      "event": "permission.updated",
+      "nested": false,
+      "ask": {
+        "id": "<id>",
+        "sessionID": "<sid>",
+        "permission": "external_directory",
+        "title": "Access external directory",
+        "metadata": { "patterns": ["C:\\Windows\\System32\\config\\*"] }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "core-flat-bash",
+      "docs": "shell asks under the flat shape are approved unless the danger blocklist matches",
+      "event": "permission.updated",
+      "nested": false,
+      "ask": {
+        "id": "<id>",
+        "sessionID": "<sid>",
+        "permission": "bash",
+        "title": "Run command",
+        "metadata": { "command": "git status --porcelain" }
+      },
+      "expect": "once"
+    },
+    {
+      "name": "legacy-type-field",
+      "docs": "older cores / mocks named the field `type` instead of `permission`",
+      "event": "permission.updated",
+      "nested": false,
+      "ask": {
+        "id": "<id>",
+        "sessionID": "<sid>",
+        "type": "edit",
+        "title": "Edit file",
+        "metadata": {}
+      },
+      "expect": "once"
+    },
+    {
+      "name": "nested-info-object",
+      "docs": "some intermediate builds wrapped the info object under p.permission on permission.asked",
+      "event": "permission.asked",
+      "nested": true,
+      "ask": {
+        "id": "<id>",
+        "type": "external_directory",
+        "title": "Access directory",
+        "metadata": { "patterns": ["D:\\data\\*"] }
+      },
+      "expect": "once"
+    },
+    {
+      "name": "unknown-type-safe-mode",
+      "docs": "unlisted tools stay human-decided in safe mode",
+      "event": "permission.updated",
+      "nested": false,
+      "ask": {
+        "id": "<id>",
+        "sessionID": "<sid>",
+        "permission": "mystery_tool",
+        "title": "Unknown thing",
+        "metadata": {}
+      },
+      "expect": null
+    }
+  ]
+}

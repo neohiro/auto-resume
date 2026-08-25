@@ -1,10 +1,18 @@
-// Self-contained env tuning: fast delays + no toast throttling for assertions.
+// Self-contained env tuning: fast delays + no notice throttling for assertions.
 process.env.OPENCODE_RESUME_BASE_DELAY_MS ??= "30"
 process.env.OPENCODE_RESUME_RATE_LIMIT_BASE_MS ??= "40"
 process.env.OPENCODE_RESUME_MAX_DELAY_MS ??= "500"
 process.env.OPENCODE_RESUME_NUDGE_DELAY_MS ??= "30"
-process.env.OPENCODE_RESUME_TOAST_THROTTLE_MS ??= "0"
+process.env.OPENCODE_RESUME_NOTICE_THROTTLE_MS ??= "0"
 process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+// Per-run isolated sidecar stores: never touch the real plugin directory and
+// never leak state between runs (a persisted stop/opt-out would poison the
+// next run's assertions).
+process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-v4-stops-${process.pid}-${Date.now()}.json`)
+process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-v4-off-${process.pid}-${Date.now()}.json`)
 
 import { AutoResumePlugin } from "../auto-resume.js"
 
@@ -16,8 +24,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 function makeClient(state) {
   return {
-    app: { log: async () => true },
-    tui: { showToast: async ({ body }) => { state.toasts.push(body.message); return true } },
+    app: { log: async ({ body }) => { state.logs.push(body?.message ?? ""); return true } },
     config: { providers: async () => ({ data: { providers: [
       { id: "provA", models: { "a-max": {}, "a-mini": {} } },
       { id: "provB", models: { "b-pro": {} } },
@@ -45,7 +52,7 @@ function makeClient(state) {
 
 function makeState(idle = []) {
   return {
-    prompts: [], aborts: [], summarizes: [], toasts: [], permResponses: [],
+    prompts: [], aborts: [], summarizes: [], logs: [], permResponses: [],
     idleIds: new Set(idle), msgStore: {}, msgN: 0, sessionList: [], messagesBySession: {},
   }
 }
@@ -240,7 +247,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   state2.msgStore.ccu = "go"
   await hooks2.event(ev("session.idle", { sessionID: "cb" })) // all checked + fresh task scope
   await sleep(350)
-  ok(state2.toasts.some((t) => t.includes("complete")),
+  ok(state2.logs.some((t) => t.includes("complete")),
     "CC3: fully-checked checklist counts as completion")
   delete process.env.OPENCODE_AUTOPILOT_IMPROVE_CYCLES
   delete process.env.OPENCODE_AUTOPILOT_PROPOSALS
@@ -282,8 +289,8 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.idle", { sessionID: "cost" }))
   await sleep(350)
   ok(state.prompts.length === 1, "DD: injections stop at the cap")
-  ok(state.toasts.some((t) => t.includes("$12.00") && t.includes("cap")),
-    "DD: cost-cap toast names the amount")
+  ok(state.logs.some((t) => t.includes("$12.00") && t.includes("cap")),
+    "DD: cost-cap notice names the amount")
   delete process.env.OPENCODE_AUTOPILOT_MAX_COST_USD
 }
 

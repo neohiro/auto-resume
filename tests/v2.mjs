@@ -1,10 +1,20 @@
-// Self-contained env tuning: fast delays + no toast throttling for assertions.
+// Self-contained env tuning: fast delays + no notice throttling for assertions.
 process.env.OPENCODE_RESUME_BASE_DELAY_MS ??= "30"
 process.env.OPENCODE_RESUME_RATE_LIMIT_BASE_MS ??= "40"
 process.env.OPENCODE_RESUME_MAX_DELAY_MS ??= "500"
 process.env.OPENCODE_RESUME_NUDGE_DELAY_MS ??= "30"
-process.env.OPENCODE_RESUME_TOAST_THROTTLE_MS ??= "0"
+process.env.OPENCODE_RESUME_NOTICE_THROTTLE_MS ??= "0"
 process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { readFileSync } from "node:fs"
+
+// Per-run isolated sidecar stores: never touch the real plugin directory and
+// never leak state between runs (a persisted stop/opt-out would poison the
+// next run's assertions).
+process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-v2-stops-${process.pid}-${Date.now()}.json`)
+process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-v2-off-${process.pid}-${Date.now()}.json`)
+
 import { AutoResumePlugin } from "../auto-resume.js"
 
 const ok = (cond, label) => {
@@ -15,8 +25,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 function makeClient(state) {
   return {
-    app: { log: async () => true },
-    tui: { showToast: async ({ body }) => { state.toasts.push(body.message); return true } },
+    app: { log: async ({ body }) => { state.logs.push(body?.message ?? ""); return true } },
     config: {
       providers: async () => ({
         data: {
@@ -54,7 +63,7 @@ function makeClient(state) {
 
 async function fresh(idle = []) {
   const state = {
-    prompts: [], aborts: [], summarizes: [], toasts: [], permResponses: [],
+    prompts: [], aborts: [], summarizes: [], logs: [], permResponses: [],
     idleIds: new Set(idle), msgStore: {}, msgN: 0,
   }
   const hooks = await AutoResumePlugin({ client: makeClient(state) })
@@ -111,23 +120,78 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(byPerm.p10 === undefined, "M: unknown type left for human in safe mode")
 }
 
-// ---- P2: nested permission payloads + async prompt dispatch -------------------
+// ---- P2/P3: payload-shape matrix driven by tests/fixtures/permission-shapes.json
 {
   const { state, hooks } = await fresh([])
-  // newer cores nest the ask payload under p.permission
-  await hooks.event(ev("permission.asked", {
-    sessionID: "permSess2",
-    permission: { id: "nested1", type: "external_directory", metadata: { patterns: ["D:\\data\\*"] } },
+  const shapes = JSON.parse(
+    readFileSync(new URL("./fixtures/permission-shapes.json", import.meta.url), "utf8"),
+  ).shapes
+  const byName = {}
+  for (const [i, s] of shapes.entries()) {
+    const id = `sh${i}`
+    const props = s.nested
+      ? { sessionID: "shapeSess", permission: { ...s.ask, id } }
+      : { ...s.ask, id, sessionID: "shapeSess" }
+    await hooks.event(ev(s.event, props))
+    byName[s.name] = { id, expect: s.expect }
+  }
+  await sleep(300)
+  const got = Object.fromEntries(state.permResponses.map((r) => [r.permissionID, r.response]))
+  for (const s of shapes) {
+    const actual = got[byName[s.name].id] ?? null
+    ok(actual === s.expect,
+      `P2[${s.name}]: ${s.expect ?? "(human-decided)"} — ${s.docs}`)
+  }
+}
+// ---- P5: benign directory asks escalate to "always" after N "once"s ---------
+{
+  process.env.OPENCODE_AUTOPILOT_DIR_ALWAYS_AFTER = "2"
+  const { state, hooks } = await fresh([])
+  const ask = (id, pattern) =>
+    hooks.event(ev("permission.updated", {
+      id, sessionID: "escSess",
+      permission: "external_directory", title: "Access external directory",
+      metadata: { pattern },
+    }))
+  await ask("e1", "~/projects/reference/**")
+  await ask("e2", "~/projects/reference/**")
+  await ask("e3", "~/projects/reference/**") // same boundary -> escalates
+  await ask("e4", "~/other/tree/**")          // different boundary -> own counter
+  await sleep(300)
+  const byPerm = Object.fromEntries(state.permResponses.map((r) => [r.permissionID, r.response]))
+  ok(byPerm.e1 === "once" && byPerm.e2 === "once", "P5: first two asks answered once")
+  ok(byPerm.e3 === "always", "P5: third ask for the SAME boundary escalates to always")
+  ok(byPerm.e4 === "once", "P5: different boundaries keep independent counters")
+  delete process.env.OPENCODE_AUTOPILOT_DIR_ALWAYS_AFTER
+}
+// ---- P4: reply API fallback — first candidate rejecting must not strand ------
+{
+  const state = {
+    prompts: [], aborts: [], summarizes: [], logs: [], permResponses: [],
+    idleIds: new Set(), msgStore: {}, msgN: 0,
+  }
+  const client = makeClient(state)
+  client.session.postSessionByIdPermissionsByPermissionId =
+    async () => { throw new Error("route drifted") }
+  client.session.respondToPermission =
+    async ({ path, body }) => {
+      state.permResponses.push({ permissionID: path.permissionID, response: body.response })
+      return true
+    }
+  const hooks = await AutoResumePlugin({ client })
+  await hooks.event(ev("permission.updated", {
+    id: "fb1", sessionID: "permFb",
+    permission: "external_directory", metadata: { patterns: ["E:\\data\\*"] },
   }))
   await sleep(250)
-  ok(state.permResponses.some((r) => r.permissionID === "nested1" && r.response === "once"),
-    "P2: nested permission payload answered")
+  ok(state.permResponses.some((r) => r.permissionID === "fb1" && r.response === "once"),
+    "P4: falls through a broken primary SDK method to the next candidate")
 }
 {
   let asyncCalls = 0
   let syncCalls = 0
   const state = {
-    prompts: [], aborts: [], summarizes: [], toasts: [], permResponses: [],
+    prompts: [], aborts: [], summarizes: [], logs: [], permResponses: [],
     idleIds: new Set(), msgStore: {}, msgN: 0,
   }
   const client = makeClient(state)
@@ -192,11 +256,11 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.idle", { sessionID: "qS" })) // consumes nudge #1 on a drive
   await sleep(350)
   ok(state.prompts.some((p) => p.text.includes("unfinished items")), "Q2: drive fired with budget")
-  // budget now exhausted; another idle with pending todos -> one-time toast
+  // budget now exhausted; another idle with pending todos -> one-time notice
   await hooks.event(ev("session.idle", { sessionID: "qS" }))
   await sleep(300)
-  ok(state.toasts.some((t) => t.includes("Drive-nudge budget") && t.includes("Self-improvement passes still run")),
-    "Q2: budget exhaustion surfaced with a clear toast")
+  ok(state.logs.some((t) => t.includes("Drive-nudge budget") && t.includes("Self-improvement passes still run")),
+    "Q2: budget exhaustion surfaced with a clear notice")
   // complete the todos -> improve MUST fire despite exhausted drive budget
   await hooks.event(ev("todo.updated", { sessionID: "qS", todos: todosDone }))
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "qS", text: "all done" } }))
@@ -234,7 +298,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(state.prompts.filter((p) => p.text.includes("wrap-up")).length === 1, "N: single proposal prompt after improvements")
   await hooks.event(ev("session.idle", { sessionID: "td" }))
   await sleep(300)
-  ok(state.toasts.some((t) => t.includes("complete")), "N: success toast shown")
+  ok(state.logs.some((t) => t.includes("complete")), "N: success notice shown")
 }
 
 // ---- O: debug nudge after consecutive tool failures --------------------------

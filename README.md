@@ -4,6 +4,8 @@
 
 **Free AI coding agents that don't fall asleep on the job.**
 
+An [OpenCode](https://opencode.ai) plugin.
+
 Recovery · Model rotation · Permission autopilot · Task autonomy
 
 </div>
@@ -77,7 +79,7 @@ The walk-away loop:
 3. **Auto-proceed** — agent ends its turn by asking *"Should I proceed…?"* → the plugin answers yes and keeps it moving (capped)
 4. **Autonomy directive** — every injected prompt tells the model to decide things itself, never wait for confirmation, document assumptions
 5. **Self-improvement passes** — when the model declares the task done, it's told to critically review its own output (correctness, performance, security, robustness, readability) and implement the improvements it's confident about — capped number of cycles
-6. **Wrap-up** — final message summarizes what was accomplished plus up to three follow-up proposals, success toast included
+6. **Wrap-up** — final message summarizes what was accomplished plus up to three follow-up proposals, success notice logged
 
 ## Install
 
@@ -89,7 +91,7 @@ into my global plugins folder (~/.config/opencode/plugins/) so every
 session gets it machine-wide.
 ```
 
-The agent downloads the single file, puts it in place, and tells you when it is done - restart OpenCode and you are protected. (Yes, auto-resume can help install the thing that will keep auto-resume sessions alive. It appreciates the irony.)
+The agent downloads the single file, puts it in place, and tells you when it is done - restart OpenCode and you are protected.
 
 
 **Option A — one file (recommended):**
@@ -137,7 +139,8 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_RETRY_FUTURE_CAP_MS` | `600000` | Next-retry scheduled further out ⇒ takeover |
 | `OPENCODE_RESUME_REANIMATE` | `true` | Revive crashed sessions on startup |
 | `OPENCODE_RESUME_REANIMATE_WINDOW_MS` | `600000` | Max age of sessions eligible for revival |
-| `OPENCODE_RESUME_AUTO_UPDATE` | `true` | Self-update daily from GitHub (applies on next OpenCode restart) |
+| `OPENCODE_RESUME_AUTO_UPDATE` | `true` | Self-update daily from GitHub (applies on next OpenCode restart); a native OS notification announces the completed update |
+| `OPENCODE_RESUME_NOTICE_THROTTLE_MS` | `3000` | Min gap between user notices in the OpenCode log (legacy `OPENCODE_RESUME_TOAST_THROTTLE_MS` still honored) |
 | `OPENCODE_RESUME_STOPSTORE` | `<plugin>/auto-resume.js.stopped.json` | Where user-stop markers are persisted across restarts |
 | `OPENCODE_RESUME_OFFSTORE` | `<plugin>/auto-resume.js.off.json` | Where per-session opt-outs (`auto-resume off`) are persisted |
 | `OPENCODE_RESUME_BREAKER_THRESHOLD` / `_WINDOW_MS` / `_COOLDOWN_MS` | `6` / `900000` / `300000` | Global circuit breaker |
@@ -154,6 +157,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_AUTOPILOT_PERMISSIONS` | `true` | Auto-answer permission prompts |
 | `OPENCODE_AUTOPILOT_PERMISSION_MODE` | `safe` | `safe` \| `all` |
 | `OPENCODE_AUTOPILOT_EXTRA_DENY` | *(empty)* | Extra deny substrings, comma-separated (`re:` prefix = regex) |
+| `OPENCODE_AUTOPILOT_DIR_ALWAYS_AFTER` | `0` (off) | After N auto-approved asks for the *same* benign external directory, escalate to **Allow always** for the session |
 | `OPENCODE_AUTOPILOT_TODO_DRIVE` | `true` | Continue unfinished todos |
 | `OPENCODE_AUTOPILOT_DEBUG_NUDGE` | `true` | Root-cause nudge after tool failures |
 | `OPENCODE_AUTOPILOT_IMPROVE` | `true` | Self-improvement pass after completion |
@@ -180,18 +184,46 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 
 ## Compatibility
 
-Works anywhere OpenCode runs — **Windows, macOS, Linux**. The plugin is a single zero-dependency file using only the OpenCode SDK client, timers, and environment variables, plus the tiny local files it manages itself: the self-update backup, the user-stop memory (`auto-resume.js.stopped.json`), and the per-session opt-out memory (`auto-resume.js.off.json`). Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
+Works anywhere OpenCode runs — **Windows, macOS, Linux**. The plugin is a single zero-dependency file using only the OpenCode SDK client, timers, and environment variables, plus the tiny local files it manages itself: the self-update backup (`.bak`), the update-ack marker (`.acked`), the user-stop memory (`auto-resume.js.stopped.json`), and the per-session opt-out memory (`auto-resume.js.off.json`). Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
 
-Tested against OpenCode's event API: `session.error`, `session.status`, `session.idle`, `message.updated`, `message.part.updated`, `todo.updated`, `permission.updated/replied`, `session.compacted`.
+Tested against OpenCode's event API: `session.error`, `session.status`, `session.idle`, `message.updated`, `message.part.updated`, `todo.updated`, `permission.asked/updated/replied`, `session.compacted`.
+
+### Permission payload shapes
+
+The autopilot tolerates every known shape; the source of truth lives in [`tests/fixtures/permission-shapes.json`](tests/fixtures/permission-shapes.json) and every entry is asserted on each test run:
+
+| Shape | Where seen | Type field | Autopilot |
+|---|---|---|---|
+| `core-flat-*` | current cores | top-level `permission` = tool-name string | answered per tool rules |
+| `legacy-type-field` | older cores / mocks | top-level `type` | answered per tool rules |
+| `nested-info-object` | some intermediate builds (`permission.asked`) | info object under `p.permission` | answered per tool rules |
+| `unknown-type-safe-mode` | any unlisted tool in safe mode | — | left for human decision (logged) |
+
+Reply delivery probes the SDK surface (`postSessionByIdPermissionsByPermissionId` → `respondToPermission` → …) until one method resolves, so client version drift cannot strand a pending ask.
 
 ## Development
 
 ```sh
 git clone https://github.com/neohiro/auto-resume && cd auto-resume
-npm test        # 46 assertions across 4 suites, mocked SDK, no OpenCode needed
+npm test        # 185+ assertions across 9 suites (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
 ```
 
-The five suites (60+ assertions) simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops) against a mocked client and assert on every injected prompt, abort, permission response, and toast.
+The nine Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
+
+### Windows unattended notes (UAC / SmartScreen)
+
+Unattended sessions on Windows can stall when the OS throws a consent dialog at your toolchain — most commonly **SmartScreen / UAC gating the first run of a downloaded binary** (portable Node, npm-installed CLIs). That is Mark-of-the-Web provenance, not a permission problem OpenCode can auto-answer. Mitigate once, from any shell:
+
+```powershell
+# strip download provenance from trusted tooling (add -WhatIf to preview)
+powershell -ExecutionPolicy Bypass -File scripts\unblock-tooling.ps1 -Path C:\path\to\node-or-tools
+```
+
+Additional hardening that keeps agents running unattended:
+
+- **Prefer 64-bit builds** of local runtimes — 32-bit executables without an elevation manifest hit Windows' Installer-Detection heuristic (argv keywords like `install`/`update` can trigger a UAC prompt).
+- **Keep long-lived toolchains out of `%TEMP%`** — prefer `%LOCALAPPDATA%\tools`; temp dirs get swept by AV/cleanup and re-flagged.
+- The plugin itself never requests elevation: its only OS integration spawns the signed `System32\WindowsPowerShell\v1.0\powershell.exe` with `-NoProfile -NonInteractive -EncodedCommand`.
 
 ## License
 

@@ -34,6 +34,7 @@ jobs:
           fi
           echo "soft=$soft"
           echo "soft=$soft" >> "$GITHUB_OUTPUT"
+
   test:
     needs: triage
     continue-on-error: ${{ needs.triage.outputs.soft == 'true' }}
@@ -52,3 +53,37 @@ jobs:
         run: node scripts/check-version.cjs
       - name: Run test suites
         run: npm test
+
+  integration:
+    needs: triage
+    continue-on-error: ${{ needs.triage.outputs.soft == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Real-$ OS notification integration (bun)
+        run: bun tests/integration.bun.mjs
+
+  windows-helper:
+    needs: triage
+    continue-on-error: ${{ needs.triage.outputs.soft == 'true' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify unblock-tooling.ps1 end-to-end
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:TEMP "unblock-ci"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $probe = Join-Path $dir "probe.txt"
+          Set-Content -LiteralPath $probe -Value "x"
+          Set-Content -LiteralPath $probe -Stream Zone.Identifier -Value "[ZoneTransfer]`nZoneId=3"
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/unblock-tooling.ps1 -Path $dir | Tee-Object -Variable out
+          if (-not (($out | Out-String) -match "Unblocked 1")) { exit 1 }
+          $left = Get-Content -LiteralPath $probe -Stream Zone.Identifier -ErrorAction SilentlyContinue
+          if ($left) { Write-Error "Zone.Identifier still present"; exit 1 }
+          Remove-Item $dir -Recurse -Force

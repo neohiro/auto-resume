@@ -1,12 +1,16 @@
-// Self-contained env tuning: fast delays + no toast throttling for assertions.
+// Self-contained env tuning: fast delays + no notice throttling for assertions.
 process.env.OPENCODE_RESUME_BASE_DELAY_MS ??= "30"
 process.env.OPENCODE_RESUME_RATE_LIMIT_BASE_MS ??= "40"
 process.env.OPENCODE_RESUME_MAX_DELAY_MS ??= "500"
 process.env.OPENCODE_RESUME_NUDGE_DELAY_MS ??= "30"
-process.env.OPENCODE_RESUME_TOAST_THROTTLE_MS ??= "0"
+process.env.OPENCODE_RESUME_NOTICE_THROTTLE_MS ??= "0"
 process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
-process.env.OPENCODE_RESUME_STOPSTORE = join(tmpdir(), "ar-title-stops.json")
-process.env.OPENCODE_RESUME_OFFSTORE = join(tmpdir(), "ar-title-off.json")
+// unique per run: a leftover opt-out/stop marker from a previous run would
+// suppress decoration before the suite even starts
+const titleStops0 = join(tmpdir(), `ar-title-stops-${process.pid}-${Date.now()}.json`)
+const titleOff0 = join(tmpdir(), `ar-title-off-${process.pid}-${Date.now()}.json`)
+process.env.OPENCODE_RESUME_STOPSTORE = titleStops0
+process.env.OPENCODE_RESUME_OFFSTORE = titleOff0
 
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -21,8 +25,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 function makeClient(state) {
   return {
-    app: { log: async () => true },
-    tui: { showToast: async ({ body }) => { state.toasts.push(body.message); return true } },
+    app: { log: async ({ body }) => { state.logs.push(body?.message ?? ""); return true } },
     config: { providers: async () => ({ data: { providers: [{ id: "provA", models: { "a-max": {} } }] } }) },
     session: {
       list: async () => ({
@@ -57,7 +60,7 @@ function makeClient(state) {
 
 function makeState(idle = []) {
   return {
-    prompts: [], aborts: [], toasts: [], updates: [],
+    prompts: [], aborts: [], logs: [], updates: [],
     idleIds: new Set(idle), msgStore: {}, msgN: 0,
     sessionList: [], messagesBySession: {},
     baseTitles: {}, titles: {},
@@ -123,8 +126,8 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.idle", { sessionID: "t3" }))
   await sleep(400)
   ok(state.prompts.length === before, "T3: fully silent while opted out")
-  ok(!state.toasts.some((t) => t.includes("Stopped by you")), "T3: no stop-toast confusion")
-  ok(state.toasts.some((t) => t.includes("Off for this session")), "T3: opt-out confirmed via toast")
+  ok(!state.logs.some((t) => t.includes("Stopped by you")), "T3: no stop-notice confusion")
+  ok(state.logs.some((t) => t.includes("Off for this session")), "T3: opt-out confirmed via notice")
 }
 
 // ---- T4: opt-out survives a restart; "auto-resume on" re-arms everything -----
@@ -137,7 +140,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   stateA.msgStore.o1 = "/auto-resume off"
   await hooksA.event(ev("message.updated", { info: { role: "user", sessionID: "p9", id: "o1" } }))
   await sleep(500)
-  ok(stateA.toasts.some((t) => t.includes("Off for this session")), "T4: run #1 opted the session out")
+  ok(stateA.logs.some((t) => t.includes("Off for this session")), "T4: run #1 opted the session out")
   // run #2: OpenCode restarted — persisted opt-out must hold
   const stateB = makeState()
   stateB.sessionList = [{ id: "p9", time: { updated: Date.now() - 1_000 } }]
@@ -164,12 +167,12 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(!offRaw.p9, "T4: opt-out marker removed from persistent store")
   await rm(dir, { recursive: true, force: true })
   // keep a valid store path for any later suites
-  process.env.OPENCODE_RESUME_OFFSTORE = join(tmpdir(), "ar-title-off.json")
+  process.env.OPENCODE_RESUME_OFFSTORE = titleOff0
 }
 
 // ---- T5: external rename is adopted and re-tagged ----------------------------
 {
-  process.env.OPENCODE_RESUME_OFFSTORE = join(tmpdir(), "ar-title-off.json")
+  process.env.OPENCODE_RESUME_OFFSTORE = titleOff0
   const state = makeState()
   state.baseTitles.t5 = "Initial task"
   state.messagesBySession.t5 = [{
@@ -204,12 +207,12 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(state.titles.t6 === "Old task", "T6: stale tag stripped on startup for opted-out session")
   ok(state.prompts.length === 0, "T6: sweep never revives the session")
   await rm(dir, { recursive: true, force: true })
-  process.env.OPENCODE_RESUME_OFFSTORE = join(tmpdir(), "ar-title-off.json")
+  process.env.OPENCODE_RESUME_OFFSTORE = titleOff0
 }
 
 // ---- T7: 🔁 reflects ACTIVE recovery only, not historical errors -------------
 {
-  process.env.OPENCODE_RESUME_OFFSTORE = join(tmpdir(), "ar-title-off.json")
+  process.env.OPENCODE_RESUME_OFFSTORE = titleOff0
   const state = makeState()
   state.baseTitles.t7 = "Workflow fixes"
   const hooks = await AutoResumePlugin({ client: makeClient(state) })

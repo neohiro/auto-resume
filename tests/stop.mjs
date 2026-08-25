@@ -1,12 +1,14 @@
-// Self-contained env tuning: fast delays + no toast throttling for assertions.
+// Self-contained env tuning: fast delays + no notice throttling for assertions.
 process.env.OPENCODE_RESUME_BASE_DELAY_MS ??= "30"
 process.env.OPENCODE_RESUME_RATE_LIMIT_BASE_MS ??= "40"
 process.env.OPENCODE_RESUME_MAX_DELAY_MS ??= "500"
 process.env.OPENCODE_RESUME_NUDGE_DELAY_MS ??= "30"
-process.env.OPENCODE_RESUME_TOAST_THROTTLE_MS ??= "0"
+process.env.OPENCODE_RESUME_NOTICE_THROTTLE_MS ??= "0"
 process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
-// keep the stop-store out of the repo dir unless a suite overrides it
-process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), "ar-stop-default.json")
+// keep the stop-store out of the repo dir unless a suite overrides it;
+// unique per run so a previous run's persisted stops can't poison this one
+const defaultStops0 = join(tmpdir(), `ar-stop-default-${process.pid}-${Date.now()}.json`)
+process.env.OPENCODE_RESUME_STOPSTORE ??= defaultStops0
 
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -21,8 +23,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 function makeClient(state) {
   return {
-    app: { log: async () => true },
-    tui: { showToast: async ({ body }) => { state.toasts.push(body.message); return true } },
+    app: { log: async ({ body }) => { state.logs.push(body?.message ?? ""); return true } },
     config: { providers: async () => ({ data: { providers: [
       { id: "provA", models: { "a-max": {} } },
     ] } }) },
@@ -49,7 +50,7 @@ function makeClient(state) {
 
 function makeState(idle = []) {
   return {
-    prompts: [], aborts: [], summarizes: [], toasts: [], permResponses: [],
+    prompts: [], aborts: [], summarizes: [], logs: [], permResponses: [],
     idleIds: new Set(idle), msgStore: {}, msgN: 0, sessionList: [], messagesBySession: {},
   }
 }
@@ -64,7 +65,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.idle", { sessionID: "s1" }))
   await sleep(400)
   ok(state.prompts.length === 0, "S1: no resume/nudge after a user Stop")
-  ok(state.toasts.some((t) => t.includes("Stopped by you")), "S1: stop acknowledged with a quiet-until-prompt toast")
+  ok(state.logs.some((t) => t.includes("Stopped by you")), "S1: stop acknowledged with a quiet-until-prompt notice")
 }
 
 // ---- S2: an already-scheduled retry is cancelled by the Stop -----------------
@@ -77,7 +78,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.error", { sessionID: "s2", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
   await sleep(500)
   ok(state.prompts.length === 0, "S2: queued recovery injection cancelled by Stop")
-  ok(state.toasts.some((t) => t.includes("Stopped by you")), "S2: stop was acknowledged")
+  ok(state.logs.some((t) => t.includes("Stopped by you")), "S2: stop was acknowledged")
 }
 
 // ---- S3: idle evaluation stays silent after Stop, next real prompt re-arms ---
@@ -112,7 +113,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.idle", { sessionID: "s4" })) // no session.error event at all
   await sleep(350)
   ok(state.prompts.length === 0, "S4: message-only abort still detected at idle")
-  ok(state.toasts.some((t) => t.includes("Stopped by you")), "S4: quiet-mode engaged")
+  ok(state.logs.some((t) => t.includes("Stopped by you")), "S4: quiet-mode engaged")
   await hooks.event(ev("session.idle", { sessionID: "s4" }))
   await sleep(250)
   ok(state.prompts.length === 0, "S4: stays quiet on subsequent idles")
@@ -126,7 +127,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(abort)
   await hooks.event(abort)
   await sleep(200)
-  ok(state.toasts.filter((t) => t.includes("Stopped by you")).length === 1,
+  ok(state.logs.filter((t) => t.includes("Stopped by you")).length === 1,
     "S5: repeated abort events do not spam")
 }
 
@@ -245,7 +246,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(!raw.p1, "S11: cleared stop removed from the persistent store")
   await rm(dir, { recursive: true, force: true })
   // keep a valid store path for any later suites
-  process.env.OPENCODE_RESUME_STOPSTORE = join(tmpdir(), "ar-stop-after-s11.json")
+  process.env.OPENCODE_RESUME_STOPSTORE = defaultStops0
 }
 
 // ---- S12: restart-time aborts are interruptions, not user stops --------------
@@ -273,7 +274,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await AutoResumePlugin({ client: makeClient(state) })
   await sleep(2200)
   ok(state.prompts.some((p) => p.id === "sd"), "S12: shutdown-abort revived as an interruption")
-  ok(!state.toasts.some((t) => t.includes("Stopped by you")), "S12: shutdown-abort NOT misread as a stop")
+  ok(!state.logs.some((t) => t.includes("Stopped by you")), "S12: shutdown-abort NOT misread as a stop")
   ok(state.prompts.some((p) => p.id === "hk"), "S12: hard-killed incomplete turn revived")
   ok(!state.prompts.some((p) => p.id === "done"), "S12: normally finished session left alone")
 }
@@ -291,7 +292,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await sleep(2500)
   ok(state.prompts.some((p) => p.id === "think" && p.text.includes("Automatic retry")),
     "S13: retry prompt is explicitly labelled")
-  ok(state.toasts.some((t) => t.includes("automatic retry")), "S13: toast says 'automatic retry'")
+  ok(state.logs.some((t) => t.includes("automatic retry")), "S13: notice says 'automatic retry'")
   // tool activity keeps its grace: no fast abort for quiet-but-running tools
   await hooks.event(ev("session.status", { sessionID: "toolx", status: { type: "busy" } }))
   await hooks.event(ev("message.part.updated", { part: { type: "tool", sessionID: "toolx", state: { status: "running" }, tool: "bash" } }))
