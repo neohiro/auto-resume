@@ -144,7 +144,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.7.6"
+const AUTO_RESUME_VERSION = "1.7.7"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -404,7 +404,7 @@ const matchesAny = (haystack, patterns) => {
 }
 const jitter = (ms) => Math.round(ms + ms * 0.25 * (Math.random() * 2 - 1))
 
-export const AutoResumePlugin = async ({ client }) => {
+export const AutoResumePlugin = async ({ client, $ }) => {
   const cfg = loadConfig()
 
   const sessions = new Map() // sessionID -> state
@@ -724,6 +724,38 @@ export const AutoResumePlugin = async ({ client }) => {
     if (cfg.toastThrottleMs > 0 && nowMs - lastToastAt < cfg.toastThrottleMs) return
     lastToastAt = nowMs
     detach(() => client.tui.showToast({ body: { message, variant } }), "toast")
+  }
+
+  /** OS-level notification — the belt-and-suspenders channel for rare one-shot
+   *  notices: visible even when no TUI/desktop surface is attached yet.
+   *  Windows uses a native toast via PowerShell; macOS/Linux use the standard
+   *  notification CLI. Best effort by design. */
+  const osNotify = async (title, message) => {
+    try {
+      const platform = typeof process !== "undefined" ? process.platform : ""
+      if (!($ && typeof $ === "function")) return false
+      if (platform === "win32") {
+        const q = (s) => "'" + String(s).replace(/'/g, "''") + "'"
+        const ps = `
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$t = $x.GetElementsByTagName('text')
+$t.Item(0).AppendChild($x.CreateTextNode(${q(title)})) | Out-Null
+$t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('opencode.auto-resume').Show([Windows.UI.Notifications.ToastNotification]::new($x))`
+        const encoded = Buffer.from(ps, "utf16le").toString("base64")
+        await $`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`.quiet()
+        return true
+      }
+      if (platform === "darwin") {
+        await $`osascript -e ${`display notification ${JSON.stringify(message)} with title ${JSON.stringify(title)}`}`
+        return true
+      }
+      await $`notify-send ${title} ${message}`.quiet()
+      return true
+    } catch {
+      return false
+    }
   }
 
   // ── circuit breaker ────────────────────────────────────────────────
@@ -1542,6 +1574,49 @@ export const AutoResumePlugin = async ({ client }) => {
   let lastUpdateCheckAt = 0
   let lastReanimateAt = 0
   let pendingUpdateToast = null
+  let noticeDelivering = false
+
+  /** Dual-channel delivery of a one-shot update notice: in-app toast plus an
+   *  OS notification (the latter renders even when no TUI/desktop surface is
+   *  attached yet). The .acked marker commits only after at least one
+   *  channel succeeded, so failed boots retry automatically. */
+  const deliverPendingNotice = async () => {
+    if (!pendingUpdateToast || noticeDelivering) return
+    noticeDelivering = true
+    try {
+      const notice = pendingUpdateToast
+      const { readFile, writeFile } = await import("node:fs/promises")
+      const current = (await readFile(notice.ackPath, "utf8").catch(() => "")).trim()
+      if (current === AUTO_RESUME_VERSION) { pendingUpdateToast = null; return }
+      let tuiOk = false
+      try {
+        const r = await client.tui.showToast({ body: { message: notice.message, variant: "info" } })
+        tuiOk = Boolean(r)
+      } catch { tuiOk = false }
+      const osOk = await osNotify("auto-resume", notice.message.replace(`${RESUME_TAG}: `, ""))
+      if (!tuiOk && !osOk) throw new Error("no delivery channel succeeded")
+      await writeFile(notice.ackPath, AUTO_RESUME_VERSION, "utf8")
+      pendingUpdateToast = null
+      log("info", "update notice delivered", { tui: tuiOk, os: osOk })
+    } catch (err) {
+      log("warn", "update notice delivery failed — retrying on next activity", { err: err?.message ?? String(err) })
+    } finally {
+      noticeDelivering = false
+    }
+  }
+
+  /** First sign of client life: settle briefly so surfaces can paint, then
+   *  deliver exactly once per arming. */
+  let noticeNudged = false
+  const nudgePendingNotice = () => {
+    if (!pendingUpdateToast || noticeNudged) return
+    noticeNudged = true
+    const t = setTimeout(() => {
+      noticeNudged = false
+      detach(deliverPendingNotice, "notice-deliver")
+    }, 2_500)
+    t.unref?.()
+  }
   const isNewerVersion = (remote, local) => {
     const r = String(remote).split(".").map((x) => parseInt(x, 10) || 0)
     const l = String(local).split(".").map((x) => parseInt(x, 10) || 0)
@@ -1601,22 +1676,28 @@ export const AutoResumePlugin = async ({ client }) => {
     // this an actual daily check while OpenCode stays open.
     const upd = setInterval(() => detach(checkForUpdates, "update-check"), 3_600_000)
     upd.unref?.()
-    // One-shot notices wait for a CONNECTED client: firing at init races the
-    // desktop/TUI attachment and the toast vanishes unseen. Delivered by the
-    // server.connected handler below.
-    detach(async () => {
-      if (!selfPath) return
-      try {
-        const { readFile } = await import("node:fs/promises")
-        const ackPath = `${selfPath}.acked`
-        const acked = (await readFile(ackPath, "utf8").catch(() => "")).trim()
-        if (acked === AUTO_RESUME_VERSION) return
-        pendingUpdateToast = {
-          ackPath,
-          message: `${RESUME_TAG}: Now running v${AUTO_RESUME_VERSION}${acked ? ` (previously ${acked})` : ""} — update fully applied.`,
-        }
-      } catch { /* cosmetic only */ }
-    }, "update-notice")
+    // One-shot update notices wait for real client activity before showing:
+    // firing at init races the desktop/TUI attachment and vanishes unseen.
+    // Delivery (dual-channel: in-app toast + OS notification) is triggered by
+    // the first session/message activity, a server.connected event, or a
+    // 15s fallback — whichever comes first.
+    if (cfg.autoUpdate) {
+      detach(async () => {
+        if (!selfPath) return
+        try {
+          const { readFile } = await import("node:fs/promises")
+          const ackPath = `${selfPath}.acked`
+          const acked = (await readFile(ackPath, "utf8").catch(() => "")).trim()
+          if (acked === AUTO_RESUME_VERSION) return
+          pendingUpdateToast = {
+            ackPath,
+            message: `${RESUME_TAG}: Now running v${AUTO_RESUME_VERSION}${acked ? ` (previously ${acked})` : ""} — update fully applied.`,
+          }
+          const fallback = setTimeout(() => detach(deliverPendingNotice, "notice-fallback"), 15_000)
+          fallback.unref?.()
+        } catch { /* cosmetic only */ }
+      }, "update-notice")
+    }
     detach(reanimate, "reanimate")
   } else {
     console.warn(`${RESUME_TAG} disabled via OPENCODE_RESUME_ENABLED`)
@@ -1638,6 +1719,7 @@ export const AutoResumePlugin = async ({ client }) => {
           }
 
           case "message.updated": {
+            nudgePendingNotice()
             const info = p.info
             if (!info?.sessionID) break
             state(info.sessionID).lastActivity = Date.now()
@@ -1733,6 +1815,7 @@ export const AutoResumePlugin = async ({ client }) => {
           }
 
           case "session.status": {
+            nudgePendingNotice()
             if (!p.sessionID) break
             const s = state(p.sessionID)
             s.status = p.status?.type ?? "unknown"
@@ -1753,6 +1836,7 @@ export const AutoResumePlugin = async ({ client }) => {
           }
 
           case "session.idle": {
+            nudgePendingNotice()
             if (p.sessionID) {
               const s = state(p.sessionID)
               s.status = "idle"
@@ -1789,24 +1873,7 @@ export const AutoResumePlugin = async ({ client }) => {
               lastReanimateAt = nowMs
               detach(reanimate, "reanimate")
             }
-            // A client just attached — NOW one-shot notices are visible.
-            if (pendingUpdateToast) {
-              const notice = pendingUpdateToast
-              detach(async () => {
-                try {
-                  const { readFile, writeFile } = await import("node:fs/promises")
-                  // another project instance may have acked first — no dupes
-                  const current = (await readFile(notice.ackPath, "utf8").catch(() => "")).trim()
-                  if (current === AUTO_RESUME_VERSION) { pendingUpdateToast = null; return }
-                  const shown = await client.tui.showToast({
-                    body: { message: notice.message, variant: "info" },
-                  }).then(() => true).catch(() => false)
-                  if (!shown) return
-                  await writeFile(notice.ackPath, AUTO_RESUME_VERSION, "utf8")
-                  pendingUpdateToast = null
-                } catch { /* retried on the next connected event */ }
-              }, "update-notice-deliver")
-            }
+            nudgePendingNotice()
             break
           }
 
