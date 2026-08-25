@@ -149,7 +149,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.8.5"
+const AUTO_RESUME_VERSION = "1.8.6"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -559,7 +559,14 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       ),
     )
     if (capped) return "paused"
-    if (s && (s.chain > 0 || s.pendingResume || s.retryEnteredAt || s.stallResumes > 0)) {
+    // 🔁 means recovery is happening RIGHT NOW (a retry is queued/dispatched
+    // or core is in its own retry loop) — not merely "had errors earlier in
+    // this task". Idle sessions with historical chain>0 show 🟢.
+    if (s && (
+      s.pendingResume ||
+      s.retryEnteredAt > 0 ||
+      ((s.status === "busy" || s.status === "retry") && s.chain > 0)
+    )) {
       return "recovering"
     }
     return "armed"
@@ -983,6 +990,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
 
   const schedule = (sessionID, delayMs, plan) => {
     if (suppressed(sessionID)) {
+      state(sessionID).pendingResume = false
       log("info", `not scheduling "${plan.kind}" — session was stopped by the user`, { sessionID })
       return
     }

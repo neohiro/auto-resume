@@ -207,4 +207,26 @@ const ev = (type, properties) => ({ event: { type, properties } })
   process.env.OPENCODE_RESUME_OFFSTORE = join(tmpdir(), "ar-title-off.json")
 }
 
+// ---- T7: 🔁 reflects ACTIVE recovery only, not historical errors -------------
+{
+  process.env.OPENCODE_RESUME_OFFSTORE = join(tmpdir(), "ar-title-off.json")
+  const state = makeState()
+  state.baseTitles.t7 = "Workflow fixes"
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t7", text: "working" } }))
+  await hooks.event(ev("session.idle", { sessionID: "t7" }))
+  await sleep(450)
+  ok(String(state.titles.t7 ?? "").includes("🟢 armed"), "T7 precondition: armed baseline")
+  // transient error mid-task -> actively recovering
+  await hooks.event(ev("session.error", { sessionID: "t7", error: { name: "APIError", data: { statusCode: 503, message: "unavailable" } } }))
+  await sleep(500)
+  ok(String(state.titles.t7 ?? "").includes("🔁 recovering"), "T7: active recovery shows 🔁")
+  // clean successful turn afterwards -> back to 🟢 armed (not stuck on 🔁)
+  state.messagesBySession.t7 = [{ info: { role: "assistant", error: null }, parts: [{ type: "text", text: "recovered fine" }] }]
+  await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t7", text: "recovered fine" } }))
+  await hooks.event(ev("session.idle", { sessionID: "t7" }))
+  await sleep(450)
+  ok(String(state.titles.t7 ?? "").includes("🟢 armed"), "T7: clean turn returns tag to 🟢 armed")
+}
+
 console.log(process.exitCode ? "TITLE TESTS FAILED" : "ALL TITLE TESTS PASSED")
