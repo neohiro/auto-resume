@@ -140,7 +140,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.7.3"
+const AUTO_RESUME_VERSION = "1.7.4"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1510,6 +1510,7 @@ export const AutoResumePlugin = async ({ client }) => {
   // -- self-updater: daily check against the official repo -------------------
   let lastUpdateCheckAt = 0
   let lastReanimateAt = 0
+  let pendingUpdateToast = null
   const isNewerVersion = (remote, local) => {
     const r = String(remote).split(".").map((x) => parseInt(x, 10) || 0)
     const l = String(local).split(".").map((x) => parseInt(x, 10) || 0)
@@ -1569,28 +1570,20 @@ export const AutoResumePlugin = async ({ client }) => {
     // this an actual daily check while OpenCode stays open.
     const upd = setInterval(() => detach(checkForUpdates, "update-check"), 3_600_000)
     upd.unref?.()
-    // Updates apply on restart (module cache): confirm to the user that the
-    // version they are NOW running is the one fetched during a past session.
+    // One-shot notices wait for a CONNECTED client: firing at init races the
+    // desktop/TUI attachment and the toast vanishes unseen. Delivered by the
+    // server.connected handler below.
     detach(async () => {
       if (!selfPath) return
       try {
-        const { readFile, writeFile } = await import("node:fs/promises")
+        const { readFile } = await import("node:fs/promises")
         const ackPath = `${selfPath}.acked`
-        let acked = ""
-        try { acked = await readFile(ackPath, "utf8").catch(() => "") } catch { }
-        if (acked.trim() === AUTO_RESUME_VERSION) return
-        // Show BEFORE committing the ack: if the TUI isn't ready yet and the
-        // toast fails, the marker stays old and the next start tries again.
-        if (acked) {
-          const shown = await client.tui.showToast({
-            body: {
-              message: `${RESUME_TAG}: Now running v${AUTO_RESUME_VERSION} (previously ${acked.trim() || "unknown"}) — update fully applied.`,
-              variant: "info",
-            },
-          }).then(() => true).catch(() => false)
-          if (!shown) return
+        const acked = (await readFile(ackPath, "utf8").catch(() => "")).trim()
+        if (acked === AUTO_RESUME_VERSION) return
+        pendingUpdateToast = {
+          ackPath,
+          message: `${RESUME_TAG}: Now running v${AUTO_RESUME_VERSION}${acked ? ` (previously ${acked})` : ""} — update fully applied.`,
         }
-        await writeFile(ackPath, AUTO_RESUME_VERSION, "utf8")
       } catch { /* cosmetic only */ }
     }, "update-notice")
     detach(reanimate, "reanimate")
@@ -1764,6 +1757,24 @@ export const AutoResumePlugin = async ({ client }) => {
             if (cfg.reanimate && nowMs - lastReanimateAt > 300_000) {
               lastReanimateAt = nowMs
               detach(reanimate, "reanimate")
+            }
+            // A client just attached — NOW one-shot notices are visible.
+            if (pendingUpdateToast) {
+              const notice = pendingUpdateToast
+              detach(async () => {
+                try {
+                  const { readFile, writeFile } = await import("node:fs/promises")
+                  // another project instance may have acked first — no dupes
+                  const current = (await readFile(notice.ackPath, "utf8").catch(() => "")).trim()
+                  if (current === AUTO_RESUME_VERSION) { pendingUpdateToast = null; return }
+                  const shown = await client.tui.showToast({
+                    body: { message: notice.message, variant: "info" },
+                  }).then(() => true).catch(() => false)
+                  if (!shown) return
+                  await writeFile(notice.ackPath, AUTO_RESUME_VERSION, "utf8")
+                  pendingUpdateToast = null
+                } catch { /* retried on the next connected event */ }
+              }, "update-notice-deliver")
             }
             break
           }
