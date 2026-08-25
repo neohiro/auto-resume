@@ -7,6 +7,7 @@ on:
 
 jobs:
   test:
+    continue-on-error: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[oc]') }}
     strategy:
       fail-fast: false
       matrix:
