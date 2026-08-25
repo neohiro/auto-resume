@@ -1,10 +1,18 @@
-// Self-contained env tuning: fast delays + no toast throttling for assertions.
+// Self-contained env tuning: fast delays + no notice throttling for assertions.
 process.env.OPENCODE_RESUME_BASE_DELAY_MS ??= "30"
 process.env.OPENCODE_RESUME_RATE_LIMIT_BASE_MS ??= "40"
 process.env.OPENCODE_RESUME_MAX_DELAY_MS ??= "500"
 process.env.OPENCODE_RESUME_NUDGE_DELAY_MS ??= "30"
-process.env.OPENCODE_RESUME_TOAST_THROTTLE_MS ??= "0"
+process.env.OPENCODE_RESUME_NOTICE_THROTTLE_MS ??= "0"
 process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+// Per-run isolated sidecar stores: never touch the real plugin directory and
+// never leak state between runs (a persisted stop/opt-out would poison the
+// next run's assertions).
+process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-v3-stops-${process.pid}-${Date.now()}.json`)
+process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-v3-off-${process.pid}-${Date.now()}.json`)
 
 import { AutoResumePlugin } from "../auto-resume.js"
 
@@ -16,8 +24,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 function makeClient(state, providers) {
   return {
-    app: { log: async () => true },
-    tui: { showToast: async ({ body }) => { state.toasts.push(body.message); return true } },
+    app: { log: async ({ body }) => { state.logs.push(body?.message ?? ""); return true } },
     config: { providers: async () => ({ data: { providers } }) },
     session: {
       status: async () => ({ data: Object.fromEntries([...state.idleIds].map((id) => [id, { type: "idle" }])) }),
@@ -36,7 +43,7 @@ function makeClient(state, providers) {
 }
 
 async function fresh(idle, providers) {
-  const state = { prompts: [], aborts: [], summarizes: [], toasts: [], permResponses: [], idleIds: new Set(idle), msgStore: {}, msgN: 0 }
+  const state = { prompts: [], aborts: [], summarizes: [], logs: [], permResponses: [], idleIds: new Set(idle), msgStore: {}, msgN: 0 }
   const hooks = await AutoResumePlugin({ client: makeClient(state, providers) })
   return { state, hooks }
 }
@@ -95,8 +102,8 @@ const ev = (type, properties) => ({ event: { type, properties } })
   }
   const distinctModels = new Set(state.prompts.map((p) => p.model?.modelID).filter(Boolean))
   ok(distinctModels.size <= 3, `T: rotations bounded (${[...distinctModels].join(",")})`)
-  ok(state.toasts.some((t) => t.toLowerCase().includes("no alternate") || t.toLowerCase().includes("gave up")),
-    "T: honest give-up toast when rotations exhausted")
+  ok(state.logs.some((t) => t.toLowerCase().includes("no alternate") || t.toLowerCase().includes("gave up")),
+    "T: honest give-up notice when rotations exhausted")
   delete process.env.OPENCODE_RESUME_MAX_ROTATIONS
   delete process.env.OPENCODE_RESUME_RL_SWITCH_AFTER
   delete process.env.OPENCODE_RESUME_MAX_CHAIN
@@ -117,7 +124,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(state.prompts.filter((p) => p.text.includes("wrap-up")).length === 1, "V: proposals follow improvements")
   await hooks.event(ev("session.idle", { sessionID: "imp" }))
   await sleep(250)
-  ok(state.toasts.some((t) => t.includes("complete")), "V: final success toast")
+  ok(state.logs.some((t) => t.includes("complete")), "V: final success notice")
   delete process.env.OPENCODE_AUTOPILOT_IMPROVE_CYCLES
 }
 

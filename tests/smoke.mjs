@@ -1,10 +1,19 @@
-// Self-contained env tuning: fast delays + no toast throttling for assertions.
+// Self-contained env tuning: fast delays + no notice throttling for assertions.
 process.env.OPENCODE_RESUME_BASE_DELAY_MS ??= "30"
 process.env.OPENCODE_RESUME_RATE_LIMIT_BASE_MS ??= "40"
 process.env.OPENCODE_RESUME_MAX_DELAY_MS ??= "500"
 process.env.OPENCODE_RESUME_NUDGE_DELAY_MS ??= "30"
-process.env.OPENCODE_RESUME_TOAST_THROTTLE_MS ??= "0"
+process.env.OPENCODE_RESUME_NOTICE_THROTTLE_MS ??= "0"
 process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+// Per-run isolated sidecar stores: never touch the real plugin directory and
+// never leak state between runs (a persisted stop/opt-out would poison the
+// next run's assertions).
+process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-smoke-stops-${process.pid}-${Date.now()}.json`)
+process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-smoke-off-${process.pid}-${Date.now()}.json`)
+
 import { AutoResumePlugin } from "../auto-resume.js"
 
 const ok = (cond, label) => {
@@ -15,8 +24,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 function makeClient(state) {
   return {
-    app: { log: async () => true },
-    tui: { showToast: async ({ body }) => { state.toasts.push(body.message); return true } },
+    app: { log: async ({ body }) => { state.logs.push(body?.message ?? ""); return true } },
     session: {
       status: async () => ({ data: Object.fromEntries([...state.idleIds].map((id) => [id, { type: "idle" }])) }),
       prompt: async ({ path, body }) => {
@@ -36,7 +44,7 @@ function makeClient(state) {
 }
 
 async function freshState(idleIds = []) {
-  const state = { prompts: [], aborts: [], summarizes: [], toasts: [], idleIds: new Set(idleIds) }
+  const state = { prompts: [], aborts: [], summarizes: [], logs: [], idleIds: new Set(idleIds) }
   const hooks = await AutoResumePlugin({ client: makeClient(state) })
   return { state, hooks }
 }
@@ -79,7 +87,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.error", { sessionID: "sessC", error: { name: "ProviderAuthError", data: { providerID: "x", message: "bad key" } } }))
   await sleep(250)
   ok(state.prompts.length === 1, "D: auth error -> no retry")
-  ok(state.toasts.some((t) => t.includes("auth")), "D: auth toast shown")
+  ok(state.logs.some((t) => t.includes("auth")), "D: auth notice shown")
 
   await hooks.event(ev("session.error", { sessionID: "sessC", error: { name: "UnknownError", data: { message: "fetch failed: ECONNRESET" } } }))
   await sleep(450)

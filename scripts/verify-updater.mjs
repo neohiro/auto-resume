@@ -28,15 +28,25 @@ function scenario(name) {
 }
 
 async function boot(file) {
-  const state = { prompts: [], toasts: [] }
+  const state = { prompts: [], logs: [], shellCalls: [] }
   const client = {
-    app: { log: async () => true },
-    tui: { showToast: async ({ body }) => { state.toasts.push(body.message); return true } },
+    app: { log: async ({ body }) => { state.logs.push(body?.message ?? ""); return true } },
     config: { providers: async () => ({ data: { providers: [] } }) },
     session: new Proxy({}, { get: () => async () => ({ data: {} }) }),
   }
+  // Stand-in for OpenCode's shell runner ($): lets the OS-notification channel
+  // "succeed" without spawning a real notifier in CI. Mirrors Bun's $
+  // contract — the tagged-call result is awaitable AND carries .quiet() —
+  // and records every invocation so tests can assert OS delivery was
+  // attempted (works identically on win32/darwin/linux runners).
+  const $ = (...args) => {
+    state.shellCalls.push(args.flat().map(String).join(" ").slice(0, 200))
+    const p = Promise.resolve({ exitCode: 0, stdout: "", stderr: "" })
+    p.quiet = () => p
+    return p
+  }
   const mod = await import(pathToFileURL(file).href + `?t=${Date.now()}-${Math.random()}`)
-  await mod.AutoResumePlugin({ client })
+  await mod.AutoResumePlugin({ client, $ })
   return state
 }
 
@@ -56,8 +66,10 @@ rmSync(ROOT, { recursive: true, force: true })
   const leftovers = existsSync(`${dir}/auto-resume.js.tmp`) ||
     require0(dir).some((f) => f.endsWith(".tmp"))
   NODE_OK(!leftovers, "T1: no temp-file leftovers")
-  NODE_OK(state.toasts.some((t) => t.includes(`Updated 1.0.0 -> ${REMOTE}`) && t.includes("Restart OpenCode")),
-    "T1: toast tells user to restart")
+  NODE_OK(state.logs.some((t) => t.includes(`Updated 1.0.0 -> ${REMOTE}`) && t.includes("Restart OpenCode")),
+    "T1: notice tells user to restart")
+  NODE_OK(state.shellCalls.some((c) => /notify|EncodedCommand|osascript/i.test(c)),
+    "T1: completed update dispatched a native OS notification")
 }
 
 // ---- T2: current version -> clean no-op --------------------------------------
@@ -67,7 +79,7 @@ rmSync(ROOT, { recursive: true, force: true })
   const state = await boot(file)
   await sleep(4000)
   NODE_OK(versionOf(file) === REMOTE && !existsSync(`${file}.bak`), "T2: up-to-date install left untouched")
-  NODE_OK(!state.toasts.some((t) => t.includes("Updated")), "T2: no update toast when current")
+  NODE_OK(!state.logs.some((t) => t.includes("Updated")), "T2: no update notice when current")
 }
 
 // ---- T3: locally newer than remote -> no downgrade ---------------------------
@@ -102,12 +114,15 @@ rmSync(ROOT, { recursive: true, force: true })
   writeFileSync(file, readFileSync(SOURCE, "utf8").replace(/AUTO_RESUME_VERSION = "[^"]+"/, 'AUTO_RESUME_VERSION = "7.7.7"'))
   writeFileSync(`${file}.acked`, "0.8.0")
   const s2 = await boot(file)
-  await sleep(1500)
-  NODE_OK(s2.toasts.some((t) => t.includes("Now running v7.7.7") && t.includes("(previously 0.8.0)")),
+  await sleep(3000) // > first-attempt delivery timer (800ms) even on slow CI
+  NODE_OK(s2.logs.some((t) => t.includes("Now running v7.7.7") && t.includes("(previously 0.8.0)")),
     "T5: restart confirms the applied update exactly once")
+  NODE_OK(s2.shellCalls.length >= 1,
+    "T5: restart confirmation dispatched via the OS channel")
   const s3 = await boot(file)
   await sleep(1200)
-  NODE_OK(!s3.toasts.some((t) => t.includes("Now running v")), "T6: confirmation never fires again")
+  NODE_OK(!s3.logs.some((t) => t.includes("Now running v")), "T6: confirmation never fires again")
+  NODE_OK(s3.shellCalls.length === 0, "T6: no OS dispatch after ack")
 }
 
 console.log(process.exitCode ? "UPDATER VERIFICATION FAILED" : "UPDATER VERIFICATION: ALL PATHS PROVEN")

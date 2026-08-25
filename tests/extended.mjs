@@ -1,10 +1,19 @@
-// Self-contained env tuning: fast delays + no toast throttling for assertions.
+// Self-contained env tuning: fast delays + no notice throttling for assertions.
 process.env.OPENCODE_RESUME_BASE_DELAY_MS ??= "30"
 process.env.OPENCODE_RESUME_RATE_LIMIT_BASE_MS ??= "40"
 process.env.OPENCODE_RESUME_MAX_DELAY_MS ??= "500"
 process.env.OPENCODE_RESUME_NUDGE_DELAY_MS ??= "30"
-process.env.OPENCODE_RESUME_TOAST_THROTTLE_MS ??= "0"
+process.env.OPENCODE_RESUME_NOTICE_THROTTLE_MS ??= "0"
 process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+// Per-run isolated sidecar stores: never touch the real plugin directory and
+// never leak state between runs (a persisted stop/opt-out would poison the
+// next run's assertions).
+process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-extended-stops-${process.pid}-${Date.now()}.json`)
+process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-extended-off-${process.pid}-${Date.now()}.json`)
+
 import { AutoResumePlugin } from "../auto-resume.js"
 
 const ok = (cond, label) => {
@@ -15,8 +24,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 function makeClient(state) {
   return {
-    app: { log: async () => true },
-    tui: { showToast: async ({ body }) => { state.toasts.push(body.message); return true } },
+    app: { log: async ({ body }) => { state.logs.push(body?.message ?? ""); return true } },
     session: {
       status: async () => ({ data: Object.fromEntries([...state.idleIds].map((id) => [id, { type: "idle" }])) }),
       prompt: async ({ path, body }) => {
@@ -31,7 +39,7 @@ function makeClient(state) {
 }
 
 async function fresh(idle = []) {
-  const state = { prompts: [], aborts: [], summarizes: [], toasts: [], idleIds: new Set(idle) }
+  const state = { prompts: [], aborts: [], summarizes: [], logs: [], idleIds: new Set(idle) }
   const hooks = await AutoResumePlugin({ client: makeClient(state) })
   return { state, hooks }
 }
@@ -66,7 +74,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   }
   await sleep(500)
   ok(state.prompts.length <= 3, `J: capped at max_chain resumes (${state.prompts.length})`)
-  ok(state.toasts.some((t) => t.toLowerCase().includes("gave up")), "J: give-up toast shown")
+  ok(state.logs.some((t) => t.toLowerCase().includes("gave up")), "J: give-up notice shown")
   delete process.env.OPENCODE_RESUME_MAX_CHAIN
 }
 
@@ -74,7 +82,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
 {
   process.env.OPENCODE_RESUME_MAX_CHAIN = "0"
   process.env.OPENCODE_RESUME_BREAKER_THRESHOLD = "2"
-  process.env.OPENCODE_RESUME_TOAST_THROTTLE_MS = "0"
+  process.env.OPENCODE_RESUME_NOTICE_THROTTLE_MS = "0"
   const { state, hooks } = await fresh(["b1", "b2", "b3"])
   for (const id of ["b1", "b2"]) {
     await hooks.event(ev("session.error", { sessionID: id, error: { name: "APIError", data: { statusCode: 500, message: "down" } } }))
@@ -83,7 +91,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.error", { sessionID: "b3", error: { name: "APIError", data: { statusCode: 500, message: "still down" } } }))
   await sleep(400)
   ok(state.prompts.length === 0, `K: breaker suppressed b3 resume (${state.prompts.length})`)
-  ok(state.toasts.some((t) => t.includes("pausing auto-recovery")), "K: breaker toast shown")
+  ok(state.logs.some((t) => t.includes("pausing auto-recovery")), "K: breaker notice shown")
   delete process.env.OPENCODE_RESUME_MAX_CHAIN
   delete process.env.OPENCODE_RESUME_BREAKER_THRESHOLD
 }

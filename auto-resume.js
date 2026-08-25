@@ -74,7 +74,7 @@
  *   • AUTO-PROCEED: if the agent ends its turn by asking a question
  *     ("Should I proceed...?"), it answers itself and continues (capped)
  *   • WRAP-UP: when the todo list completes → asks once for concrete
- *     improvement proposals (listed, not implemented) + success toast
+ *     improvement proposals (listed, not implemented) + success notice
  *   • BEYOND EXPECTATIONS: before wrapping up, runs a self-critique pass —
  *     the model reviews its own work for correctness/perf/security/robustness
  *     improvements and implements the safe ones (capped number of cycles)
@@ -114,7 +114,9 @@
  *  OPENCODE_RESUME_BREAKER_WINDOW_MS     breaker rolling window     (900000)
  *  OPENCODE_RESUME_BREAKER_COOLDOWN_MS   breaker cool-down          (300000)
  *  OPENCODE_RESUME_COMPACT_ON_OVERFLOW   summarize then resume      (true)
- *  OPENCODE_RESUME_TOAST_THROTTLE_MS     min gap between toasts     (3000)
+ *  OPENCODE_RESUME_NOTICE_THROTTLE_MS    min gap between user notices
+ *                                      (legacy OPENCODE_RESUME_TOAST_THROTTLE_MS
+ *                                      still honored)             (3000)
  *  OPENCODE_RESUME_SWITCH_ON_QUOTA       rotate model on free-tier  (true)
  *  OPENCODE_RESUME_SWITCH_ON_RATELIMIT   rotate after N 429s        (true)
  *  OPENCODE_RESUME_SWITCH_ON_FAILURES    rotate after persistent
@@ -129,7 +131,10 @@
  *  OPENCODE_RESUME_AUTONOMY              master switch subsystem 3+4(true)
  *  OPENCODE_AUTOPILOT_PERMISSIONS        auto-answer permissions    (true)
  *  OPENCODE_AUTOPILOT_PERMISSION_MODE    safe | all                 (safe)
- *  OPENCODE_AUTOPILOT_EXTRA_DENY         comma-separated extra deny regexes
+ *  OPENCODE_AUTOPILOT_EXTRA_DENY        comma-separated extra deny regexes
+ *  OPENCODE_AUTOPILOT_DIR_ALWAYS_AFTER  benign external-directory asks of the
+ *                                      SAME boundary escalate once->always
+ *                                      after N auto-answers         (0=off)
  *  OPENCODE_AUTOPILOT_TODO_DRIVE         continue unfinished todos  (true)
  *  OPENCODE_AUTOPILOT_DEBUG_NUDGE        diagnose after tool errors (true)
  *  OPENCODE_AUTOPILOT_PROPOSALS          wrap-up proposals message  (true)
@@ -150,7 +155,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.9.0"
+const AUTO_RESUME_VERSION = "1.12.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -175,7 +180,7 @@ const DEFAULTS = {
   breakerWindowMs: 900_000,
   breakerCooldownMs: 300_000,
   compactOnOverflow: true,
-  toastThrottleMs: 3_000,
+  noticeThrottleMs: 3_000,
   autoUpdate: true,
   maxTaskCostUsd: 10,
   switchOnQuota: true,
@@ -190,6 +195,7 @@ const DEFAULTS = {
   permissions: true,
   permissionMode: "safe",
   extraDeny: "",
+  dirAlwaysAfter: 0,
   todoDrive: true,
   debugNudge: true,
   proposals: true,
@@ -389,7 +395,9 @@ function loadConfig() {
     breakerWindowMs: num("OPENCODE_RESUME_BREAKER_WINDOW_MS", DEFAULTS.breakerWindowMs),
     breakerCooldownMs: num("OPENCODE_RESUME_BREAKER_COOLDOWN_MS", DEFAULTS.breakerCooldownMs),
     compactOnOverflow: bool("OPENCODE_RESUME_COMPACT_ON_OVERFLOW", DEFAULTS.compactOnOverflow),
-    toastThrottleMs: num("OPENCODE_RESUME_TOAST_THROTTLE_MS", DEFAULTS.toastThrottleMs),
+    // New name wins; the pre-1.10 toast-era env var stays honored as fallback.
+    noticeThrottleMs: num("OPENCODE_RESUME_NOTICE_THROTTLE_MS",
+      num("OPENCODE_RESUME_TOAST_THROTTLE_MS", DEFAULTS.noticeThrottleMs)),
     autoUpdate: bool("OPENCODE_RESUME_AUTO_UPDATE", DEFAULTS.autoUpdate),
     maxTaskCostUsd: num("OPENCODE_AUTOPILOT_MAX_COST_USD", DEFAULTS.maxTaskCostUsd),
     switchOnQuota: bool("OPENCODE_RESUME_SWITCH_ON_QUOTA", DEFAULTS.switchOnQuota),
@@ -404,6 +412,10 @@ function loadConfig() {
     permissions: bool("OPENCODE_AUTOPILOT_PERMISSIONS", DEFAULTS.permissions),
     permissionMode: str("OPENCODE_AUTOPILOT_PERMISSION_MODE", DEFAULTS.permissionMode).toLowerCase(),
     extraDeny: str("OPENCODE_AUTOPILOT_EXTRA_DENY", DEFAULTS.extraDeny),
+    // After N auto-approved "once" answers for the SAME benign external
+    // directory boundary in one session, escalate to "always" (core saves the
+    // proposed patterns for the session). 0 disables escalation.
+    dirAlwaysAfter: num("OPENCODE_AUTOPILOT_DIR_ALWAYS_AFTER", DEFAULTS.dirAlwaysAfter),
     todoDrive: bool("OPENCODE_AUTOPILOT_TODO_DRIVE", DEFAULTS.todoDrive),
     debugNudge: bool("OPENCODE_AUTOPILOT_DEBUG_NUDGE", DEFAULTS.debugNudge),
     proposals: bool("OPENCODE_AUTOPILOT_PROPOSALS", DEFAULTS.proposals),
@@ -423,6 +435,103 @@ const matchesAny = (haystack, patterns) => {
 }
 const jitter = (ms) => Math.round(ms + ms * 0.25 * (Math.random() * 2 - 1))
 
+// ── native OS notifications ─────────────────────────────────────────────
+// The popup channel for rare milestone events (e.g. a completed self-update):
+// renders even when no TUI/desktop client is attached. Best effort by design
+// — every path resolves false instead of throwing.
+//   • Windows  WinRT toast via PowerShell, balloon-tip fallback
+//   • macOS    AppleScript display notification
+//   • Linux    notify-send → raw D-Bus → WSL PowerShell bridge
+
+const psQuote = (s) => "'" + String(s).replace(/'/g, "''") + "'"
+
+/** PowerShell source for one Windows notification: tries the modern WinRT
+ *  toast first; if the AUMID is blocked (common on hardened builds), falls
+ *  back to a NotifyIcon balloon tip, which Windows 10/11 render as a toast. */
+const windowsToastPs = (title, message) => `
+$ErrorActionPreference = 'Stop'
+$title = ${psQuote(title)}
+$text  = ${psQuote(message)}
+try {
+  [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+  $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+  $nodes = $xml.GetElementsByTagName('text')
+  [void]$nodes.Item(0).AppendChild($xml.CreateTextNode($title))
+  [void]$nodes.Item(1).AppendChild($xml.CreateTextNode($text))
+  $appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
+  [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show(
+    [Windows.UI.Notifications.ToastNotification]::new($xml))
+  exit 0
+} catch {
+  try {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $tip = New-Object System.Windows.Forms.NotifyIcon
+    $tip.Icon = [System.Drawing.SystemIcons]::Information
+    $tip.Visible = $true
+    $tip.BalloonTipTitle = $title
+    $tip.BalloonTipText = $text
+    $tip.ShowBalloonTip(10000)
+    Start-Sleep -Seconds 11
+    $tip.Dispose()
+    exit 0
+  } catch { exit 1 }
+}`
+
+/** Build a best-effort OS notifier bound to an OpenCode shell runner ($).
+ *  platform / systemRoot / wslVersionFile are injectable so tests can drive
+ *  every OS branch without mutating process globals. Returns
+ *  async (title, message) => boolean — true once a notifier accepted the job. */
+export const createOsNotifier = ({
+  $,
+  platform = process.platform,
+  systemRoot = process.env.SystemRoot,
+  wslVersionFile = "/proc/version",
+} = {}) => {
+  let wslCache
+  const wslProbe = () =>
+    platform !== "linux"
+      ? Promise.resolve("")
+      : (wslCache ??= import("node:fs/promises")
+          .then(({ readFile }) => readFile(wslVersionFile, "utf8"))
+          .catch(() => ""))
+  const runPowerShellToast = async (exe, title, message) => {
+    const encoded = Buffer.from(windowsToastPs(title, message), "utf16le").toString("base64")
+    await $`${exe} -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand ${encoded}`.quiet()
+  }
+  return async (title, message) => {
+    try {
+      if (!($ && typeof $ === "function")) return false
+      if (platform === "win32") {
+        await runPowerShellToast(
+          `${systemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+          title, message)
+        return true
+      }
+      if (platform === "darwin") {
+        // AppleScript double-quoted strings: escape backslashes first, then quotes
+        const q = (s) => `"${String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+        await $`osascript -e ${`display notification ${q(message)} with title ${q(title)}`}`
+        return true
+      }
+      // Linux/BSD: WSL hosts delegate to Windows PowerShell; bare metal uses
+      // libnotify first and the raw D-Bus Notifications API as fallback.
+      if (/microsoft|wsl/i.test(await wslProbe())) {
+        await runPowerShellToast("powershell.exe", title, message)
+        return true
+      }
+      try {
+        await $`notify-send -a auto-resume ${title} ${message}`.quiet()
+        return true
+      } catch { /* no libnotify installed */ }
+      await $`dbus-send --session --type=method_call --dest=org.freedesktop.Notifications /org/freedesktop/Notifications org.freedesktop.Notifications.Notify string:${title} uint32:0 string:dialog-information string:${title} string:${message} array:string: dict:string:string: int32:5000`.quiet()
+      return true
+    } catch {
+      return false
+    }
+  }
+}
+
 export const AutoResumePlugin = async ({ client, $ }) => {
   const cfg = loadConfig()
 
@@ -432,8 +541,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   const timers = new Map()
   const breakerFailures = []
   let breakerOpenUntil = 0
-  let breakerToasted = false
-  let lastToastAt = 0
+  let breakerNoted = false
+  let lastNoticeAt = 0
   let catalogCache = null
   let catalogFetchedAt = 0
 
@@ -564,7 +673,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     if (s?.userStopped || persistedStops.has(sessionID)) return "stopped"
     const capped = Boolean(
       s && (
-        s.costToasted ||
+        s.costNotified ||
         (cfg.maxTaskCostUsd > 0 && s.taskCost >= cfg.maxTaskCostUsd) ||
         s.chain >= cfg.maxChain ||
         s.nudges >= cfg.maxNudges ||
@@ -694,7 +803,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       const t = timers.get(sessionID)
       if (t) { clearTimeout(t); timers.delete(sessionID) }
       log("info", "auto-resume disabled for session", { sessionID })
-      toast(`${RESUME_TAG}: Off for this session — nothing will be automated here until you say "auto-resume on".`, "info")
+      notice(`${RESUME_TAG}: Off for this session — nothing will be automated here until you say "auto-resume on".`, "info")
       queueTitleRefresh(sessionID)
       return
     }
@@ -706,7 +815,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     s.currentModel = null
     s.emptyNudges = 0
     log("info", "auto-resume enabled for session", { sessionID })
-    toast(`${RESUME_TAG}: ${wasOff ? "On again for this session" : "Already on here"} — armed. 🟢`, "info")
+    notice(`${RESUME_TAG}: ${wasOff ? "On again for this session" : "Already on here"} — armed. 🟢`, "info")
     queueTitleRefresh(sessionID)
   }
 
@@ -730,7 +839,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         userStopped: false, takeoverAt: 0,
         lastInjectKind: null,
         lastEvalSig: null,
-        taskCost: 0, costToasted: false, budgetToasted: false, gaveUpRearmed: false,
+        taskCost: 0, costNotified: false, budgetNotified: false, gaveUpRearmed: false,
       }
       sessions.set(id, s)
     }
@@ -746,8 +855,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       lastDriveCompleted: -1, proposalSent: false, improveDone: 0,
       proceedCount: 0, taskStartAt: Date.now(), toolErrs: 0,
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
-      userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costToasted: false,
-      budgetToasted: false, gaveUpRearmed: false,
+      userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costNotified: false,
+      budgetNotified: false, gaveUpRearmed: false,
       lastErrorName: null, lastErrorSig: null,
     })
     if (!keepTimers) s.stallResumes = 0
@@ -760,46 +869,37 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   const log = (level, message, extra) =>
     detach(() => client.app.log({ body: { service: "auto-resume", level, message, extra } }), "app.log")
 
-  const toast = (message, variant = "warning") => {
+  /** User-facing notices go to the OpenCode log stream ONLY — the flaky TUI
+   *  toast surface was removed in v1.10. Rare milestone events (update
+   *  applied) additionally fire a native OS notification via osNotify. */
+  const NOTICE_LEVEL = { info: "info", success: "info", warning: "warn", error: "error" }
+  const notice = (message, variant = "warning") => {
     const nowMs = Date.now()
-    if (cfg.toastThrottleMs > 0 && nowMs - lastToastAt < cfg.toastThrottleMs) return
-    lastToastAt = nowMs
-    detach(() => client.tui.showToast({ body: { message, variant } }), "toast")
+    if (cfg.noticeThrottleMs > 0 && nowMs - lastNoticeAt < cfg.noticeThrottleMs) return
+    lastNoticeAt = nowMs
+    log(NOTICE_LEVEL[variant] ?? "warn", message)
   }
 
-  /** OS-level notification — the belt-and-suspenders channel for rare one-shot
-   *  notices: visible even when no TUI/desktop surface is attached yet.
-   *  Windows uses a native toast via PowerShell; macOS/Linux use the standard
-   *  notification CLI. Best effort by design. */
-  const osNotify = async (title, message) => {
-    try {
-      const platform = typeof process !== "undefined" ? process.platform : ""
-      if (!($ && typeof $ === "function")) return false
-      if (platform === "win32") {
-        const q = (s) => "'" + String(s).replace(/'/g, "''") + "'"
-        const ps = `
-[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
-$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
-$t = $x.GetElementsByTagName('text')
-$t.Item(0).AppendChild($x.CreateTextNode(${q(title)})) | Out-Null
-$t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))`
-        const encoded = Buffer.from(ps, "utf16le").toString("base64")
-        await $`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`.quiet()
-        return true
-      }
-      if (platform === "darwin") {
-        // AppleScript double-quoted strings: escape backslashes first, then quotes
-        const q = (s) => `"${String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
-        await $`osascript -e ${`display notification ${q(message)} with title ${q(title)}`}`
-        return true
-      }
-      // Linux and everything else: libnotify
-      await $`notify-send ${title} ${message}`.quiet()
-      return true
-    } catch {
-      return false
-    }
+  // ── OS notifications + milestones ──────────────────────────────────────
+  const osNotify = createOsNotifier({ $ })
+
+  /** Milestone events (update applied, …): pushed through the native OS
+   *  channel AND logged — throttle-exempt because their rarity self-caps
+   *  them; lastNoticeAt is reserved up front so ordinary notices stay spaced
+   *  even while a slow balloon-tip dispatch is in flight. With
+   *  requireDelivery, the durable log line only lands when the OS channel
+   *  accepted the job (retry loops then surface failures via their own
+   *  warn/debug path instead of implying success). Log entries carry
+   *  structured extra fields ({event, os}) for machine filtering. Resolves
+   *  true when the OS channel accepted the job. */
+  const announce = async (message, {
+    title = "auto-resume", requireDelivery = false, event = "milestone",
+  } = {}) => {
+    const body = message.startsWith(RESUME_TAG) ? message : `${RESUME_TAG}: ${message}`
+    lastNoticeAt = Date.now()
+    const delivered = await osNotify(title, message.replace(`${RESUME_TAG}: `, ""))
+    if (delivered || !requireDelivery) log("info", body, { event, os: delivered })
+    return delivered
   }
 
   // ── circuit breaker ────────────────────────────────────────────────
@@ -812,10 +912,10 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
       breakerOpenUntil = nowMs + cfg.breakerCooldownMs
       breakerFailures.length = 0
       log("warn", "circuit breaker opened", { cooldownMs: cfg.breakerCooldownMs })
-      toast(`${RESUME_TAG} Repeated failures — pausing auto-recovery for ${Math.round(cfg.breakerCooldownMs / 60_000)} min.`, "error")
+      notice(`${RESUME_TAG} Repeated failures — pausing auto-recovery for ${Math.round(cfg.breakerCooldownMs / 60_000)} min.`, "error")
     }
   }
-  const noteSuccess = () => { breakerFailures.length = 0; breakerOpenUntil = 0; breakerToasted = false }
+  const noteSuccess = () => { breakerFailures.length = 0; breakerOpenUntil = 0; breakerNoted = false }
 
   // ── classification ─────────────────────────────────────────────────
   const classify = (error) => {
@@ -977,7 +1077,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     log("info", "rotated model", {
       sessionID, from: exhausted ? modelKey(exhausted) : null, to: modelKey(alt), reason,
     })
-    toast(`${RESUME_TAG}: ${reason} on ${exhausted ? modelKey(exhausted) : "model"} — continuing on ${modelKey(alt)}.`)
+    notice(`${RESUME_TAG}: ${reason} on ${exhausted ? modelKey(exhausted) : "model"} — continuing on ${modelKey(alt)}.`)
     queueTitleRefresh(sessionID)
     return true
   }
@@ -994,7 +1094,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     const t = timers.get(sessionID)
     if (t) { clearTimeout(t); timers.delete(sessionID) }
     log("info", "user stop detected — automation paused until next prompt", { sessionID, why })
-    toast(`${RESUME_TAG}: Stopped by you — staying quiet until your next prompt.`, "info")
+    notice(`${RESUME_TAG}: Stopped by you — staying quiet until your next prompt.`, "info")
     queueTitleRefresh(sessionID)
   }
 
@@ -1046,10 +1146,10 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
       return
     }
     if (cfg.maxTaskCostUsd > 0 && s0.taskCost >= cfg.maxTaskCostUsd) {
-      if (!s0.costToasted) {
-        s0.costToasted = true
+      if (!s0.costNotified) {
+        s0.costNotified = true
         log("warn", "task cost cap reached - stopping auto-injections", { sessionID, spent: Math.round(s0.taskCost * 100) / 100 })
-        toast(`${RESUME_TAG}: Task cost $${s0.taskCost.toFixed(2)} reached the $${cfg.maxTaskCostUsd} cap - pausing auto-drive. Raise OPENCODE_AUTOPILOT_MAX_COST_USD to continue.`, "warning")
+        notice(`${RESUME_TAG}: Task cost $${s0.taskCost.toFixed(2)} reached the $${cfg.maxTaskCostUsd} cap - pausing auto-drive. Raise OPENCODE_AUTOPILOT_MAX_COST_USD to continue.`, "warning")
       }
       return
     }
@@ -1065,9 +1165,9 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
 
     if (plan.kind === "resume") {
       if (breakerOpen()) {
-        if (!breakerToasted) {
-          breakerToasted = true
-          toast(`${RESUME_TAG} Circuit breaker open — auto-recovery suppressed.`, "error")
+        if (!breakerNoted) {
+          breakerNoted = true
+          notice(`${RESUME_TAG} Circuit breaker open — auto-recovery suppressed.`, "error")
         }
         return
       }
@@ -1126,7 +1226,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
         s.chain += 1
         schedule(sessionID, backoff(s.chain, cfg.baseDelayMs), plan)
       } else {
-        toast(`${RESUME_TAG}: Could not resume (${err?.message ?? "error"}).`, "error")
+        notice(`${RESUME_TAG}: Could not resume (${err?.message ?? "error"}).`, "error")
       }
     }
   }
@@ -1175,7 +1275,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
         s.chain += 1
         if (s.chain <= cfg.maxChain) { schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) }); return }
       }
-      toast(`${RESUME_TAG}: Provider authentication failed — run \`opencode auth login\`.`, "error")
+      notice(`${RESUME_TAG}: Provider authentication failed — run \`opencode auth login\`.`, "error")
       return
     }
 
@@ -1185,7 +1285,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
         schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) })
         return
       }
-      toast(`${RESUME_TAG}: Quota exhausted and no alternate model available — manual action needed.`, "error")
+      notice(`${RESUME_TAG}: Quota exhausted and no alternate model available — manual action needed.`, "error")
       return
     }
 
@@ -1199,7 +1299,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
 
     if (kind === "output_length") {
       if (s.continueCount >= cfg.outputLengthMax) {
-        toast(`${RESUME_TAG}: Output kept hitting max length ${cfg.outputLengthMax}x — giving up.`, "warning")
+        notice(`${RESUME_TAG}: Output kept hitting max length ${cfg.outputLengthMax}x — giving up.`, "warning")
         return
       }
       s.continueCount += 1
@@ -1209,7 +1309,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
 
     if (kind === "overflow") {
       if (!cfg.compactOnOverflow || s.compactAttempted) {
-        toast(`${RESUME_TAG}: Context window exhausted${s.compactAttempted ? " (compaction already tried)" : ""}.`, "error")
+        notice(`${RESUME_TAG}: Context window exhausted${s.compactAttempted ? " (compaction already tried)" : ""}.`, "error")
         return
       }
       s.compactAttempted = true
@@ -1230,7 +1330,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
           })
           const alt = await pickAlternateModel(s.currentModel ?? s.lastModel)
           if (!alt) {
-            toast(`${RESUME_TAG}: Compaction failed and no alternate model available.`, "error")
+            notice(`${RESUME_TAG}: Compaction failed and no alternate model available.`, "error")
             return
           }
           await summarizeWith(alt)
@@ -1240,7 +1340,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
           const cur = state(sessionID)
           if (cur.awaitingCompactionSince) {
             cur.awaitingCompactionSince = 0
-            toast(`${RESUME_TAG}: Compaction did not complete — not resuming.`, "error")
+            notice(`${RESUME_TAG}: Compaction did not complete — not resuming.`, "error")
           }
         }, 180_000).unref?.()
       }, "summarize")
@@ -1248,7 +1348,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     }
 
     if (kind === "fatal") {
-      toast(`${RESUME_TAG}: Unrecoverable error (${error?.name ?? "unknown"}) — not retrying.`, "error")
+      notice(`${RESUME_TAG}: Unrecoverable error (${error?.name ?? "unknown"}) — not retrying.`, "error")
       return
     }
 
@@ -1271,7 +1371,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     if (s.pendingResume) return
     if (s.chain >= cfg.maxChain) {
       noteResumeFailure()
-      toast(`${RESUME_TAG}: Gave up after ${s.chain} recovery attempts (${kind}). Send a message to try manually.`, "error")
+      notice(`${RESUME_TAG}: Gave up after ${s.chain} recovery attempts (${kind}). Send a message to try manually.`, "error")
       // Bounded self-re-arm for unattended runs: after a cool-down, reset the
       // chain and try ONCE more — long outages (502 storms, provider blips)
       // must not permanently kill recovery until the user returns.
@@ -1308,7 +1408,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     return denyListCache
   }
   const looksDangerous = (perm) => {
-    const blob = JSON.stringify({ t: perm.title, m: perm.metadata, c: perm.callID }).toLowerCase()
+    const blob = JSON.stringify({ t: perm.title, m: perm.metadata, c: perm.callID, p: perm.permission }).toLowerCase()
     return denyList().some((entry) => {
       if (entry.startsWith("re:")) {
         try { return new RegExp(entry.slice(3), "i").test(blob) } catch { return false }
@@ -1317,26 +1417,50 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     })
   }
 
+  /** OpenCode's Permission info names the tool/type field `permission`
+   *  ({ id, sessionID, permission: "external_directory", metadata, title });
+   *  older cores and our own test mocks used `type`. Tolerate both. */
+  const permTypeOf = (perm) => String(perm?.permission ?? perm?.type ?? "").toLowerCase()
+  const permIdOf = (perm) => perm?.id ?? perm?.permissionID
+
+  /** Reply to a pending request. The SDK surface drifted across versions, so
+   *  candidates are probed IN ORDER until one resolves — a wrong-shape call
+   *  rejecting must not strand the ask. */
   const respondToPermission = async (sessionID, perm, response, why) => {
-    const fn =
-      client.session?.postSessionByIdPermissionsByPermissionId ??
-      client.session?.respondToPermission ??
-      client.session?.postSessionIdPermissionsPermissionId
-    if (!fn) { log("warn", "permission API unavailable on this opencode version"); return false }
-    try {
-      await fn.call(client.session, {
-        path: { id: sessionID, permissionID: perm.id },
-        body: { response },
-      })
-      log("info", `permission auto-${response}`, { sessionID, type: perm.type, why })
-      toast(`${RESUME_TAG}: auto-${response} ${perm.type} permission (${why}).`, response === "reject" ? "warning" : "info")
-      return true
-    } catch (err) {
-      log("warn", "permission respond failed", { sessionID, err: err?.message ?? String(err) })
-      // A silent failure strands AFK runs on a popup — surface it.
-      toast(`${RESUME_TAG}: Could not auto-answer a ${perm.type} permission — it needs your attention.`, "warning")
-      return false
+    const ns = client.session ?? {}
+    // Known names first (SDK drift across versions), then any other
+    // permission-ish method as last resort. Deduped: the scan would otherwise
+    // re-add the primary and retry a known-bad shape needlessly.
+    const fns = [...new Set([
+      ns.postSessionByIdPermissionsByPermissionId,
+      ns.respondToPermission,
+      ns.postSessionIdPermissionsPermissionId,
+      ...Object.keys(ns)
+        .filter((k) => /permission/i.test(k) && typeof ns[k] === "function")
+        .map((k) => ns[k]),
+    ])].filter((f) => typeof f === "function")
+    if (!fns.length) { log("warn", "permission API unavailable on this opencode version"); return false }
+    const permID = permIdOf(perm)
+    let lastErr
+    for (const fn of fns) {
+      try {
+        await fn.call(ns, {
+          path: { id: sessionID, permissionID: permID },
+          body: { response },
+        })
+        log("info", `permission auto-${response}`, { sessionID, type: permTypeOf(perm), why })
+        notice(`${RESUME_TAG}: auto-${response} ${permTypeOf(perm)} permission (${why}).`, response === "reject" ? "warning" : "info")
+        return true
+      } catch (err) {
+        lastErr = err
+      }
     }
+    log("warn", "permission respond failed", {
+      sessionID, err: lastErr?.message ?? String(lastErr),
+    })
+    // A silent failure strands AFK runs on a popup — surface it.
+    notice(`${RESUME_TAG}: Could not auto-answer a ${permTypeOf(perm)} permission — it needs your attention.`, "warning")
+    return false
   }
 
   const EDIT_TYPES = ["edit", "write", "patch", "file", "apply_patch"]
@@ -1365,17 +1489,38 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     return SENSITIVE_DIR_RES.some((re) => re.test(blob))
   }
 
-  const decidePermission = (perm) => {
+  /** Identifies WHICH external boundary an ask refers to, so repeated asks
+   *  for the same directory escalate together while different directories
+   *  keep independent counters. */
+  const dirSignature = (sessionID, perm) => {
+    const m = perm.metadata ?? {}
+    const pattern = m.patterns ?? m.pattern ?? m.path ?? m.directory ?? ""
+    return `${sessionID}|${permTypeOf(perm)}|${JSON.stringify(pattern)}`
+  }
+  const dirAskCounts = new Map() // "<sessionID>|<type>|<pattern>" -> benign answers
+
+  const decidePermission = (sessionID, perm) => {
     if (!cfg.autonomy || !cfg.permissions) return null
     if (cfg.permissionMode === "off") return null
-    const type = String(perm.type ?? "").toLowerCase()
+    const type = permTypeOf(perm)
     if (looksDangerous(perm)) return "reject"
     if (EDIT_TYPES.includes(type) || WEB_TYPES.includes(type)) return "once"
     // Answered "once" so unattended runs proceed; repeated asks for the same
     // directory are each answered automatically. Cross-OS sensitive areas are
     // rejected outright; paths can additionally be deny-listed via
-    // OPENCODE_AUTOPILOT_EXTRA_DENY (the directory pattern is in metadata).
-    if (DIR_TYPES.includes(type)) return sensitiveDirHit(perm) ? "reject" : "once"
+    // OPENCODE_AUTOPILOT_EXTRA_DENY. With DIR_ALWAYS_AFTER > 0, the Nth+1
+    // benign ask for the SAME boundary escalates to "always" so core saves
+    // its proposed patterns instead of re-asking forever.
+    if (DIR_TYPES.includes(type) || type.includes("directory")) {
+      if (sensitiveDirHit(perm)) return "reject"
+      if (cfg.dirAlwaysAfter > 0) {
+        const sig = dirSignature(sessionID, perm)
+        const seen = (dirAskCounts.get(sig) ?? 0) + 1
+        dirAskCounts.set(sig, seen)
+        return seen > cfg.dirAlwaysAfter ? "always" : "once"
+      }
+      return "once"
+    }
     if (SHELL_TYPES.includes(type)) return "once" // danger already checked above
     if (cfg.permissionMode === "all") return "once"
     return null // safe mode: unknown types stay human-decided
@@ -1440,7 +1585,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
       s.lastSuccessAt = Date.now()
       s.toolErrs = 0
       s.gaveUpRearmed = false
-      s.budgetToasted = false
+      s.budgetNotified = false
 
       const todos = s.todos ?? []
       const open = todos.filter((t) => t.status === "pending" || t.status === "in_progress")
@@ -1476,7 +1621,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
         }
       }
 
-        // Full completion → self-improvement passes → wrap-up proposals → toast
+        // Full completion → self-improvement passes → wrap-up proposals → notice
       if ((todos.length > 0 || boxes.length > 0) && open.length === 0 && cbOpen === 0) {
         // Quality passes are EXEMPT from the shared nudge budget: they have
         // their own hard caps (improveCycles / proposalSent), and burning the
@@ -1497,7 +1642,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
           schedule(sessionID, cfg.nudgeDelayMs, { kind: "propose", prompt: PROMPTS.propose })
           return
         }
-        toast(`${RESUME_TAG}: Task list complete. ✅`, "success")
+        notice(`${RESUME_TAG}: Task list complete. ✅`, "success")
         return
       }
 
@@ -1519,14 +1664,14 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
           return
         }
         log("warn", "todo-drive stopped: no progress across nudges", { sessionID })
-        toast(`${RESUME_TAG}: Todos stalled without progress — stopping auto-drive.`, "warning")
+        notice(`${RESUME_TAG}: Todos stalled without progress — stopping auto-drive.`, "warning")
         return
       }
       // Nudge budget exhausted on drives/proceeds: say so ONCE instead of
       // silently going dark — quality passes (improve/propose) still run.
-      if ((open.length > 0 || cbOpen > 0) && !s.budgetToasted) {
-        s.budgetToasted = true
-        toast(`${RESUME_TAG}: Drive-nudge budget (${cfg.maxNudges}) reached — pausing todo-drives. Self-improvement passes still run. Send a new prompt to refill.`, "warning")
+      if ((open.length > 0 || cbOpen > 0) && !s.budgetNotified) {
+        s.budgetNotified = true
+        notice(`${RESUME_TAG}: Drive-nudge budget (${cfg.maxNudges}) reached — pausing todo-drives. Self-improvement passes still run. Send a new prompt to refill.`, "warning")
       }
       return
     }
@@ -1539,7 +1684,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
   }
 
   // ── stall + stuck-retry watchdog ───────────────────────────────────
-  const takeover = (sessionID, why, toastMsg, plan = { kind: "resume", prompt: PROMPTS.resume }) => {
+  const takeover = (sessionID, why, noticeMsg, plan = { kind: "resume", prompt: PROMPTS.resume }) => {
     const s = state(sessionID)
     if (s.chain >= cfg.maxChain || s.stallResumes >= 2) return
     s.stallResumes += 1
@@ -1549,7 +1694,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     s.retryEnteredAt = 0
     s.retryNext = 0
     log("warn", why, { sessionID })
-    toast(toastMsg)
+    notice(noticeMsg)
     queueTitleRefresh(sessionID)
     detach(async () => {
       try { await client.session.abort({ path: { id: sessionID } }) } catch { /* already dead */ }
@@ -1567,6 +1712,9 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
         knownTitles.delete(sessionID)
         writtenTitles.delete(sessionID)
         baseTitles.delete(sessionID)
+        for (const k of dirAskCounts.keys()) {
+          if (k.startsWith(`${sessionID}|`)) dirAskCounts.delete(k)
+        }
         const tt = titleTimers.get(sessionID)
         if (tt) clearTimeout(tt)
         titleTimers.delete(sessionID)
@@ -1661,7 +1809,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
       if (lastInfo.role === "user") {
         log("info", "reanimating session with unanswered prompt", { sessionID: sess.id })
         schedule(sess.id, 1_500, { kind: "resume", prompt: PROMPTS.resume })
-        toast(`${RESUME_TAG}: Revived a session interrupted by the restart.`)
+        notice(`${RESUME_TAG}: Revived a session interrupted by the restart.`)
         continue
       }
 
@@ -1697,7 +1845,7 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
             ? { kind: "continue", prompt: PROMPTS.truncated }
             : { kind: "resume", prompt: PROMPTS.resume },
         )
-        toast(`${RESUME_TAG}: Revived a session interrupted by the restart.`)
+        notice(`${RESUME_TAG}: Revived a session interrupted by the restart.`)
       }
     }
     // reconnect rescans double as zero-trace sweeps for opted-out sessions
@@ -1708,43 +1856,45 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
   // -- self-updater: daily check against the official repo -------------------
   let lastUpdateCheckAt = 0
   let lastReanimateAt = 0
-  let pendingUpdateToast = null
+  let pendingUpdateNotice = null
   let noticeDelivering = false
+  let lastNoticeTryAt = 0
+  let noticeAttempts = 0
 
-  /** Dual-channel delivery of a one-shot update notice: in-app toast plus an
-   *  OS notification (the latter renders even when no TUI/desktop surface is
-   *  attached yet). The .acked marker commits only after at least one
-   *  channel succeeded, so failed boots retry automatically. */
+  /** Delivery of a one-shot update confirmation as a native OS notification —
+   *  the TUI toast channel no longer exists. The .acked marker commits only
+   *  after the OS notifier accepted the job, so failed attempts retry on the
+   *  next activity nudge (at most every 30s). Persistent failure (notifier-less
+   *  hosts) downgrades to debug after 3 tries so busy logs aren't flooded. */
   const deliverPendingNotice = async () => {
-    if (!pendingUpdateToast || noticeDelivering) return
+    if (!pendingUpdateNotice || noticeDelivering) return
+    if (Date.now() - lastNoticeTryAt < 30_000) return
     noticeDelivering = true
     try {
-      const notice = pendingUpdateToast
+      const n = pendingUpdateNotice
       const { readFile, writeFile } = await import("node:fs/promises")
-      const current = (await readFile(notice.ackPath, "utf8").catch(() => "")).trim()
-      if (current === AUTO_RESUME_VERSION) { pendingUpdateToast = null; return }
-      let tuiOk = false
-      try {
-        const r = await client.tui.showToast({ body: { message: notice.message, variant: "info" } })
-        tuiOk = Boolean(r)
-      } catch { tuiOk = false }
-      const osOk = await osNotify("auto-resume", notice.message.replace(`${RESUME_TAG}: `, ""))
-      if (!tuiOk && !osOk) throw new Error("no delivery channel succeeded")
-      await writeFile(notice.ackPath, AUTO_RESUME_VERSION, "utf8")
-      pendingUpdateToast = null
-      log("info", "update notice delivered", { tui: tuiOk, os: osOk })
+      const current = (await readFile(n.ackPath, "utf8").catch(() => "")).trim()
+      if (current === AUTO_RESUME_VERSION) { pendingUpdateNotice = null; return }
+      const osOk = await announce(n.message, { requireDelivery: true })
+      if (!osOk) throw new Error("OS notifier unavailable")
+      await writeFile(n.ackPath, AUTO_RESUME_VERSION, "utf8")
+      pendingUpdateNotice = null
+      log("info", "update notice delivered via OS notification")
     } catch (err) {
-      log("warn", "update notice delivery failed — retrying on next activity", { err: err?.message ?? String(err) })
+      lastNoticeTryAt = Date.now()
+      noticeAttempts += 1
+      log(noticeAttempts >= 3 ? "debug" : "warn",
+        "update notice delivery failed — retrying later", { err: err?.message ?? String(err) })
     } finally {
       noticeDelivering = false
     }
   }
 
-  /** First sign of client life: settle briefly so surfaces can paint, then
-   *  deliver exactly once per arming. */
+  /** First sign of client life: settle briefly so the notifier stack is up,
+   *  then attempt delivery exactly once per arming. */
   let noticeNudged = false
   const nudgePendingNotice = () => {
-    if (!pendingUpdateToast || noticeNudged) return
+    if (!pendingUpdateNotice || noticeNudged) return
     noticeNudged = true
     const t = setTimeout(() => {
       noticeNudged = false
@@ -1788,10 +1938,13 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
       await writeFile(tmp, src, "utf8")
       await rename(tmp, selfPath)
       log("info", "self-updated", { from: AUTO_RESUME_VERSION, to: match[1], path: selfPath })
-      toast(
-        `${RESUME_TAG}: Updated ${AUTO_RESUME_VERSION} -> ${match[1]}. Restart OpenCode to load it.`,
-        "info",
-      )
+      // Update completed → user-facing channels: an OpenCode log entry plus a
+      // native OS notification (works even when no client window is open).
+      detach(() =>
+        announce(
+          `${RESUME_TAG}: Updated ${AUTO_RESUME_VERSION} -> ${match[1]}. Restart OpenCode to load it.`,
+          { title: "auto-resume updated", event: "update-applied" },
+        ), "milestone-announce")
     } catch (err) {
       log("debug", "update check skipped", { err: err?.message ?? String(err) })
     }
@@ -1811,11 +1964,10 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
     // this an actual daily check while OpenCode stays open.
     const upd = setInterval(() => detach(checkForUpdates, "update-check"), 3_600_000)
     upd.unref?.()
-    // One-shot update notices wait for real client activity before showing:
-    // firing at init races the desktop/TUI attachment and vanishes unseen.
-    // Delivery (dual-channel: in-app toast + OS notification) is triggered by
-    // the first session/message activity, a server.connected event, or a
-    // 15s fallback — whichever comes first.
+    // One-shot update confirmations are delivered as native OS notifications:
+    // a short settle delay after init avoids racing server startup, then the
+    // first session/message activity, a server.connected event, or an 15s
+    // fallback re-attempt failed deliveries.
     if (cfg.autoUpdate) {
       detach(async () => {
         if (!selfPath) return
@@ -1824,10 +1976,12 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
           const ackPath = `${selfPath}.acked`
           const acked = (await readFile(ackPath, "utf8").catch(() => "")).trim()
           if (acked === AUTO_RESUME_VERSION) return
-          pendingUpdateToast = {
+          pendingUpdateNotice = {
             ackPath,
             message: `${RESUME_TAG}: Now running v${AUTO_RESUME_VERSION}${acked ? ` (previously ${acked})` : ""} — update fully applied.`,
           }
+          const first = setTimeout(() => detach(deliverPendingNotice, "notice-deliver"), 800)
+          first.unref?.()
           const fallback = setTimeout(() => detach(deliverPendingNotice, "notice-fallback"), 15_000)
           fallback.unref?.()
         } catch { /* cosmetic only */ }
@@ -1983,19 +2137,29 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
 
           case "permission.updated":
           case "permission.asked": {
-            // Tolerate both payload shapes: flat fields and a nested
-            // p.permission object (seen on newer cores) — without this the
-            // autopilot silently ignored every ask.
-            const perm = p.permission ?? p
+            // Payload shapes seen across cores:
+            //   • FLAT (current): properties ARE the Permission info and
+            //     `p.permission` holds the TOOL NAME STRING ("external_directory")
+            //   • NESTED (older): the info object lives under p.permission
+            // Only treat p.permission as the info object when it really is one.
+            const perm = p.permission && typeof p.permission === "object" ? p.permission : p
             const sessionID = perm.sessionID ?? p.sessionID
             if (!sessionID) break
             permissionPending.set(sessionID, Date.now()) // always: watchdog depends on it
-            if (!perm.id) break
+            const permID = permIdOf(perm)
+            if (!permID) break
             // After a user Stop, the human owns every decision again.
-            const decision = suppressed(sessionID) ? null : decidePermission(perm)
+            const decision = suppressed(sessionID) ? null : decidePermission(sessionID, perm)
             if (decision) {
               detach(respondToPermission(sessionID, perm, decision,
                 decision === "reject" ? "dangerous pattern" : "autopilot"), "permission")
+            } else {
+              // Visibility: a silently-ignored ask looks identical to a dead
+              // autopilot from the outside. Say why it was left alone.
+              log("info", "permission left for manual decision", {
+                sessionID, type: permTypeOf(perm),
+                reason: suppressed(sessionID) ? "session stopped/opted-out" : "safe mode: unlisted type",
+              })
             }
             break
           }
@@ -2059,6 +2223,9 @@ $t.Item(1).AppendChild($x.CreateTextNode(${q(message)})) | Out-Null
               knownTitles.delete(id)
               writtenTitles.delete(id)
               baseTitles.delete(id)
+              for (const k of dirAskCounts.keys()) {
+                if (k.startsWith(`${id}|`)) dirAskCounts.delete(k)
+              }
               const tt = titleTimers.get(id)
               if (tt) clearTimeout(tt)
               titleTimers.delete(id)
