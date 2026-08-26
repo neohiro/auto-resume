@@ -121,7 +121,8 @@
  *  OPENCODE_RESUME_SWITCH_ON_RATELIMIT   rotate after N 429s        (true)
  *  OPENCODE_RESUME_SWITCH_ON_FAILURES    rotate after persistent
  *                                        network/5xx failures       (true)
- *  OPENCODE_RESUME_RL_SWITCH_AFTER       429s before rotating       (2)
+ *  OPENCODE_RESUME_DISABLE_ROTATION      disable ALL model rotation (false)
+ *  OPENCODE_RESUME_RL_SWITCH_AFTER       429s before rotating       (1)
  *  OPENCODE_RESUME_ROTATE_AFTER_FAILURES failed rounds before
  *                                        rotating away              (3)
  *  OPENCODE_RESUME_MAX_ROTATIONS         model rotations per task   (3)
@@ -188,7 +189,8 @@ const DEFAULTS = {
   switchOnQuota: true,
   switchOnRateLimit: true,
   switchOnFailures: true,
-  rlSwitchAfter: 2,
+  disableRotation: false,
+  rlSwitchAfter: 1,
   rotateAfterFailures: 3,
   maxRotations: 3,
   modelCooldownMs: 3_600_000,
@@ -268,6 +270,11 @@ const NETWORK_PATTERNS = [
   "overloaded_error", "overloaded", "bad gateway", "service unavailable",
   "internal server error", "unavailable", "upstream", "unable to connect",
   "load failed", "epipe", "too many requests",
+]
+
+const RATE_LIMIT_PATTERNS = [
+  "rate limit exceeded", "rate limit", "rate limited", "rate-limit",
+  "too many requests", "quota exceeded", "request limit", "throttle",
 ]
 
 const OVERFLOW_PATTERNS = [
@@ -407,7 +414,8 @@ function loadConfig() {
     switchOnQuota: bool("OPENCODE_RESUME_SWITCH_ON_QUOTA", DEFAULTS.switchOnQuota),
     switchOnRateLimit: bool("OPENCODE_RESUME_SWITCH_ON_RATELIMIT", DEFAULTS.switchOnRateLimit),
     switchOnFailures: bool("OPENCODE_RESUME_SWITCH_ON_FAILURES", DEFAULTS.switchOnFailures),
-    rlSwitchAfter: Math.max(1, num("OPENCODE_RESUME_RL_SWITCH_AFTER", DEFAULTS.rlSwitchAfter)),
+    disableRotation: bool("OPENCODE_RESUME_DISABLE_ROTATION", DEFAULTS.disableRotation),
+    rlSwitchAfter: Math.max(1, num("OPENCODE_RESUME_RL_SWITCH_AFTER", 1)),
     rotateAfterFailures: Math.max(1, num("OPENCODE_RESUME_ROTATE_AFTER_FAILURES", DEFAULTS.rotateAfterFailures)),
     maxRotations: num("OPENCODE_RESUME_MAX_ROTATIONS", DEFAULTS.maxRotations),
     modelCooldownMs: num("OPENCODE_RESUME_MODEL_COOLDOWN_MS", DEFAULTS.modelCooldownMs),
@@ -962,6 +970,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     if (name === "ProviderAuthError") return "auth"
     if (name === "MessageOutputLengthError") return "output_length"
     if (matchesAny(text, QUOTA_PATTERNS)) return "quota"
+    if (matchesAny(text, RATE_LIMIT_PATTERNS)) return "rate_limit"
     if (name === "APIError") {
       const code = data.statusCode
       if (code === 429) return "rate_limit"
@@ -1304,7 +1313,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     }
     if (kind === "auth") {
       // Auth is provider-scoped: rotate to another PROVIDER's model if possible.
-      if (cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "authentication failed"))) {
+      if (!cfg.disableRotation && cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "authentication failed"))) {
         s.chain += 1
         if (s.chain <= cfg.maxChain) { schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) }); return }
       }
@@ -1314,7 +1323,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
     // ── quota / free-tier exhaustion → rotate model, no user input ──
     if (kind === "quota") {
-      if (cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "quota/free tier exhausted"))) {
+      if (!cfg.disableRotation && cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "quota/free tier exhausted"))) {
         schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) })
         return
       }
@@ -1323,8 +1332,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     }
 
     // ── repeated rate limits on the same model → rotate too ──
-    if (kind === "rate_limit" && s.rlStreak + 1 >= cfg.rlSwitchAfter &&
-        cfg.switchOnRateLimit && (await rotateAwayFrom(sessionID, "repeated rate limits"))) {
+    const isExplicitRateLimit = matchesAny(text, RATE_LIMIT_PATTERNS)
+    if (kind === "rate_limit" && !cfg.disableRotation &&
+        (isExplicitRateLimit || s.rlStreak + 1 >= cfg.rlSwitchAfter) &&
+        cfg.switchOnRateLimit && (await rotateAwayFrom(sessionID, isExplicitRateLimit ? "rate limit exceeded" : "repeated rate limits"))) {
       s.rlStreak = 0
       schedule(sessionID, jitter(Math.min(cfg.baseDelayMs, 15_000)), { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) })
       return
@@ -1393,7 +1404,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     // No cooldown penalty — provider outages are usually temporary.
     if (kind === "retryable") {
       s.failStreak += 1
-      if (cfg.switchOnFailures && s.failStreak >= cfg.rotateAfterFailures &&
+      if (!cfg.disableRotation && cfg.switchOnFailures && s.failStreak >= cfg.rotateAfterFailures &&
           (await rotateAwayFrom(sessionID, "persistent failures", false))) {
         s.failStreak = 0
     schedule(sessionID, jitter(Math.min(cfg.baseDelayMs, 15_000)), { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) })

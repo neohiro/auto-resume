@@ -148,7 +148,8 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_SWITCH_ON_QUOTA` | `true` | Rotate on free-tier exhaustion |
 | `OPENCODE_RESUME_SWITCH_ON_RATELIMIT` | `true` | Rotate on repeated 429s |
 | `OPENCODE_RESUME_SWITCH_ON_FAILURES` | `true` | Rotate on persistent network/5xx failures |
-| `OPENCODE_RESUME_RL_SWITCH_AFTER` | `2` | 429s before rotating |
+| `OPENCODE_RESUME_DISABLE_ROTATION` | `false` | Disable ALL model rotation (overrides the three above) |
+| `OPENCODE_RESUME_RL_SWITCH_AFTER` | `1` | 429s before rotating |
 | `OPENCODE_RESUME_ROTATE_AFTER_FAILURES` | `3` | Failed rounds before rotating |
 | `OPENCODE_RESUME_MAX_ROTATIONS` | `3` | Model rotations per task |
 | `OPENCODE_RESUME_MODEL_COOLDOWN_MS` | `3600000` | Exhausted-model pause |
