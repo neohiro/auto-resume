@@ -143,6 +143,8 @@
  *  OPENCODE_AUTOPILOT_MAX_PROCEEDS       self-answers per task      (3)
  *  OPENCODE_AUTOPILOT_IMPROVE            self-improvement pass      (true)
  *  OPENCODE_AUTOPILOT_IMPROVE_CYCLES     max improvement cycles     (2)
+ *  OPENCODE_AUTOPILOT_IMPROVE_MAX        session-wide improve cap   (4)
+ *  OPENCODE_AUTOPILOT_IMPROVE_COOLDOWN_MS cooldown before re-arm    (600000 = 10min)
  *  OPENCODE_AUTOPILOT_MAX_NUDGES         max self-driven nudges/task(25)
  *  OPENCODE_AUTOPILOT_BUDGET_MS          wall-clock budget per task (28800000 = 8h, 0=off)
  *  OPENCODE_RESUME_AUTO_UPDATE           self-update daily from GitHub (true)
@@ -203,6 +205,8 @@ const DEFAULTS = {
   maxProceeds: 3,
   improveLoop: true,
   improveCycles: 2,
+  improveMax: 4,
+  improveCooldownMs: 600_000,
   maxNudges: 25,
   budgetMs: 28_800_000,
 }
@@ -423,6 +427,8 @@ function loadConfig() {
     maxProceeds: num("OPENCODE_AUTOPILOT_MAX_PROCEEDS", DEFAULTS.maxProceeds),
     improveLoop: bool("OPENCODE_AUTOPILOT_IMPROVE", DEFAULTS.improveLoop),
     improveCycles: num("OPENCODE_AUTOPILOT_IMPROVE_CYCLES", DEFAULTS.improveCycles),
+    improveMax: num("OPENCODE_AUTOPILOT_IMPROVE_MAX", DEFAULTS.improveMax),
+    improveCooldownMs: num("OPENCODE_AUTOPILOT_IMPROVE_COOLDOWN_MS", DEFAULTS.improveCooldownMs),
     maxNudges: num("OPENCODE_AUTOPILOT_MAX_NUDGES", DEFAULTS.maxNudges),
     budgetMs: num("OPENCODE_AUTOPILOT_BUDGET_MS", DEFAULTS.budgetMs),
   }
@@ -852,7 +858,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         rlStreak: 0, failStreak: 0, rotations: 0,
         todos: [], nudges: 0, driveCount: 0, staleDrives: -1,
         lastDriveCompleted: -1, proposalSent: false, taskStartAt: 0,
-        improveDone: 0, proceedCount: 0,
+        improveDone: 0, improveTotal: 0, lastImprovedAt: 0,
+        proceedCount: 0,
         toolErrs: 0, debugArmed: false, toolRunning: false,
         lastTurnHadText: false,
         retryEnteredAt: 0, retryNext: 0, child: false, reanimated: false,
@@ -866,13 +873,19 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     return s
   }
 
-  /** Fresh-task boundary detection: any REAL (human or injected-but-new) user turn. */
-  const resetTaskScope = (s, keepTimers = true) => {
+  /** Task-scope boundary: resets per-task counters on fresh tasks and follow-ups.
+   *  When `followUp` is true, preserve improve counters so improvement passes
+   *  don't re-trigger on the same topic within the cooldown window. */
+  const resetTaskScope = (s, { keepTimers = true, followUp = false } = {}) => {
+    const improveDone = followUp ? s.improveDone : 0
+    const improveTotal = followUp ? s.improveTotal : 0
+    const lastImprovedAt = followUp ? s.lastImprovedAt : 0
     Object.assign(s, {
       chain: 0, continueCount: 0, compactAttempted: false,
       rlStreak: 0, failStreak: 0, rotations: 0,
       nudges: 0, driveCount: 0, staleDrives: -1,
-      lastDriveCompleted: -1, proposalSent: false, improveDone: 0,
+      lastDriveCompleted: -1, proposalSent: false,
+      improveDone, improveTotal, lastImprovedAt,
       proceedCount: 0, taskStartAt: Date.now(), toolErrs: 0,
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
       userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costNotified: false,
@@ -1646,8 +1659,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         // Quality passes are EXEMPT from the shared nudge budget: they have
         // their own hard caps (improveCycles / proposalSent), and burning the
         // drive budget must never silence final-quality passes on long runs.
-        if (cfg.autonomy && cfg.improveLoop && s.improveDone < cfg.improveCycles && budgetLeft(s)) {
+        if (cfg.autonomy && cfg.improveLoop && s.improveDone < cfg.improveCycles
+            && s.improveTotal < cfg.improveMax && budgetLeft(s)) {
           s.improveDone += 1
+          s.improveTotal += 1
+          s.lastImprovedAt = Date.now()
           s.nudges += 1
           log("info", "improvement pass", { sessionID, cycle: `${s.improveDone}/${cfg.improveCycles}` })
           schedule(sessionID, cfg.nudgeDelayMs, {
@@ -2073,7 +2089,18 @@ export const AutoResumePlugin = async ({ client, $ }) => {
                 // disk too, so future runs automate this session again.
                 // (An explicit opt-out is only lifted by "auto-resume on".)
                 if (persistedStops.delete(info.sessionID)) stopStore.save()
-                resetTaskScope(s0)
+                // Follow-up detection: if all todos are already complete and
+                // the improve-cooldown hasn't elapsed yet, preserve improve
+                // counters so improvement passes don't re-trigger on the same
+                // topic.  Once the cooldown expires, reset everything so new
+                // work gets a fresh improvement cycle.
+                const todos = s0.todos ?? []
+                const allDone = todos.length > 0 &&
+                  todos.every((t) => t.status === "completed" || t.status === "cancelled")
+                const cooldownElapsed = !s0.lastImprovedAt ||
+                  (cfg.improveCooldownMs > 0 && Date.now() - s0.lastImprovedAt >= cfg.improveCooldownMs)
+                const followUp = allDone && !cooldownElapsed
+                resetTaskScope(s0, { followUp })
                 s0.currentModel = null
                 s0.emptyNudges = 0
                 queueTitleRefresh(info.sessionID)
