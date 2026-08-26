@@ -128,4 +128,67 @@ const ev = (type, properties) => ({ event: { type, properties } })
   delete process.env.OPENCODE_AUTOPILOT_IMPROVE_CYCLES
 }
 
+// ---- U: no-todo autopilot triggers self-improvement for any LLM --------------
+// Many free/cheap LLMs (e.g. OpenRouter's "Free Models Router") never call the
+// todo tool and never emit markdown checkboxes. Without the no-todo autopilot
+// branch, the entire subsystem-4 (improvement + proposals) silently skipped
+// their sessions. This test simulates such a model: it returns a long,
+// substantive assistant turn with NO todos, and asserts the improvement pass
+// still fires.
+{
+  const longText = "I have refactored the auth module to use the new session-cache pattern. " +
+    "The legacy cookie path is preserved as a shim and the new path is gated behind a feature flag. " +
+    "Tests were added for the new flow including a regression test for the prior fix-token regression. " +
+    "All existing unit tests pass and the build is green; coverage on the touched files is 100%."
+  const providers = [{ id: "openrouter", models: { "free-models-router": {} } }]
+  const state = { prompts: [], aborts: [], summarizes: [], logs: [], permResponses: [], idleIds: new Set(["fmr"]), msgStore: {}, msgN: 0 }
+  const client = {
+    app: { log: async ({ body }) => { state.logs.push(body?.message ?? ""); return true } },
+    config: { providers: async () => ({ data: { providers } }) },
+    session: {
+      status: async () => ({ data: { fmr: { type: "idle" } } }),
+      prompt: async ({ path, body }) => {
+        state.prompts.push({ id: path.id, text: body.parts[0].text, model: body.model })
+        return { data: {} }
+      },
+      abort: async () => true,
+      summarize: async () => true,
+      messages: async () => ({
+        data: [{
+          info: { role: "assistant", error: null, providerID: "openrouter", modelID: "free-models-router", id: `m${++state.msgN}` },
+          parts: [{ type: "text", text: longText }],
+        }],
+      }),
+      message: async ({ path }) => ({ data: { parts: [{ type: "text", text: state.msgStore[path.messageID] ?? "" }] } }),
+    },
+  }
+  const hooks = await AutoResumePlugin({ client })
+  // Step 1: assistant message starts the turn and records the model
+  await hooks.event(ev("message.updated", { info: { role: "assistant", sessionID: "fmr", providerID: "openrouter", modelID: "free-models-router" } }))
+  // Step 2: text arrives — signals the turn had content (lastTurnHadText = true)
+  await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "fmr", text: "I have refactored" } }))
+  // Step 3: idle fires — no todos, no checkboxes, but the model delivered substantive text
+  await hooks.event(ev("session.idle", { sessionID: "fmr" }))
+  await sleep(400)
+  // Must label the FIRST pass as 1/2, not 0/2 — counter increments were happening
+  // BEFORE the prompt was built, producing the off-by-one "0/2" label.
+  ok(state.prompts.some((p) => p.text.includes("Self-improvement pass 1/2")),
+    `U: no-todo model still gets an autopilot self-improvement pass (${state.prompts.length} prompt(s))`)
+  ok(!state.prompts.some((p) => p.text.includes("Self-improvement pass 0/")),
+    "U: first pass labels as 1/2, never 0/2")
+  // Step 4: a single follow-up user question must NOT instantly re-arm the loop.
+  // The improve-cooldown (10 min default) plus noTodoImproveFired plus
+  // proposalSent all gate the next fire so Q&A in the same task doesn't
+  // re-trigger the full critique cycle.
+  state.msgStore.fu1 = "Just one quick question — what does the shim do?"
+  await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "fmr", id: "fu1" } }))
+  await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "fmr", text: longText } }))
+  await hooks.event(ev("session.idle", { sessionID: "fmr" }))
+  await sleep(400)
+  const extraImprove = state.prompts.filter((p) => p.text.includes("Self-improvement pass")).length
+  ok(extraImprove === 1,
+    `U: single follow-up question does NOT re-trigger the improvement cycle (${extraImprove} improve prompt(s) total)`)
+}
+
+
 console.log(process.exitCode ? "V3 TESTS FAILED" : "ALL V3 TESTS PASSED")

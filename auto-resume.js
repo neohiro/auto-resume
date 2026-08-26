@@ -866,7 +866,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         rlStreak: 0, failStreak: 0, rotations: 0,
         todos: [], nudges: 0, driveCount: 0, staleDrives: -1,
         lastDriveCompleted: -1, proposalSent: false, taskStartAt: 0,
-        improveDone: 0, improveTotal: 0, lastImprovedAt: 0,
+        improveDone: 0, improveTotal: 0, lastImprovedAt: 0, noTodoImproveFired: false,
         proceedCount: 0,
         toolErrs: 0, debugArmed: false, toolRunning: false,
         lastTurnHadText: false,
@@ -897,7 +897,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       proceedCount: 0, taskStartAt: Date.now(), toolErrs: 0,
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
       userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costNotified: false,
-      budgetNotified: false, gaveUpRearmed: false,
+      budgetNotified: false, gaveUpRearmed: false, noTodoImproveFired: false,
       lastErrorName: null, lastErrorSig: null,
     })
     if (!keepTimers) s.stallResumes = 0
@@ -1332,7 +1332,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     }
 
     // ── repeated rate limits on the same model → rotate too ──
-    const isExplicitRateLimit = matchesAny(text, RATE_LIMIT_PATTERNS)
+    const errText = `${error?.data?.message ?? ""} ${error?.data?.responseBody ?? ""}`
+    const isExplicitRateLimit = matchesAny(errText, RATE_LIMIT_PATTERNS)
     if (kind === "rate_limit" && !cfg.disableRotation &&
         (isExplicitRateLimit || s.rlStreak + 1 >= cfg.rlSwitchAfter) &&
         cfg.switchOnRateLimit && (await rotateAwayFrom(sessionID, isExplicitRateLimit ? "rate limit exceeded" : "repeated rate limits"))) {
@@ -1672,14 +1673,15 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         // drive budget must never silence final-quality passes on long runs.
         if (cfg.autonomy && cfg.improveLoop && s.improveDone < cfg.improveCycles
             && s.improveTotal < cfg.improveMax && budgetLeft(s)) {
-          s.improveDone += 1
+          const cycle = s.improveDone + 1
+          s.improveDone = cycle
           s.improveTotal += 1
           s.lastImprovedAt = Date.now()
           s.nudges += 1
-          log("info", "improvement pass", { sessionID, cycle: `${s.improveDone}/${cfg.improveCycles}` })
+          log("info", "improvement pass", { sessionID, cycle: `${cycle}/${cfg.improveCycles}` })
           schedule(sessionID, cfg.nudgeDelayMs, {
             kind: "improve",
-            prompt: () => PROMPTS.improve(s.improveDone, cfg.improveCycles),
+            prompt: () => PROMPTS.improve(cycle, cfg.improveCycles),
           })
           return
         }
@@ -1691,6 +1693,47 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         }
         notice(`${RESUME_TAG}: Task list complete. ✅`, "success")
         return
+      }
+
+      // No-todo autopilot: many LLMs (cheap/free routers, smaller open-source
+      // models, fast inference endpoints) never call the todo tool and never
+      // emit markdown checkboxes. Without this branch the entire subsystem 4
+      // (self-improvement + wrap-up proposals) silently skips their sessions.
+      // We still require (a) substantive text output, (b) no pending todos /
+      // boxes, and (c) a clean (non-error) turn — same safety rails as the
+      // todo-driven path — and gate behind the same improve caps/budget so
+      // a no-todo session never gets more autonomy than a structured one.
+      const noTodos = todos.length === 0 && boxes.length === 0
+      // Honour the same cooldown + proposalSent latches as the todo path so a
+      // single follow-up question can't instantly re-trigger the loop.
+      const cooldownOk = !s.lastImprovedAt ||
+        (cfg.improveCooldownMs === 0) ||
+        (Date.now() - s.lastImprovedAt >= cfg.improveCooldownMs)
+      if (noTodos && !s.noTodoImproveFired && !s.proposalSent && cooldownOk
+          && s.lastInjectKind !== "improve" && s.lastInjectKind !== "propose"
+          && cfg.autonomy && cfg.improveLoop
+          && s.improveDone < cfg.improveCycles && s.improveTotal < cfg.improveMax
+          && budgetLeft(s)) {
+        const text = (lastAssistant.parts ?? [])
+          .map((x) => (x?.type === "text" ? x.text : "")).join(" ").trim()
+        // Only fire when the model actually delivered answer-shaped text, so
+        // trivial acks / single-line tool echoes don't trigger a critique pass.
+        if (text.length >= 80) {
+          const cycle = s.improveDone + 1
+          s.improveDone = cycle
+          s.improveTotal += 1
+          s.lastImprovedAt = Date.now()
+          s.nudges += 1
+          s.noTodoImproveFired = true
+          log("info", "no-todo autopilot: improvement pass on a non-todo model", {
+            sessionID, cycle: `${cycle}/${cfg.improveCycles}`, chars: text.length,
+          })
+          schedule(sessionID, cfg.nudgeDelayMs, {
+            kind: "improve",
+            prompt: () => PROMPTS.improve(cycle, cfg.improveCycles),
+          })
+          return
+        }
       }
 
       // Unfinished todos → drive continuation (with spin detection + caps)
@@ -2100,17 +2143,18 @@ export const AutoResumePlugin = async ({ client, $ }) => {
                 // disk too, so future runs automate this session again.
                 // (An explicit opt-out is only lifted by "auto-resume on".)
                 if (persistedStops.delete(info.sessionID)) stopStore.save()
-                // Follow-up detection: if all todos are already complete and
-                // the improve-cooldown hasn't elapsed yet, preserve improve
-                // counters so improvement passes don't re-trigger on the same
-                // topic.  Once the cooldown expires, reset everything so new
-                // work gets a fresh improvement cycle.
+                // Follow-up detection: if all todos are already complete (or
+                // the no-todo autopilot has already fired for this session)
+                // and the improve-cooldown hasn't elapsed yet, preserve
+                // improve counters so improvement passes don't re-trigger on
+                // the same topic.  Once the cooldown expires, reset
+                // everything so new work gets a fresh improvement cycle.
                 const todos = s0.todos ?? []
                 const allDone = todos.length > 0 &&
                   todos.every((t) => t.status === "completed" || t.status === "cancelled")
                 const cooldownElapsed = !s0.lastImprovedAt ||
                   (cfg.improveCooldownMs !== 0 && Date.now() - s0.lastImprovedAt >= cfg.improveCooldownMs)
-                const followUp = allDone && !cooldownElapsed
+                const followUp = (allDone || s0.noTodoImproveFired) && !cooldownElapsed
                 resetTaskScope(s0, { followUp })
                 s0.currentModel = null
                 s0.emptyNudges = 0
