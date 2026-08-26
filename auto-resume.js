@@ -1882,6 +1882,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   let noticeDelivering = false
   let lastNoticeTryAt = 0
   let noticeAttempts = 0
+  let deliveryTimers = []
 
   /** Delivery of a one-shot update confirmation as a native OS notification —
    *  the TUI toast channel no longer exists. The .acked marker commits only
@@ -1896,11 +1897,16 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       const n = pendingUpdateNotice
       const { readFile, writeFile } = await import("node:fs/promises")
       const current = (await readFile(n.ackPath, "utf8").catch(() => "")).trim()
-      if (current === AUTO_RESUME_VERSION) { pendingUpdateNotice = null; return }
+      if (current === AUTO_RESUME_VERSION) {
+        pendingUpdateNotice = null
+        for (const t of deliveryTimers.splice(0)) clearTimeout(t)
+        return
+      }
       const osOk = await announce(n.message, { requireDelivery: true })
       if (!osOk) throw new Error("OS notifier unavailable")
       await writeFile(n.ackPath, AUTO_RESUME_VERSION, "utf8")
       pendingUpdateNotice = null
+      for (const t of deliveryTimers.splice(0)) clearTimeout(t) // delivered: stop retry passes
       log("info", "update notice delivered via OS notification")
     } catch (err) {
       lastNoticeTryAt = Date.now()
@@ -2006,8 +2012,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           // mechanism for a milestone the ack protocol must not lose. Bun
           // has been observed never firing unref'd timers once the host
           // loop goes quiet — exactly when a headless CI test waits on them.
-          const first = setTimeout(() => detach(deliverPendingNotice, "notice-deliver"), 800)
-          const fallback = setTimeout(() => detach(deliverPendingNotice, "notice-fallback"), 15_000)
+          // deliverPendingNotice clears both once the notice resolves.
+          deliveryTimers = [
+            setTimeout(() => detach(deliverPendingNotice, "notice-deliver"), 800),
+            setTimeout(() => detach(deliverPendingNotice, "notice-fallback"), 15_000),
+          ]
         } catch { /* cosmetic only */ }
       }, "update-notice")
     }
