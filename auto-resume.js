@@ -2098,7 +2098,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
                 const allDone = todos.length > 0 &&
                   todos.every((t) => t.status === "completed" || t.status === "cancelled")
                 const cooldownElapsed = !s0.lastImprovedAt ||
-                  (cfg.improveCooldownMs > 0 && Date.now() - s0.lastImprovedAt >= cfg.improveCooldownMs)
+                  (cfg.improveCooldownMs !== 0 && Date.now() - s0.lastImprovedAt >= cfg.improveCooldownMs)
                 const followUp = allDone && !cooldownElapsed
                 resetTaskScope(s0, { followUp })
                 s0.currentModel = null
