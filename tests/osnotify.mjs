@@ -119,5 +119,28 @@ const MSG = "body 'quoted' text"
   ok(await notify("t", "m") === false, "N7: total notifier failure resolves false")
 }
 
+// ---- 8: HUNG notifier -> hard timeout resolves false -------------------------
+{
+  const everPending = (..._args) => {
+    const p = new Promise(() => {}) // never settles — D-Bus autolaunch style
+    p.quiet = () => p
+    return p
+  }
+  const calls = []
+  const notify = createOsNotifier({
+    $: (...args) => { calls.push(1); return everPending(...args) },
+    platform: "linux",
+    wslVersionFile: join(tmpdir(), `ar-n8-${Date.now()}-missing`),
+    timeoutMs: 250,
+  })
+  const t0 = Date.now()
+  let result
+  try { result = await notify("t", "m") } catch { result = "threw" }
+  const elapsed = Date.now() - t0
+  ok(result === false && elapsed < 5_000,
+    `N8: hung dispatch times out to false (${elapsed}ms, result=${result})`)
+  ok(calls.length === 2, "N8: timed-out libnotify still falls through to D-Bus")
+}
+
 await sleep(50)
 console.log(process.exitCode ? "OSNOTIFY TESTS FAILED" : "ALL OSNOTIFY TESTS PASSED")

@@ -155,7 +155,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.12.0"
+const AUTO_RESUME_VERSION = "1.12.1"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -481,13 +481,28 @@ try {
 /** Build a best-effort OS notifier bound to an OpenCode shell runner ($).
  *  platform / systemRoot / wslVersionFile are injectable so tests can drive
  *  every OS branch without mutating process globals. Returns
- *  async (title, message) => boolean — true once a notifier accepted the job. */
+ *  async (title, message) => boolean — true once a notifier accepted the job.
+ *  Every dispatch races a hard timeout (default 15s): headless hosts can hang
+ *  indefinitely inside D-Bus autolaunch, and an un-resolving await would
+ *  silently swallow both the notification AND its failure reporting. */
+const NOTIFIER_TIMEOUT_MS = 15_000
 export const createOsNotifier = ({
   $,
   platform = process.platform,
   systemRoot = process.env.SystemRoot,
   wslVersionFile = "/proc/version",
+  timeoutMs = NOTIFIER_TIMEOUT_MS,
 } = {}) => {
+  const withTimeout = (p) =>
+    Promise.race([
+      p,
+      new Promise((_, reject) => {
+        // Deliberately NOT unref'd: this timer is what resolves hung
+        // dispatches — an unref'd timer on an otherwise idle event loop
+        // would let the process exit (code 13) without settling anything.
+        setTimeout(() => reject(new Error(`notifier timed out after ${timeoutMs}ms`)), timeoutMs)
+      }),
+    ])
   let wslCache
   const wslProbe = () =>
     platform !== "linux"
@@ -497,7 +512,7 @@ export const createOsNotifier = ({
           .catch(() => ""))
   const runPowerShellToast = async (exe, title, message) => {
     const encoded = Buffer.from(windowsToastPs(title, message), "utf16le").toString("base64")
-    await $`${exe} -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand ${encoded}`.quiet()
+    await withTimeout($`${exe} -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand ${encoded}`.quiet())
   }
   return async (title, message) => {
     try {
@@ -511,7 +526,7 @@ export const createOsNotifier = ({
       if (platform === "darwin") {
         // AppleScript double-quoted strings: escape backslashes first, then quotes
         const q = (s) => `"${String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
-        await $`osascript -e ${`display notification ${q(message)} with title ${q(title)}`}`
+        await withTimeout($`osascript -e ${`display notification ${q(message)} with title ${q(title)}`}`)
         return true
       }
       // Linux/BSD: WSL hosts delegate to Windows PowerShell; bare metal uses
@@ -521,10 +536,10 @@ export const createOsNotifier = ({
         return true
       }
       try {
-        await $`notify-send -a auto-resume ${title} ${message}`.quiet()
+        await withTimeout($`notify-send -a auto-resume ${title} ${message}`.quiet())
         return true
       } catch { /* no libnotify installed */ }
-      await $`dbus-send --session --type=method_call --dest=org.freedesktop.Notifications /org/freedesktop/Notifications org.freedesktop.Notifications.Notify string:${title} uint32:0 string:dialog-information string:${title} string:${message} array:string: dict:string:string: int32:5000`.quiet()
+      await withTimeout($`dbus-send --session --type=method_call --dest=org.freedesktop.Notifications /org/freedesktop/Notifications org.freedesktop.Notifications.Notify string:${title} uint32:0 string:dialog-information string:${title} string:${message} array:string: dict:string:string: int32:5000`.quiet())
       return true
     } catch {
       return false
@@ -682,14 +697,21 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       ),
     )
     if (capped) return "paused"
-    // 🔁 means recovery is happening RIGHT NOW (a retry is queued/dispatched
-    // or core is in its own retry loop) — not merely "had errors earlier in
-    // this task". Idle sessions with historical chain>0 show 🟢.
-    if (s && (
-      s.pendingResume ||
-      s.retryEnteredAt > 0 ||
-      ((s.status === "busy" || s.status === "retry") && s.chain > 0)
-    )) {
+    // 🔁 means recovery is happening RIGHT NOW: a queued/dispatched retry,
+    // core parked in its own retry loop, or a busy turn that OUR injection
+    // started (lastResumeAt newer than the last error AND last success).
+    // A plain busy turn that merely has historical errors stays 🟢 armed —
+    // the old `(busy|retry) && chain > 0` clause latched 🔁 onto every later
+    // user task forever, because chain never resets on success.
+    if (
+      s && (
+        s.pendingResume ||
+        s.retryEnteredAt > 0 ||
+        s.status === "retry" ||
+        (s.status === "busy" &&
+          s.lastResumeAt > Math.max(s.lastErrorAt, s.lastSuccessAt))
+      )
+    ) {
       return "recovering"
     }
     return "armed"

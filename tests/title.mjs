@@ -236,4 +236,31 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(t7Title().includes("[auto-resume: armed]") && t7Title().includes("🟢"), "T7: clean turn returns tag to 🟢 armed")
 }
 
+// ---- T8: 🔁 must NOT latch onto later user tasks after a recovered error -----
+// Regression for the "(busy|retry) && chain > 0" clause: chain never reset on
+// success, so ANY busy turn that followed a recovered error stayed 🔁 forever.
+{
+  process.env.OPENCODE_RESUME_OFFSTORE = titleOff0
+  const state = makeState()
+  state.baseTitles.t8 = "Long build"
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const t8 = (status) => hooks.event(ev("session.status", { sessionID: "t8", status: { type: status } }))
+  // a transient error -> auto-resume fires -> turn completes cleanly
+  await hooks.event(ev("session.error", { sessionID: "t8", error: { name: "APIError", data: { statusCode: 502, message: "blip" } } }))
+  await sleep(150) // let the scheduled resume inject (chain becomes 1)
+  state.messagesBySession.t8 = [{ info: { role: "assistant", error: null }, parts: [{ type: "text", text: "done" }] }]
+  await t8("idle")
+  await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t8", text: "done" } }))
+  await hooks.event(ev("session.idle", { sessionID: "t8" }))
+  await sleep(450)
+  const t8Title = () => String(state.titles.t8 ?? "")
+  ok(t8Title().includes("[auto-resume: armed]"), "T8 precondition: armed after clean recovery")
+  // the user starts a NEW long task on the same session — historical chain
+  // must not resurrect the recovering glyph
+  await t8("busy")
+  await sleep(400)
+  ok(t8Title().includes("[auto-resume: armed]") && !t8Title().includes("🔁"),
+    "T8: new user task on recovered session shows 🟢, not a latched 🔁")
+}
+
 console.log(process.exitCode ? "TITLE TESTS FAILED" : "ALL TITLE TESTS PASSED")
