@@ -100,6 +100,10 @@ const mockClient = () => ({
       (deliveredDurably && !surfacedFailure) || (surfacedFailure && acked !== SOURCE_VERSION),
       `I2: honest outcome (acked='${acked || ""}', delivered=${deliveredDurably}, failure-surfaced=${surfacedFailure})`,
     )
+    if (process.exitCode) {
+      console.log("I2 diagnostics — logs:", JSON.stringify(logs, null, 1))
+      console.log("I2 diagnostics — shellCalls:", JSON.stringify(shellCalls, null, 1))
+    }
   }
   await rm(dir, { recursive: true, force: true })
 }

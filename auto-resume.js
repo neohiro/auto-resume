@@ -2002,10 +2002,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
             ackPath,
             message: `${RESUME_TAG}: Now running v${AUTO_RESUME_VERSION}${acked ? ` (previously ${acked})` : ""} — update fully applied.`,
           }
+          // Deliberately REF'D (no unref): these timers are the delivery
+          // mechanism for a milestone the ack protocol must not lose. Bun
+          // has been observed never firing unref'd timers once the host
+          // loop goes quiet — exactly when a headless CI test waits on them.
           const first = setTimeout(() => detach(deliverPendingNotice, "notice-deliver"), 800)
-          first.unref?.()
           const fallback = setTimeout(() => detach(deliverPendingNotice, "notice-fallback"), 15_000)
-          fallback.unref?.()
         } catch { /* cosmetic only */ }
       }, "update-notice")
     }
