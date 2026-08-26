@@ -670,7 +670,6 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   }
   const knownTitles = new Map()   // sessionID -> latest raw title we saw
   const writtenTitles = new Map() // sessionID -> last title this plugin wrote
-  const baseTitles = new Map()    // sessionID -> clean base title (no decorations)
   const titleTimers = new Map()   // sessionID -> debounce timer
 
   /** Remove our trailing tag; strip a leading STATUS glyph if present — those
@@ -767,8 +766,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         if (raw == null) return
         knownTitles.set(sessionID, raw)
       }
-      const base = extractBaseTitle(raw)
-      baseTitles.set(sessionID, base)
+      const base = extractBaseTitle(raw)
       if (isOptedOut(sessionID)) {
         // Off: restore the pristine title — remove every trace of us.
         if (base !== raw) {
@@ -1732,8 +1730,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       if (nowMs - s.lastActivity > 21_600_000) {
         sessions.delete(sessionID)
         knownTitles.delete(sessionID)
-        writtenTitles.delete(sessionID)
-        baseTitles.delete(sessionID)
+        writtenTitles.delete(sessionID)
         for (const k of dirAskCounts.keys()) {
           if (k.startsWith(`${sessionID}|`)) dirAskCounts.delete(k)
         }
@@ -2254,8 +2251,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
                 offStore.save()
               }
               knownTitles.delete(id)
-              writtenTitles.delete(id)
-              baseTitles.delete(id)
+              writtenTitles.delete(id)
               for (const k of dirAskCounts.keys()) {
                 if (k.startsWith(`${id}|`)) dirAskCounts.delete(k)
               }

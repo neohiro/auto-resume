@@ -38,6 +38,7 @@ jobs:
   test:
     needs: triage
     continue-on-error: ${{ needs.triage.outputs.soft == 'true' }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +58,7 @@ jobs:
   integration:
     needs: triage
     continue-on-error: ${{ needs.triage.outputs.soft == 'true' }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -71,6 +73,7 @@ jobs:
   windows-helper:
     needs: triage
     continue-on-error: ${{ needs.triage.outputs.soft == 'true' }}
+    timeout-minutes: 10
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
