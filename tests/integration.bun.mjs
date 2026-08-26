@@ -74,29 +74,32 @@ const mockClient = () => ({
   const hooks = await AutoResumePlugin({ client: mockClient(), $: real$ })
   void hooks // arming happens during init; nothing else to drive
 
-  // Delivery fires ~800ms after arming; poll generously — the Windows balloon
-  // fallback alone sleeps ~11s before the dispatch resolves and ack commits.
+  // Delivery fires ~800ms after arming; poll up to 40s — headless runners can
+  // burn TWO 15s notifier timeouts (libnotify + D-Bus autolaunch hang) before
+  // the failure warn lands; genuine deliveries commit within seconds.
   let acked = ""
-  for (let i = 0; i < 100; i += 1) {
+  for (let i = 0; i < 160; i += 1) {
     await sleep(250)
     acked = (await readFile(`${file}.acked`, "utf8").catch(() => "")).trim()
     if (acked === SOURCE_VERSION) break
   }
   const dispatched = shellCalls.length > before
+  const deliveredDurably =
+    acked === SOURCE_VERSION &&
+    logs.some((m) => m.includes("Now running v")) &&
+    logs.some((m) => m.includes("update notice delivered via OS notification"))
+  const surfacedFailure =
+    logs.some((m) => m.includes("update notice delivery failed"))
   if (!dispatched) {
-    ok(logs.some((m) => m.includes("update notice delivery failed")),
-      "I2: no dispatch possible here — failure surfaced honestly")
+    ok(false, "I2: no OS dispatch attempted at all")
   } else {
     ok(true, `I2: OS dispatch attempted (${shellCalls.length - before} call/s)`)
-    if (acked === SOURCE_VERSION) {
-      ok(true, "I2: ack committed after real-channel delivery")
-      ok(logs.some((m) => m.includes("Now running v")), "I2: durable log trace written")
-    } else if (/win32|darwin/.test(process.platform)) {
-      ok(false, `I2: ack not written despite dispatch (got '${acked || ""}')`)
-    } else {
-      ok(logs.some((m) => m.includes("update notice delivery failed")),
-        "I2: notifier-less linux surfaces failure instead of fake success")
-    }
+    // Exactly one honest outcome is acceptable: a durable delivery (ack +
+    // trace log) OR a surfaced, retryable failure. Fake success is the bug.
+    ok(
+      (deliveredDurably && !surfacedFailure) || (surfacedFailure && acked !== SOURCE_VERSION),
+      `I2: honest outcome (acked='${acked || ""}', delivered=${deliveredDurably}, failure-surfaced=${surfacedFailure})`,
+    )
   }
   await rm(dir, { recursive: true, force: true })
 }
