@@ -71,7 +71,11 @@ const mockClient = () => ({
   await writeFile(`${file}.acked`, "0.0.1", "utf8") // stale marker forces delivery
 
   const before = shellCalls.length
-  const hooks = await AutoResumePlugin({ client: mockClient(), $: real$ })
+  // Boot the COPY, not the repo original: the plugin derives its .acked path
+  // from its own module URL, so delivery must land next to this copy for the
+  // assertions below to observe it.
+  const { AutoResumePlugin: CopyPlugin } = await import(pathToFileURL(file).href)
+  const hooks = await CopyPlugin({ client: mockClient(), $: real$ })
   void hooks // arming happens during init; nothing else to drive
 
   // Delivery fires ~800ms after arming; poll up to 40s — headless runners can
