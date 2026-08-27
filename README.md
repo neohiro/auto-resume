@@ -64,6 +64,14 @@ Anything **model-specific** that keeps failing moves your session elsewhere:
 - Candidates are ranked by **capability tier**: `max`/`ultra`/`opus`/`pro`/`high` variants beat `mini`/`nano`/`lite`/`flash`. Non-chat endpoints (embeddings, TTS, image) are filtered out.
 - The conversation continues seamlessly — same session, same context, new engine.
 
+> **Prerequisite — configure your allowed models in OpenCode.** The rotation engine picks from whatever models OpenCode has in its active provider catalog. If no other model is available to switch to, the session stalls on quota. To enable smooth auto-rotation:
+> 1. Open OpenCode's main window (the model selector is below the prompt area).
+> 2. Click **Manage Models** (or the models gear icon).
+> 3. In the **Allowed models** list, select only the models you want the agent to use — add at least 2–3 so rotation has somewhere to go. Remove any you don't want it to touch (including slow/free models you only use manually).
+> 4. You can also set a preferred ordering (top = used first).
+>
+> Without this step, OpenCode may not expose alternative models to the plugin even if they're installed — the catalog it sees may be empty or restricted.
+
 ### 3 — Permission autopilot
 Never comes back from lunch to a session stuck on *"Allow bash command?"*:
 
