@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.12.1"
+const AUTO_RESUME_VERSION = "1.13.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -216,49 +216,62 @@ const DEFAULTS = {
 const RESUME_TAG = "[auto-resume]"
 
 const AUTONOMY_DIRECTIVE =
-  " You are a senior software engineer working fully unattended — hold every output ABOVE INDUSTRY STANDARDS and EXCEED EXPECTATIONS." +
-  " Make reasonable decisions yourself and document them; never wait for confirmation or ask questions; prefer completing the task over asking; choose sensible defaults." +
-  " Your definition of done is production-grade, not merely plausible: the project builds, tests and linters/type-checks pass, edge cases and error handling are covered, security and performance were considered, public behavior stays backward-compatible, and docs/comments match reality — zero leftover TODO/FIXME or dead code." +
-  " Verify your own work with real toolchain runs before declaring completion: perfect finalization always beats a fast partial."
+  " You are a senior engineer working unattended. Decide, don't ask. Document assumptions; pick sensible defaults." +
+  " Done = production-grade, above user expectations: builds + tests + linters/type-checks green; edges + errors handled; security + perf considered; backward-compatible; no TODO/FIXME or dead code; docs match code." +
+  " Verify with the real toolchain. Quality > speed. Exceed industry standards."
+
+/** Compact version of AUTONOMY_DIRECTIVE for the lowBudget path — keeps the
+ *  production-grade definition but drops the "working unattended / don't ask"
+ *  boilerplate since the model is already in context and needs the token
+ *  budget for the actual work, not the framing. ~85 chars vs ~391. */
+const AUTONOMY_DIRECTIVE_TIGHT =
+  " Done = production-grade: builds + tests + linters/type-checks green; no TODO/FIXME or dead code; docs match code. Verify. Quality > speed."
+
+/** Shared closing line — quality bar + verification reminder. Appended by
+ *  prompts that produce real artifact output (not pure re-orients). Kept short
+ *  so the same words don't repeat across every prompt. */
+const QUALITY = " Senior-grade output: verify (build/test/lint) before claiming done. No TODOs, no apology, no recap. Exceed expectations."
 
 const PROMPTS = {
   retry: (attempt) =>
-    `${RESUME_TAG} Automatic retry #${attempt} — this is routine self-healing, not an error on your part. Your previous attempt was stopped because it produced no output for ~60 seconds while marked busy. Resume the task exactly where it visibly stopped and continue straight to production-grade completion.` +
-    AUTONOMY_DIRECTIVE,
-  resume: (auto, detail) =>
-    `${RESUME_TAG} Your run was interrupted by a transient infrastructure error (network outage, provider error, rate limit, or timeout).` +
-    (detail ? ` Detected issue: ${detail}.` : "") +
-    ` Re-enter like a senior engineer: silently reconstruct the exact task state from the conversation and codebase (re-read the files you touched, re-run quick checks if unsure), then continue from precisely where you stopped.` +
-    " Do not apologize, do not repeat finished work, do not summarize unless asked — deliver the remaining work to production-grade completion: builds/tests/linters green, edge cases handled, docs consistent." +
-    (auto ? AUTONOMY_DIRECTIVE : ""),
+    `${RESUME_TAG} Auto-retry #${attempt}. Self-healing; the previous turn was busy ~60s with no output and got aborted.` +
+    ` Pick up exactly where you stopped; finish production-grade.`,
+  resume: (auto, detail, modelNote) =>
+    `${RESUME_TAG} Auto-resume. A provider turn failed (network / 5xx / rate-limit / timeout / quota).` +
+    (detail ? ` Cause: "${detail}".` : "") +
+    (modelNote ? ` ${modelNote}` : "") +
+    ` Reconstruct state from the conversation + codebase (re-read files if unsure); continue from exactly where you stopped.` +
+    ` Exceed industry standards on the remaining work.`,
+  lowBudget: (auto, detail, modelNote) =>
+    `${RESUME_TAG} Auto-resume on a tight token/credit budget. The previous reply was rejected for exceeding max_tokens the account can afford.` +
+    (detail ? ` Cause: "${detail}".` : "") +
+    (modelNote ? ` ${modelNote}` : "") +
+    ` Lead with the answer, justify concisely. Skip preamble, restated context, and unchanged code blocks. Edits > rewrites; diffs > restatements. Tight prose, minimal code, no corners cut on correctness or verification. Quality bar above user expectations.` +
+    (auto ? AUTONOMY_DIRECTIVE_TIGHT : ""),
   truncated: (auto) =>
-    `${RESUME_TAG} Your previous reply hit the maximum output length and was cut off mid-response. Continue seamlessly from the exact point you stopped — never repeat earlier content. Close any half-open code block or sentence first, then finish the remainder completely; when the artifact is code, deliver it whole, runnable, and up to standard rather than fragmentary.` +
-    (auto ? AUTONOMY_DIRECTIVE : ""),
+    `${RESUME_TAG} Last reply hit max output length and was cut off. Continue seamlessly from the cut point. Close any half-open block/sentence first, then finish. Code must be whole + runnable, not fragmentary.`,
   empty: (auto) =>
-    `${RESUME_TAG} Your previous response arrived empty, likely due to a transient provider issue. Produce the full answer to the original request now — substantive, precise, and held to a production-grade bar.` +
-    (auto ? AUTONOMY_DIRECTIVE : ""),
+    `${RESUME_TAG} Previous reply came back empty (likely a transient provider hiccup). Answer the original request now: concise, precise, production-grade.`,
   todos: () =>
-    `${RESUME_TAG} This session went idle while the todo list still has unfinished items. Work them off autonomously now, one by one, like a staff engineer shipping a release: implement each item completely (code + tests + docs where they matter), actually VERIFY it (run the relevant build/tests/linters), and only then mark it completed. Hold every item to a quality bar above industry standards — edge cases, error handling, clean integration — until the list reaches flawless completion.`,
+    `${RESUME_TAG} Session idle, todos unfinished. Work them autonomously, one by one: implement end-to-end (code + tests + docs where they matter), verify (build/test/lint), then mark complete. Hold the bar above industry standards — edges, errors, clean integration — until the list is flawless.`,
   proceed: () =>
-    `${RESUME_TAG} Proceed autonomously with exactly what you just proposed or asked about — the answer is yes. Do not ask again; decide and continue.` +
-    " Execute it end-to-end at senior level: complete implementation including tests, error handling, and doc touches, verified against the real toolchain — aim to exceed expectations, not merely satisfy the request." +
+    `${RESUME_TAG} Proceed autonomously with what you just proposed/asked — answer is yes. Decide and continue.` +
+    ` Execute end-to-end at senior level: full impl + tests + error handling + doc touches, verified against the real toolchain. Aim to exceed expectations.` +
     AUTONOMY_DIRECTIVE,
   keepGoing: () =>
-    `${RESUME_TAG} You ended your reply indicating there is still work to do ("continue", "finalize", etc.) but the turn stopped. Pick up exactly where you left off right now and drive it to perfect finalization: finish the remaining steps, verify with builds/tests/linters, and leave nothing half-done — no stray TODOs, no loose ends, no unverified claims.` +
-    AUTONOMY_DIRECTIVE,
-  retry: (attempt) =>
-    `${RESUME_TAG} Automatic retry #${attempt} — this is routine self-healing, not an error on your part. Your previous attempt was stopped because it produced no output for ~60 seconds while marked busy. Resume the task exactly where it visibly stopped and continue straight to production-grade completion.` +
+    `${RESUME_TAG} You paused mid-work ("continue", "finalize", etc.) — indicating there is still work to do. Pick up now and drive to perfect finalization: finish remaining steps, verify (build/test/lint), nothing half-done. Production-grade, not partial.` +
     AUTONOMY_DIRECTIVE,
   debug: () =>
-    `${RESUME_TAG} The last several tool calls failed repeatedly. Stop repeating the same failing approach — switch to disciplined root cause analysis: read the FULL error output (not just the first line), inspect the actual files/state involved, form ONE concrete hypothesis, apply the smallest targeted fix that addresses the true cause, then prove it: re-run the failing command and add a regression test so this class of failure stays dead.`,
+    `${RESUME_TAG} Multiple tool calls failed. Stop the failing approach. Root-cause: read the FULL error (not just the first line), inspect the actual files/state, form ONE concrete hypothesis, apply the smallest targeted fix for the real cause, prove it (re-run the failing command), add a regression test so this class stays dead.`,
   improve: (cycle, total) =>
-    `${RESUME_TAG} Self-improvement pass ${cycle}/${total}: critically review ALL work produced in this session the way a principal engineer signs off a release. Hunt for concrete gains in correctness, performance, security, robustness, and readability — unhandled edge cases, missing input validation, race conditions, resource leaks, stale docs/comments, thin test coverage on critical paths, inefficient hot spots, inconsistent style. Directly implement every improvement you are confident about and VALIDATE it (run builds, tests, linters, type-checks); explicitly skip anything ambiguous or risky and note why in one line. Do NOT introduce new features — raise the existing work clearly above industry standards.` +
-    AUTONOMY_DIRECTIVE,
+    `${RESUME_TAG} Self-improvement pass ${cycle}/${total}. Review all work this session as a principal engineer signing off a release.` +
+    ` Hunt concrete gains: correctness, perf, security, robustness, readability — unhandled edges, missing input validation, races, leaks, stale docs/comments, thin test coverage on critical paths, inefficient hot spots, style inconsistencies.` +
+    ` Implement what you're confident about and validate (build/test/lint/typecheck). Skip ambiguous/risky items; one-line note why. No new features — raise existing work above industry standards, beyond what the user asked for.`,
   propose: () =>
-    `${RESUME_TAG} The todo list is fully complete — flawless execution. Do NOT implement anything further. Your previous reply already described the work, so do NOT summarize or repeat it. Instead deliver a short wrap-up containing NEW information only:` +
-    " 1. Verification status — what you actually ran (build/tests/linters/type-checks) and the results; state plainly if anything was NOT verified." +
-    " 2. Known limitations, risks, or assumptions a reviewer should know before relying on this." +
-    " 3. Up to 3 concrete follow-up improvement proposals as bullet points, each with its expected payoff.",
+    `${RESUME_TAG} Todos complete, flawless execution. Do NOT implement more. Don't summarize the work. Wrap-up = NEW info only:` +
+    ` (1) Verification status — what you ran (build/test/lint/typecheck) and results; flag anything unverified.` +
+    ` (2) Known limitations, risks, assumptions a reviewer should know.` +
+    ` (3) Up to 3 follow-up improvement proposals, each with expected payoff — aim above user expectations.`,
 }
 
 const NETWORK_PATTERNS = [
@@ -288,6 +301,27 @@ const QUOTA_PATTERNS = [
   "free usage exceeded", "free tier", "free-tier", "quota", "billing",
   "payment required", "credit balance", "insufficient", "usage limit",
   "limit reached", "upgrade to go", "subscribe to go", "exceeded your",
+  "requires more credits", "insufficient_credit", "insufficient_quota",
+  "insufficient credits", "insufficient balance", "insufficient credit",
+  "credit", "afford", "out of credits", "no credits",
+]
+
+/** A second, narrower tier of phrases that mean the model asked for too many
+ *  max_tokens (or a too-large response) given the current account/credit
+ *  state — the canonical OpenRouter "You requested up to N tokens, but can
+ *  only afford M" message. We classify these as quota (so we rotate) but
+ *  ALSO switch to a more concise prompt so the same model can still finish
+ *  the task under the smaller budget. Order in this list = priority. */
+const MAX_TOKENS_PATTERNS = [
+  "requires more credits, or fewer max_tokens",
+  "you requested up to",
+  "but can only afford",
+  "max_tokens",
+  "reduce max_tokens",
+  "fewer max_tokens",
+  "context length exceeded",
+  "context_length_exceeded",
+  "maximum context length",
 ]
 
 /** Model ids that look like non-chat endpoints and must never receive prompts. */
@@ -447,6 +481,14 @@ const matchesAny = (haystack, patterns) => {
   const lower = String(haystack).toLowerCase()
   return patterns.some((p) => lower.includes(p))
 }
+
+const isCreditsConstraint = (error) => {
+  const msg = String(error?.data?.message ?? "").toLowerCase()
+  const body = String(error?.data?.responseBody ?? "").toLowerCase()
+  const combined = msg + " " + body
+  return matchesAny(combined, MAX_TOKENS_PATTERNS)
+}
+
 const jitter = (ms) => Math.round(ms + ms * 0.25 * (Math.random() * 2 - 1))
 
 // ── native OS notifications ─────────────────────────────────────────────
@@ -974,6 +1016,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     if (name === "APIError") {
       const code = data.statusCode
       if (code === 429) return "rate_limit"
+      if (code === 402) return "quota"   // HTTP 402 Payment Required → quota/credits
       if (code === 408 || code === 409) return "retryable"
       if (typeof code === "number" && code >= 500) return "retryable"
       if (data.isRetryable === true) return "retryable"
@@ -996,6 +1039,66 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const name = error.name ?? "Error"
     const code = error.data?.statusCode
     const msg = String(error.data?.message ?? error.message ?? "").replace(/\s+/g, " ").trim().slice(0, 120)
+    const parts = [name, typeof code === "number" ? `HTTP ${code}` : "", msg].filter(Boolean)
+    return parts.join(" — ")
+  }
+
+  /** Compact, model-facing cause for injected prompts. Strips URLs, the
+   *  "To increase, visit …" tail, JSON blobs, and trailing marketing/help text
+   *  so the injected message stays well under any per-prompt token budget.
+   *  Also derives a one-line "requested N, can afford M" summary for the
+   *  OpenRouter-style messages. */
+  const describeErrForPrompt = (error) => {
+    if (!error) return ""
+    const name = error.name ?? "Error"
+    const code = error.data?.statusCode
+    let raw = String(error.data?.message ?? error.message ?? "").replace(/\s+/g, " ").trim()
+    // Some providers (OpenRouter, others) dump the error as a JSON blob in
+    // the message field. Pull out the inner `message` if present, otherwise
+    // drop the JSON envelope entirely so the model sees just the prose.
+    if (raw.startsWith("{") && raw.endsWith("}")) {
+      try {
+        const obj = JSON.parse(raw)
+        if (typeof obj?.message === "string" && obj.message.trim()) {
+          raw = obj.message
+        } else if (typeof obj?.error?.message === "string" && obj.error.message.trim()) {
+          raw = obj.error.message
+        } else {
+          raw = ""
+        }
+      } catch { /* not JSON; leave raw as-is */ }
+    }
+    // responseBody sometimes carries the real message (e.g. when
+    // data.message is the JSON blob above). Prefer whichever is shorter
+    // after cleaning, so we keep the more compact human prose.
+    if (error.data?.responseBody) {
+      const body = String(error.data.responseBody).replace(/\s+/g, " ").trim()
+      if (body && body.length < raw.length) raw = body
+    }
+    // Drop URLs (settings/credits/upgrade etc. — the model can't act on them).
+    let msg = raw.replace(/https?:\/\/\S+/g, "").replace(/\s{2,}/g, " ").trim()
+    // Drop "to increase, visit …", "upgrade to …", "subscribe to go …" tails —
+    // they're marketing copy, not actionable. Match with or without a preceding
+    // period. Also strip any orphaned "Visit" or "see" that survives URL removal.
+    msg = msg.replace(/\.\s*(to (increase|fix|resolve).*)$/i, "")
+             .replace(/\s+(to (increase|fix|resolve).*)$/i, "")
+             .replace(/\s+(visit\s+\S+.*)$/i, "")
+             .replace(/\s+(upgrade\s+to\s+\S+.*)$/i, "")
+             .replace(/\s+(subscribe\s+to\s+\S+.*)$/i, "")
+             .replace(/\.\s*(upgrade\s+to.*)$/i, "")
+             .replace(/[,\s]+(visit|upgrade|subscribe)\s*$/i, "")
+             .replace(/\s+visit\s*$/i, "")
+             .replace(/\s+see\s+\S+.*$/i, "")
+             .replace(/[.,]\s*$/, "")   // drop trailing bare comma or period
+             .trim()
+    // Derive a compact "requested N tokens, can afford M" summary when the
+    // raw message follows the OpenRouter "requested up to X tokens, but can
+    // only afford Y" shape. This is what the model needs to know to write
+    // a shorter reply.
+    const m = msg.match(/requested\s+(?:up\s+to\s+)?(\d+)\s*tokens?[,\s]+(?:but\s+)?(?:can\s+(?:only\s+)?afford|only)\s+(\d+)/i)
+    if (m) msg = `requested ${m[1]} tokens, can afford ${m[2]}`
+    // Hard cap: keep the injected cause small even after stripping.
+    if (msg.length > 90) msg = msg.slice(0, 87) + "…"
     const parts = [name, typeof code === "number" ? `HTTP ${code}` : "", msg].filter(Boolean)
     return parts.join(" — ")
   }
@@ -1026,6 +1129,28 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   // ── model catalog + rotation ───────────────────────────────────────
   const modelKey = (m) => `${m.providerID}/${m.modelID}`
   const cooling = (key) => (modelCooldown.get(key) ?? 0) > Date.now()
+
+  /** Pick the right prompt + model-note for an auto-resume injection.
+   *  - sessionID: needed to read the (now-current) model state
+   *  - kind: classify() result
+   *  - error: raw error object
+   *  - rotated: true if we already swapped to a new model for this resume
+   *  - rotatedFrom: modelKey of the old model (null if no rotation)
+   *  Returns (auto) => string. */
+  const buildResumePrompt = (sessionID, kind, error, rotated, rotatedFrom) => {
+    // prompt-facing cause: compact, URL/help-text stripped, OpenRouter
+    // "requested N tokens, can afford M" rewritten as a one-liner.
+    const detail = describeErrForPrompt(error)
+    const cur = state(sessionID)
+    const nowKey = cur.currentModel ? modelKey(cur.currentModel) : null
+    const modelNote = rotated && rotatedFrom && nowKey && rotatedFrom !== nowKey
+      ? `You are now on a different model (${nowKey}).`
+      : ""
+    if (kind === "quota" && isCreditsConstraint(error)) {
+      return (a) => PROMPTS.lowBudget(a, detail, modelNote)
+    }
+    return (a) => PROMPTS.resume(a, detail, modelNote)
+  }
 
   const getCatalog = async () => {
     if (catalogCache && Date.now() - catalogFetchedAt < 300_000) return catalogCache
@@ -1313,9 +1438,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     }
     if (kind === "auth") {
       // Auth is provider-scoped: rotate to another PROVIDER's model if possible.
+      const authFrom = s.lastModel ? modelKey(s.lastModel) : null
       if (!cfg.disableRotation && cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "authentication failed"))) {
         s.chain += 1
-        if (s.chain <= cfg.maxChain) { schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) }); return }
+        if (s.chain <= cfg.maxChain) {
+          schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, authFrom) }); return
+        }
       }
       notice(`${RESUME_TAG}: Provider authentication failed — run \`opencode auth login\`.`, "error")
       return
@@ -1323,8 +1451,21 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
     // ── quota / free-tier exhaustion → rotate model, no user input ──
     if (kind === "quota") {
+      // If the error is the OpenRouter-style "requires more credits, or fewer
+      // max_tokens" situation, the same model can still be used — but only if
+      // it produces a tighter reply. We still rotate (different model =
+      // different default budget), but the injected prompt tells the new
+      // model to be concise so it doesn't repeat the same wall.
+      const quotaFrom = s.lastModel ? modelKey(s.lastModel) : null
       if (!cfg.disableRotation && cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "quota/free tier exhausted"))) {
-        schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) })
+        schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, quotaFrom) })
+        return
+      }
+      // No alternate model available. If this is a credits/max_tokens
+      // constraint rather than a hard ban, the current model can still work
+      // if it produces a tighter reply — nudge it with the low-budget prompt.
+      if (isCreditsConstraint(error)) {
+        schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, false, null) })
         return
       }
       notice(`${RESUME_TAG}: Quota exhausted and no alternate model available — manual action needed.`, "error")
@@ -1336,10 +1477,13 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const isExplicitRateLimit = matchesAny(errText, RATE_LIMIT_PATTERNS)
     if (kind === "rate_limit" && !cfg.disableRotation &&
         (isExplicitRateLimit || s.rlStreak + 1 >= cfg.rlSwitchAfter) &&
-        cfg.switchOnRateLimit && (await rotateAwayFrom(sessionID, isExplicitRateLimit ? "rate limit exceeded" : "repeated rate limits"))) {
-      s.rlStreak = 0
-      schedule(sessionID, jitter(Math.min(cfg.baseDelayMs, 15_000)), { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) })
-      return
+        cfg.switchOnRateLimit) {
+      const rlFrom = s.lastModel ? modelKey(s.lastModel) : null
+      if (await rotateAwayFrom(sessionID, isExplicitRateLimit ? "rate limit exceeded" : "repeated rate limits")) {
+        s.rlStreak = 0
+        schedule(sessionID, jitter(Math.min(cfg.baseDelayMs, 15_000)), { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, rlFrom) })
+        return
+      }
     }
 
     if (kind === "output_length") {
@@ -1405,11 +1549,13 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     // No cooldown penalty — provider outages are usually temporary.
     if (kind === "retryable") {
       s.failStreak += 1
-      if (!cfg.disableRotation && cfg.switchOnFailures && s.failStreak >= cfg.rotateAfterFailures &&
-          (await rotateAwayFrom(sessionID, "persistent failures", false))) {
-        s.failStreak = 0
-    schedule(sessionID, jitter(Math.min(cfg.baseDelayMs, 15_000)), { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) })
-        return
+      if (!cfg.disableRotation && cfg.switchOnFailures && s.failStreak >= cfg.rotateAfterFailures) {
+        const retFrom = s.lastModel ? modelKey(s.lastModel) : null
+        if (await rotateAwayFrom(sessionID, "persistent failures", false)) {
+          s.failStreak = 0
+          schedule(sessionID, jitter(Math.min(cfg.baseDelayMs, 15_000)), { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, retFrom) })
+          return
+        }
       }
     }
 
@@ -1440,7 +1586,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const delay = kind === "rate_limit"
       ? (retryAfterMs(error) ?? backoff(s.chain, cfg.rateLimitBaseMs))
       : backoff(s.chain, cfg.baseDelayMs)
-    schedule(sessionID, delay, { kind: "resume", prompt: (a) => PROMPTS.resume(a, detail) })
+    schedule(sessionID, delay, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, false, null) })
   }
 
   // ── permission autopilot ───────────────────────────────────────────

@@ -82,7 +82,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   const { state, hooks } = await freshState(["sessC"])
   await hooks.event(ev("session.error", { sessionID: "sessC", error: { name: "MessageOutputLengthError", data: {} } }))
   await sleep(350)
-  ok(state.prompts.length === 1 && state.prompts[0].text.includes("maximum output length"), "C: truncation -> continue nudge")
+  ok(state.prompts.length === 1 && state.prompts[0].text.includes("max output length"), "C: truncation -> continue nudge")
 
   await hooks.event(ev("session.error", { sessionID: "sessC", error: { name: "ProviderAuthError", data: { providerID: "x", message: "bad key" } } }))
   await sleep(250)

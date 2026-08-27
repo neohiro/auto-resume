@@ -90,14 +90,14 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.error", { sessionID: "s3", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
   await hooks.event(ev("session.idle", { sessionID: "s3" })) // unfinished todos, but stopped
   await sleep(350)
-  ok(!state.prompts.some((p) => p.text.includes("unfinished items")),
+  ok(!state.prompts.some((p) => p.text.includes("todos unfinished")),
     "S3: todo-drive does NOT fire after a user Stop")
   // a REAL user prompt starts a new workflow -> automation armed again
   await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "s3", id: "u1" } }))
   state.msgStore.u1 = "ok continue with the rest"
   await hooks.event(ev("session.idle", { sessionID: "s3" }))
   await sleep(350)
-  ok(state.prompts.some((p) => p.text.includes("unfinished items") && p.id === "s3"),
+  ok(state.prompts.some((p) => p.text.includes("todos unfinished") && p.id === "s3"),
     "S3: new user prompt re-enables todo-drive")
 }
 
@@ -170,7 +170,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   // infra failure on the NEW task -> automatic recovery must work again
   await hooks.event(ev("session.error", { sessionID: "s8", error: { name: "APIError", data: { statusCode: 503, message: "service unavailable" } } }))
   await sleep(600)
-  ok(state.prompts.some((p) => p.id === "s8" && p.text.includes("transient infrastructure error")),
+  ok(state.prompts.some((p) => p.id === "s8" && p.text.includes("Auto-resume")),
     "S8: recovery re-armed by a new user prompt")
 }
 
@@ -188,7 +188,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.idle", { sessionID: "s9" }))
   // ...but the takeover's own scheduled resume must still fire
   await sleep(3200)
-  ok(state.prompts.some((p) => p.id === "s9" && p.text.includes("transient infrastructure error")),
+  ok(state.prompts.some((p) => p.id === "s9" && p.text.includes("Auto-resume")),
     "S9: takeover-induced abort is NOT mistaken for a user stop")
   ;["OPENCODE_RESUME_STALL_TIMEOUT_MS", "OPENCODE_RESUME_WATCHDOG_MS"]
     .forEach((k) => delete process.env[k])
@@ -206,7 +206,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "s10", id: "own1" } }))
   await hooks.event(ev("session.idle", { sessionID: "s10" })) // todos pending, but stop stands
   await sleep(350)
-  ok(!state.prompts.some((p) => p.text.includes("unfinished items")),
+  ok(!state.prompts.some((p) => p.text.includes("todos unfinished")),
     "S10: own injected prompt does NOT clear a user stop")
 }
 
@@ -290,7 +290,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await sleep(300) // past the 150ms think-stall window
   ok(state.aborts.includes("think"), "S13: silent thinking aborted at the fast threshold")
   await sleep(2500)
-  ok(state.prompts.some((p) => p.id === "think" && p.text.includes("Automatic retry")),
+  ok(state.prompts.some((p) => p.id === "think" && p.text.includes("Auto-retry")),
     "S13: retry prompt is explicitly labelled")
   ok(state.logs.some((t) => t.includes("automatic retry")), "S13: notice says 'automatic retry'")
   // tool activity keeps its grace: no fast abort for quiet-but-running tools

@@ -40,7 +40,7 @@ This is what auto-resume is for.
 | Network / transport errors (`ECONNRESET`, `fetch failed`, DNS, TLS…) | Exponential backoff + jitter, re-injects a continuation prompt |
 | Provider outages (5xx, 529 overloaded, gateway errors) | Same, with model rotation after repeated rounds (see below) |
 | Rate limits (429) | Honors `Retry-After`; rotates models on repeated strikes |
-| Free-tier / quota exhaustion (`402`, "free usage exceeded", …) | **Rotates to another model instantly — no user input** |
+| Free-tier / quota exhaustion (`402`, "free usage exceeded", "Insufficient balance", "requires more credits, or fewer max_tokens"…) | **Rotates to another model instantly — no user input**; if OpenRouter-style max_tokens/credits constraint and no alternate model, resumes with a compact low-token-budget prompt so the same model can finish under the tighter limit |
 | Truncated output (`MessageOutputLengthError`) | Seamless *"continue exactly where you stopped"* nudge |
 | Context-window overflow | Triggers compaction, resumes automatically afterwards |
 | Empty responses | Re-nudges once |

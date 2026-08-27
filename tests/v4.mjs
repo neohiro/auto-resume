@@ -122,7 +122,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "ask", text: "Should I proceed with the migration?" } }))
   await hooks.event(ev("session.idle", { sessionID: "ask" }))
   await sleep(350)
-  ok(state.prompts.some((p) => p.text.includes("Proceed autonomously with exactly what you just proposed")),
+  ok(state.prompts.some((p) => p.text.includes("Proceed autonomously with what you just proposed")),
     "Y: agent's own question auto-answered")
   await hooks.event(ev("session.idle", { sessionID: "ask" }))
   await sleep(250)
@@ -237,7 +237,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks2.event(ev("message.part.updated", { part: { type: "text", sessionID: "cb", text: "Plan:\n- [x] scaffold\n- [ ] implement\n- [ ] test" } }))
   await hooks2.event(ev("session.idle", { sessionID: "cb" })) // 2 unchecked -> drive
   await sleep(350)
-  ok(state2.prompts.filter((p) => p.text.includes("unfinished items")).length === 1,
+  ok(state2.prompts.filter((p) => p.text.includes("todos unfinished")).length === 1,
     "CC2: markdown checklist drives without the todo tool")
   state2.messagesBySession.cb = [{
     info: { role: "assistant", error: null },
