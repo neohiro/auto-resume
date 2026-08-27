@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.0"
+const AUTO_RESUME_VERSION = "1.13.1"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -917,6 +917,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         lastInjectKind: null,
         lastEvalSig: null,
         taskCost: 0, costNotified: false, budgetNotified: false, gaveUpRearmed: false,
+      lowBudgetStreak: 0, lowBudgetSig: null, lowBudgetLastFired: false,
+        lowBudgetLastFired: false,
       }
       sessions.set(id, s)
     }
@@ -940,6 +942,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
       userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costNotified: false,
       budgetNotified: false, gaveUpRearmed: false, noTodoImproveFired: false,
+      lowBudgetStreak: 0, lowBudgetSig: null,
       lastErrorName: null, lastErrorSig: null,
     })
     if (!keepTimers) s.stallResumes = 0
@@ -1451,20 +1454,41 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
     // ── quota / free-tier exhaustion → rotate model, no user input ──
     if (kind === "quota") {
-      // If the error is the OpenRouter-style "requires more credits, or fewer
-      // max_tokens" situation, the same model can still be used — but only if
-      // it produces a tighter reply. We still rotate (different model =
-      // different default budget), but the injected prompt tells the new
-      // model to be concise so it doesn't repeat the same wall.
+      // We already fired the last-resort `[auto-resume] Continue.` once and it
+      // hit the same wall. Nothing will get through — stop the loop.
+      if (s.lowBudgetLastFired) {
+        s.lowBudgetLastFired = false
+        notice(`${RESUME_TAG}: Token/credit budget is too tight for any prompt to succeed. Manual intervention required.`, "error")
+        return
+      }
       const quotaFrom = s.lastModel ? modelKey(s.lastModel) : null
+      const isCredits = isCreditsConstraint(error)
+      const sig = isCredits ? describeErrForPrompt(error) : null
       if (!cfg.disableRotation && cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "quota/free tier exhausted"))) {
+        // Track streak even across rotations: every model hitting the same
+        // credits constraint = same hopeless budget wall.
+        if (isCredits) {
+          if (s.lowBudgetSig === sig && s.lowBudgetStreak >= 1) {
+            s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = false
+            notice(`${RESUME_TAG}: Token/credit budget too tight for any model to complete this task (${sig}). Manual intervention required.`, "error")
+            return
+          }
+          s.lowBudgetStreak += 1; s.lowBudgetSig = sig; s.lowBudgetLastFired = false
+        }
         schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, quotaFrom) })
         return
       }
-      // No alternate model available. If this is a credits/max_tokens
-      // constraint rather than a hard ban, the current model can still work
-      // if it produces a tighter reply — nudge it with the low-budget prompt.
-      if (isCreditsConstraint(error)) {
+      // No alternate model available.
+      if (isCredits) {
+        const looping = s.lowBudgetStreak > 0 && sig === s.lowBudgetSig
+        s.lowBudgetStreak += 1; s.lowBudgetSig = sig
+        if (looping || s.lowBudgetStreak >= 1) {
+          // Last resort before giving up: inject a 3-word prompt so minimal it
+          // can't exceed any token budget. If it also fails, nothing will work.
+          s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = true
+          schedule(sessionID, cfg.baseDelayMs, { kind: "continue", prompt: `${RESUME_TAG} Continue.`, extra: { _lowBudgetLast: true } })
+          return
+        }
         schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, false, null) })
         return
       }
@@ -1777,6 +1801,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       s.toolErrs = 0
       s.gaveUpRearmed = false
       s.budgetNotified = false
+      s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = false
 
       const todos = s.todos ?? []
       const open = todos.filter((t) => t.status === "pending" || t.status === "in_progress")
