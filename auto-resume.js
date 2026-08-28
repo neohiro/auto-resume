@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.9"
+const AUTO_RESUME_VERSION = "1.13.10"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1400,21 +1400,31 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     })
     if (!eligible.length) return null
 
-    // Preferred-chain entries keep absolute priority (explicit user intent);
-    // everything else is ranked by capability tier — Max/Ultra/Opus/Pro/High
-    // variants beat mini/nano/lite/flash — then by provider proximity.
+    // Budget-aware model selection.  When the user is hitting token/credit
+    // caps we want a model that won't hit the same wall — prioritise entries
+    // in the user's explicit preferred chain, then models that carry
+    // "unlimited" in their id (these usually have no per-request cap), then
+    // "free" variants (no per-credit cost), then same-provider for minimal
+    // capability surprise, then other-provider, then by tier score as a
+    // final tie-breaker.  The previous sort ordered exclusively by tier,
+    // which kept pushing the user back onto the same expensive model. */
     const chainSet = new Set(
       cfg.fallbackModels.split(",").map((x) => x.trim()).filter(Boolean),
     )
-    const groupOf = (m) => {
+    const freeRank = (m) => {
+      // Lower = preferred.  0 = chain (explicit user intent), 1 = unlimited,
+      // 2 = free, 3 = same-provider, 4 = other-provider.
       if (chainSet.has(modelKey(m))) return 0
-      if (!exhausted || m.providerID === exhausted.providerID) return 1
-      return 2
+      const id = String(m.modelID ?? "").toLowerCase()
+      if (/unlimited/.test(id)) return 1
+      if (/free/.test(id)) return 2
+      if (exhausted && m.providerID === exhausted.providerID) return 3
+      return 4
     }
     const ordered = [...eligible].sort((a, b) => {
-      const ga = groupOf(a)
-      const gb = groupOf(b)
-      if (ga !== gb) return ga - gb
+      const ra = freeRank(a)
+      const rb = freeRank(b)
+      if (ra !== rb) return ra - rb
       const ta = tierScore(a.modelID)
       const tb = tierScore(b.modelID)
       if (ta !== tb) return tb - ta
@@ -1681,51 +1691,60 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       return
     }
 
-    // ── quota / free-tier exhaustion → rotate model, no user input ──
+    // ── quota / free-tier exhaustion: budget cascade or rotation ──────────
     if (kind === "quota") {
-      // We already fired the last-resort `[auto-resume] Continue.` once and it
-      // hit the same wall. Nothing will get through — stop the loop.
-      if (s.lowBudgetLastFired) {
-        s.lowBudgetLastFired = false
-        notice(`${RESUME_TAG}: Token/credit budget is too tight for any prompt to succeed. Manual intervention required.`, "error")
-        return
-      }
-      const quotaFrom = s.lastModel ? modelKey(s.lastModel) : null
       const isCredits = isCreditsConstraint(error)
       const sig = isCredits ? describeErrForPrompt(error) : null
-      if (!cfg.disableRotation && cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "quota/free tier exhausted"))) {
-        // Track streak even across rotations: every model hitting the same
-        // credits constraint = same hopeless budget wall.
-        if (isCredits) {
-          if (s.lowBudgetSig === sig && s.lowBudgetStreak >= 1) {
-            s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = false
-            notice(`${RESUME_TAG}: Token/credit budget too tight for any model to complete this task (${sig}). Manual intervention required.`, "error")
-            return
+      const sameBudget = isCredits && sig && sig === s.lowBudgetSig
+      const quotaFrom = s.lastModel ? modelKey(s.lastModel) : null
+
+      // Always rotate on quota — pick a free/unlimited model first so the
+      // next attempt has a better chance of fitting in the budget.
+      if (!cfg.disableRotation && cfg.switchOnQuota) {
+        const rotated = await rotateAwayFrom(sessionID, "quota/free tier exhausted")
+        if (rotated) {
+          s.chain += 1
+          // New model may still hit the budget wall — compact prompt for the
+          // first attempt after rotation so we stay within tight token limits.
+          if (s.chain <= cfg.maxChain) {
+            schedule(sessionID, cfg.baseDelayMs, {
+              kind: "lowBudget",
+              prompt: buildResumePrompt(sessionID, kind, error, true, quotaFrom),
+            })
           }
-          s.lowBudgetStreak += 1; s.lowBudgetSig = sig; s.lowBudgetLastFired = false
-          // New model has the same budget constraint — go compact immediately.
-          schedule(sessionID, cfg.baseDelayMs, { kind: "lowBudget", prompt: buildResumePrompt(sessionID, kind, error, true, quotaFrom) })
           return
         }
-        // Non-budget quota (free tier, etc.): full prompt after rotation.
-        schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, quotaFrom) })
+        // No model to rotate to — fall through to cascade below.
+      }
+
+      // No rotation possible.  Cascade: compact → compact → Continue.
+      // Step 1 & 2: compact lowBudget (always for the first two attempts).
+      if (!sameBudget || s.lowBudgetStreak < 2) {
+        if (sameBudget) s.lowBudgetStreak += 1
+        else { s.lowBudgetStreak = 1; s.lowBudgetSig = sig }
+        s.lowBudgetLastFired = false
+        schedule(sessionID, cfg.baseDelayMs, {
+          kind: "lowBudget",
+          prompt: buildResumePrompt(sessionID, kind, error, false, null),
+        })
         return
       }
-      // No alternate model available.
-      if (isCredits) {
-        const looping = s.lowBudgetStreak > 0 && sig === s.lowBudgetSig
-        s.lowBudgetStreak += 1; s.lowBudgetSig = sig
-        if (looping || s.lowBudgetStreak >= 1) {
-          // Last resort before giving up: inject a 3-word prompt so minimal it
-          // can't exceed any token budget. If it also fails, nothing will work.
-          s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = true
-          schedule(sessionID, cfg.baseDelayMs, { kind: "continue", prompt: `Continue`, extra: { _lowBudgetLast: true } })
-          return
-        }
-        schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, false, null) })
+
+      // Step 3: same budget hit three times → bare "Continue" (8 chars, no tag).
+      if (s.lowBudgetStreak === 2) {
+        s.lowBudgetStreak += 1
+        s.lowBudgetLastFired = true
+        schedule(sessionID, cfg.baseDelayMs, {
+          kind: "continue",
+          prompt: `Continue`,
+          extra: { _lowBudgetLast: true },
+        })
         return
       }
-      notice(`${RESUME_TAG}: Quota exhausted and no alternate model available — manual action needed.`, "error")
+
+      // Step 4: everything failed.
+      s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = false
+      notice(`${RESUME_TAG}: Token/credit budget too tight — ${isCredits ? sig : "quota exhausted"}. Manual intervention required.`, "error")
       return
     }
 
