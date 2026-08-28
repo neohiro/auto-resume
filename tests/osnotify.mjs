@@ -142,5 +142,50 @@ const MSG = "body 'quoted' text"
   ok(calls.length === 2, "N8: timed-out libnotify still falls through to D-Bus")
 }
 
+// ---- 9: drop-file fallback when $ is missing --------------------------------
+{
+  const dir = await mkdtemp(join(tmpdir(), "ar-drop-"))
+  const drop = join(dir, "notices.jsonl")
+  const notify = createOsNotifier({ platform: "win32", dropFile: drop })
+  const r = await notify("hi", "world")
+  ok(r === true, "N9: no $ -> drop-file fallback resolves true")
+  const { readFile } = await import("node:fs/promises")
+  const text = (await readFile(drop, "utf8")).trim()
+  const entry = JSON.parse(text)
+  ok(entry.title === "hi" && entry.message === "world" && typeof entry.ts === "number",
+    "N9: drop file carries structured {ts, title, message}")
+  await rm(dir, { recursive: true, force: true })
+}
+
+// ---- 10: drop-file fallback fires after OS channel fails --------------------
+{
+  const dir = await mkdtemp(join(tmpdir(), "ar-drop-"))
+  const drop = join(dir, "notices.jsonl")
+  const { $ } = recorder({ failWhen: () => true })
+  const notify = createOsNotifier({ $, platform: "linux", dropFile: drop, wslVersionFile: join(tmpdir(), `ar-n10-${Date.now()}-missing`) })
+  const r = await notify("hello", "from osnotify test")
+  ok(r === true, "N10: OS-channel failure -> drop file still resolves true")
+  const { readFile } = await import("node:fs/promises")
+  const text = (await readFile(drop, "utf8")).trim()
+  ok(text.includes("\"title\":\"hello\"") && text.includes("\"message\":\"from osnotify test\""),
+    "N10: drop file captures the milestone even when OS channel is down")
+  await rm(dir, { recursive: true, force: true })
+}
+
+// ---- 11: argv array form is used (not template-interpolated strings) --------
+{
+  const { calls, $ } = recorder()
+  const notify = createOsNotifier({ $, platform: "win32", systemRoot: "C:\\Win" })
+  await notify("T", "M")
+  // Recorder flattens [cmd, args] so first element must be the exe string,
+  // second must be the flag, not a space-joined "exe -flag" payload.
+  ok(typeof calls[0][0] === "string" && calls[0][0].endsWith("powershell.exe"),
+    "N11: argv[0] is the bare exe, not a space-joined command")
+  ok(calls[0].includes("-NoProfile") && calls[0].includes("-EncodedCommand"),
+    "N11: flags and -EncodedCommand are discrete argv entries")
+  ok(!calls[0].some((s) => typeof s === "string" && s.includes(" -NoProfile")),
+    "N11: no string was formed by template-interpolating a command line")
+}
+
 await sleep(50)
 console.log(process.exitCode ? "OSNOTIFY TESTS FAILED" : "ALL OSNOTIFY TESTS PASSED")

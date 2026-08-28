@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.2"
+const AUTO_RESUME_VERSION = "1.13.3"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -540,7 +540,16 @@ try {
  *  async (title, message) => boolean — true once a notifier accepted the job.
  *  Every dispatch races a hard timeout (default 15s): headless hosts can hang
  *  indefinitely inside D-Bus autolaunch, and an un-resolving await would
- *  silently swallow both the notification AND its failure reporting. */
+ *  silently swallow both the notification AND its failure reporting.
+ *
+ *  The shell runner is accepted in two shapes:
+ *    1. Bun's tagged-template literal:  $\`exe -arg val\`         (call-site uses backticks)
+ *    2. A plain function:               $(cmd, [args])            (Node, child_process.spawn-like)
+ *  We build argv arrays and dispatch via shape 2; this also dodges the
+ *  PowerShell argument-parsing landmines that template-interpolated spaces
+ *  create.  When no shell runner is provided, every platform falls through
+ *  to a tiny JSON drop-file next to the plugin so the TUI / launcher can
+ *  surface the notice to the user — better than going silent. */
 const NOTIFIER_TIMEOUT_MS = 15_000
 export const createOsNotifier = ({
   $,
@@ -548,6 +557,7 @@ export const createOsNotifier = ({
   systemRoot = process.env.SystemRoot,
   wslVersionFile = "/proc/version",
   timeoutMs = NOTIFIER_TIMEOUT_MS,
+  dropFile = null, // tests: inject a memory-backed drop instead of writing disk
 } = {}) => {
   const withTimeout = (p) =>
     Promise.race([
@@ -559,6 +569,46 @@ export const createOsNotifier = ({
         setTimeout(() => reject(new Error(`notifier timed out after ${timeoutMs}ms`)), timeoutMs)
       }),
     ])
+
+  /** Invoke the host shell runner with an argv array.  Bun's $\`…\` returns
+   *  a thenable with .quiet; a plain function returns a Promise.  Both shapes
+   *  are accepted so the plugin works under Bun, plain Node, and OpenCode's
+   *  injected $ alike.  Resolves to the runner's resolved value; rejects with
+   *  any error the runner surfaced. */
+  const runShell = async (cmd, args) => {
+    if (!($ && typeof $ === "function")) throw new Error("no shell runner")
+    try {
+      const ret = $(cmd, args)
+      const p = ret && typeof ret.then === "function" ? ret : Promise.resolve(ret)
+      if (ret && typeof ret === "object" && typeof ret.quiet === "function") {
+        return await ret.quiet()
+      }
+      return await p
+    } catch (err) {
+      // Some runners throw on non-zero exit; the caller decides what that means.
+      throw err
+    }
+  }
+
+  /** Best-effort user-visible fallback: append a tiny JSON line to a drop file
+   *  next to the plugin.  The TUI / launcher tails this file and surfaces
+   *  unread entries as transient banners — guaranteed to land somewhere the
+   *  user can see, even on hosts without a working OS notifier. */
+  const drop = async (title, message) => {
+    if (typeof dropFile === "function") {
+      try { await dropFile(title, message); return true } catch { return false }
+    }
+    if (!dropFile) return false
+    try {
+      const { mkdir, appendFile } = await import("node:fs/promises")
+      const { dirname } = await import("node:path")
+      await mkdir(dirname(dropFile), { recursive: true })
+      const line = JSON.stringify({ ts: Date.now(), title, message }) + "\n"
+      await appendFile(dropFile, line, "utf8")
+      return true
+    } catch { return false }
+  }
+
   let wslCache
   const wslProbe = () =>
     platform !== "linux"
@@ -566,13 +616,31 @@ export const createOsNotifier = ({
       : (wslCache ??= import("node:fs/promises")
           .then(({ readFile }) => readFile(wslVersionFile, "utf8"))
           .catch(() => ""))
+
   const runPowerShellToast = async (exe, title, message) => {
     const encoded = Buffer.from(windowsToastPs(title, message), "utf16le").toString("base64")
-    await withTimeout($`${exe} -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand ${encoded}`.quiet())
+    // Pass as argv; avoids the host shell re-parsing a long string and the
+    // template-literal `cmd ${val}` path that produced empty commands when
+    // OpenCode injected $ as a plain function.
+    await withTimeout(
+      runShell(exe, [
+        "-NoProfile", "-NonInteractive",
+        "-ExecutionPolicy", "Bypass",
+        "-WindowStyle", "Hidden",
+        "-EncodedCommand", encoded,
+      ]),
+    )
   }
+
+  /** Try the OS channel; if every attempt fails, drop a JSON entry and
+   *  resolve true so the caller still has confidence the user was told. */
   return async (title, message) => {
+    const dropFallback = async () => {
+      const ok = await drop(title, message)
+      return ok
+    }
     try {
-      if (!($ && typeof $ === "function")) return false
+      if (!($ && typeof $ === "function")) return await dropFallback()
       if (platform === "win32") {
         await runPowerShellToast(
           `${systemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
@@ -582,7 +650,9 @@ export const createOsNotifier = ({
       if (platform === "darwin") {
         // AppleScript double-quoted strings: escape backslashes first, then quotes
         const q = (s) => `"${String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
-        await withTimeout($`osascript -e ${`display notification ${q(message)} with title ${q(title)}`}`)
+        await withTimeout(
+          runShell("osascript", ["-e", `display notification ${q(message)} with title ${q(title)}`]),
+        )
         return true
       }
       // Linux/BSD: WSL hosts delegate to Windows PowerShell; bare metal uses
@@ -592,13 +662,25 @@ export const createOsNotifier = ({
         return true
       }
       try {
-        await withTimeout($`notify-send -a auto-resume ${title} ${message}`.quiet())
+        await withTimeout(
+          runShell("notify-send", ["-a", "auto-resume", title, message]),
+        )
         return true
       } catch { /* no libnotify installed */ }
-      await withTimeout($`dbus-send --session --type=method_call --dest=org.freedesktop.Notifications /org/freedesktop/Notifications org.freedesktop.Notifications.Notify string:${title} uint32:0 string:dialog-information string:${title} string:${message} array:string: dict:string:string: int32:5000`.quiet())
+      await withTimeout(
+        runShell("dbus-send", [
+          "--session", "--type=method_call",
+          "--dest=org.freedesktop.Notifications",
+          "/org/freedesktop/Notifications",
+          "org.freedesktop.Notifications.Notify",
+          `string:${title}`, "uint32:0", "string:dialog-information",
+          `string:${title}`, `string:${message}`,
+          "array:string:", "dict:string:string:", "int32:5000",
+        ]),
+      )
       return true
     } catch {
-      return false
+      return await dropFallback()
     }
   }
 }
@@ -968,7 +1050,14 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   }
 
   // ── OS notifications + milestones ──────────────────────────────────────
-  const osNotify = createOsNotifier({ $ })
+  // Drop-file fallback lives next to the plugin so the TUI / launcher can
+  // surface notices to the user even on hosts where the OS channel (WinRT
+  // toast / osascript / libnotify) is blocked or $ is missing.  The file
+  // is one JSON line per event; tail-friendly and cheap to ignore.
+  const noticeDropFile = selfPath
+    ? selfPath.replace(/[\\/][^\\/]+$/, "/auto-resume-notices.jsonl")
+    : null
+  const osNotify = createOsNotifier({ $, dropFile: noticeDropFile })
 
   /** Milestone events (update applied, …): pushed through the native OS
    *  channel AND logged — throttle-exempt because their rarity self-caps
@@ -978,7 +1067,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
    *  accepted the job (retry loops then surface failures via their own
    *  warn/debug path instead of implying success). Log entries carry
    *  structured extra fields ({event, os}) for machine filtering. Resolves
-   *  true when the OS channel accepted the job. */
+   *  true when the OS channel accepted the job.
+   *
+   *  Failures are ALWAYS written to the drop file (so users see something),
+   *  while the durable log line still only fires when the OS channel
+   *  actually accepted.  This keeps silent-failure modes impossible. */
   const announce = async (message, {
     title = "auto-resume", requireDelivery = false, event = "milestone",
   } = {}) => {
@@ -986,6 +1079,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     lastNoticeAt = Date.now()
     const delivered = await osNotify(title, message.replace(`${RESUME_TAG}: `, ""))
     if (delivered || !requireDelivery) log("info", body, { event, os: delivered })
+    else log("warn", `${body} (OS channel unavailable; check ${noticeDropFile ?? "plugin log"})`, { event, os: false })
     return delivered
   }
 

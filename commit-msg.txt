@@ -1,0 +1,17 @@
+1.13.3: fix OS notifications failing under OpenCode's plain-function shell runner
+
+The shell runner was invoked via Bun's tagged-template syntax
+(`runner`...``) which silently degrades to a comma-joined string
+when OpenCode injects the runner as a regular function — producing
+malformed PowerShell commands that never reach the AUMID, so update
+and quit-milestone toasts failed to fire on the user's host.
+
+Switched every dispatch to a (cmd, args) argv-array call so the
+runner contract is honored regardless of which shape the host
+provides.  Also added a JSON drop-file fallback next to the plugin
+(auto-resume-notices.jsonl) that catches every milestone even when
+no shell runner, WinRT toast, osascript, or libnotify is available —
+the TUI can tail it and surface unread entries, and failures now log
+a clear warning pointing at the file.  announce() now logs a warning
+(not silence) when the OS channel declines, so the user always has a
+trail to follow.
