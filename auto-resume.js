@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.6"
+const AUTO_RESUME_VERSION = "1.13.7"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -864,7 +864,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     lowBudget:    { glyph: "🪙", label: "armed · tight budget" },
     todo:         { glyph: "📋", label: "armed · todo drive" },
     improving:    { glyph: "🧪", label: "armed · improving" },
-    proposing:    { glyph: "🟡", label: "armed · wrap-up" },
+    proposing:    { glyph: "🏁", label: "armed · wrap-up" },
     idle:         { glyph: "💤", label: "armed · idle" },
     fatal:        { glyph: "🔴", label: "armed · unrecoverable" },
   }
