@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.1"
+const AUTO_RESUME_VERSION = "1.13.2"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -890,6 +890,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     s.userStopped = false
     s.currentModel = null
     s.emptyNudges = 0
+    s.emptyStreak = false
     log("info", "auto-resume enabled for session", { sessionID })
     notice(`${RESUME_TAG}: ${wasOff ? "On again for this session" : "Already on here"} — armed. 🟢`, "info")
     queueTitleRefresh(sessionID)
@@ -901,7 +902,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       s = {
         status: "unknown", lastActivity: Date.now(),
         lastErrorAt: 0, lastErrorSig: null, lastErrorName: null,
-        chain: 0, continueCount: 0, stallResumes: 0, emptyNudges: 0,
+        chain: 0, continueCount: 0, stallResumes: 0, emptyNudges: 0, emptyStreak: false,
         compactAttempted: false, awaitingCompactionSince: 0,
         pendingResume: false, lastResumeAt: 0, lastInjectAt: 0, lastSuccessAt: 0,
         lastModel: null, currentModel: null, originalModel: null,
@@ -942,7 +943,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
       userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costNotified: false,
       budgetNotified: false, gaveUpRearmed: false, noTodoImproveFired: false,
-      lowBudgetStreak: 0, lowBudgetSig: null,
+      lowBudgetStreak: 0, lowBudgetSig: null, emptyStreak: false,
       lastErrorName: null, lastErrorSig: null,
     })
     if (!keepTimers) s.stallResumes = 0
@@ -1937,9 +1938,14 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       return
     }
 
-    if (!errored && !hasContent && s.lastResumeAt && s.emptyNudges < 1) {
+    if (!errored && !hasContent && s.lastResumeAt && s.emptyNudges < 2) {
       s.emptyNudges += 1
-      log("info", "empty response detected, nudging", { sessionID })
+      log("info", "empty response detected, nudging", { sessionID, emptyNudges: s.emptyNudges })
+      if (s.emptyNudges >= 2) {
+        notice(`${RESUME_TAG}: Two empty responses in a row (likely a context compaction or model loop). Pausing auto-resume — send a new prompt to resume.`, "warning")
+        s.emptyStreak = true
+        return
+      }
       schedule(sessionID, cfg.nudgeDelayMs, { kind: "empty", prompt: PROMPTS.empty })
     }
   }
@@ -2329,6 +2335,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
                 resetTaskScope(s0, { followUp })
                 s0.currentModel = null
                 s0.emptyNudges = 0
+                s0.emptyStreak = false
                 queueTitleRefresh(info.sessionID)
               }
               s0.lastTurnHadText = false // new turn begins
