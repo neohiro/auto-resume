@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.5"
+const AUTO_RESUME_VERSION = "1.13.6"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -836,12 +836,37 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   // restores the exact previous title — no trace of the plugin remains.
   const TITLE_MARK_TEST = /\[auto-resume:/i
   const TITLE_MARK_STRIP = /\s*\[auto-resume:[^\]]*\]/gi
-  const GLYPH_LEAD_RE = /^\s*(?:🟢|🔁|⏸️|🚫)\s+/u
+  // Leading glyph is OUR exclusive status signal. It REPLACES (not appends)
+  // so one glance tells the user the most actionable state, even when several
+  // are true at once. Priority order: stopped > paused > recovering > armed.
+  // Every paused sub-state uses 🚫 as the leading glyph (the user prefers
+  // that one character for "I stopped because the plugin decided to") and
+  // disambiguates the cause in the trailing label — the leading character
+  // never changes between pause causes, only the text inside the brackets.
+  // 🟢🔁⏸️⏳💰📋🧪💤🔴 are the active/armed/recovering glyphs; 🚫 is the
+  // universal "paused by auto-resume" signal.
+  const GLYPH_LEAD_RE = /^\s*(?:🟢|🔁|⏸️|🚫|⏳|💸|🔕|🪙|📋|🧪|🔄|⏱|💤|🟡|🔴)\s+/u
   const STATUS_STYLE = {
-    armed:      { glyph: "🟢", label: "armed" },
-    recovering: { glyph: "🔁", label: "recovering" },
-    stopped:    { glyph: "⏸️", label: "stopped" },
-    paused:     { glyph: "🚫", label: "paused" },
+    armed:        { glyph: "🟢", label: "armed" },
+    recovering:   { glyph: "🔁", label: "recovering" },
+    stopped:      { glyph: "⏸️", label: "stopped" },
+    paused:       { glyph: "🚫", label: "paused" },
+    // All paused sub-states share 🚫 as the leading glyph (user preference)
+    // and the label disambiguates the cause.  No new leading characters
+    // here on purpose — the eye only has to learn one "paused" symbol.
+    pausedCost:   { glyph: "🚫", label: "paused · cost cap" },
+    pausedBudget: { glyph: "🚫", label: "paused · time budget" },
+    pausedNudges: { glyph: "🚫", label: "paused · nudges" },
+    pausedRetry:  { glyph: "🚫", label: "paused · retries" },
+    pausedRot:    { glyph: "🚫", label: "paused · rotations" },
+    // Armed sub-states: each gets its own leading glyph because they need
+    // different action (top up / run todos / wait / inspect / nothing).
+    lowBudget:    { glyph: "🪙", label: "armed · tight budget" },
+    todo:         { glyph: "📋", label: "armed · todo drive" },
+    improving:    { glyph: "🧪", label: "armed · improving" },
+    proposing:    { glyph: "🟡", label: "armed · wrap-up" },
+    idle:         { glyph: "💤", label: "armed · idle" },
+    fatal:        { glyph: "🔴", label: "armed · unrecoverable" },
   }
   const knownTitles = new Map()   // sessionID -> latest raw title we saw
   const writtenTitles = new Map() // sessionID -> last title this plugin wrote
@@ -859,38 +884,47 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
   const statusKeyOf = (sessionID) => {
     const s = sessions.get(sessionID)
+    // User stop: always highest priority, shows ⏸️.
     if (s?.userStopped || persistedStops.has(sessionID)) return "stopped"
-    const capped = Boolean(
-      s && (
-        s.costNotified ||
-        (cfg.maxTaskCostUsd > 0 && s.taskCost >= cfg.maxTaskCostUsd) ||
-        s.chain >= cfg.maxChain ||
-        s.nudges >= cfg.maxNudges ||
-        s.rotations >= cfg.maxRotations ||
-        (cfg.budgetMs > 0 && s.taskStartAt && Date.now() - s.taskStartAt >= cfg.budgetMs)
-      ),
-    )
-    if (capped) return "paused"
-    // 🔁 means recovery is happening RIGHT NOW: a queued/dispatched retry,
-    // core parked in its own retry loop, or a busy turn that OUR injection
-    // started (lastResumeAt newer than the last error AND last success).
-    // A plain busy turn that merely has historical errors stays 🟢 armed —
-    // the old `(busy|retry) && chain > 0` clause latched 🔁 onto every later
-    // user task forever, because chain never resets on success.
-    if (
-      s && (
-        s.pendingResume ||
-        s.retryEnteredAt > 0 ||
-        s.status === "retry" ||
-        (s.status === "busy" &&
-          s.lastResumeAt > Math.max(s.lastErrorAt, s.lastSuccessAt))
-      )
-    ) {
+
+    // Cap-based pauses: cause-built glyph tells user WHY without opening the title.
+    if (s?.costNotified || (cfg.maxTaskCostUsd > 0 && (s?.taskCost ?? 0) >= cfg.maxTaskCostUsd))
+      return "pausedCost"
+    if (s?.chain >= cfg.maxChain) return "pausedRetry"
+    if (s?.rotations >= cfg.maxRotations) return "pausedRot"
+    if (s?.nudges >= cfg.maxNudges) return "pausedNudges"
+    if (cfg.budgetMs > 0 && s?.taskStartAt && Date.now() - s.taskStartAt >= cfg.budgetMs)
+      return "pausedBudget"
+
+    // Active recovery: 🔁 only while something is genuinely happening.
+    if (s && (s.pendingResume || s.retryEnteredAt > 0 || s.status === "retry" ||
+        (s.status === "busy" && s.lastResumeAt > Math.max(s.lastErrorAt, s.lastSuccessAt))))
       return "recovering"
-    }
+
+    // Armed sub-states: most actionable signal first.
+    // Fatal / auth error: 🔴 tells user it can't self-heal.
+    if (s?.lastErrorName === "fatal" || s?.lastErrorName === "auth") return "fatal"
+    // Tight budget: 🪙 tells user to top up or switch model.
+    if (s?.lowBudgetStreak > 0) return "lowBudget"
+    // Todo drive active: 📋 (open items, autopilot driving them).
+    if (s?.todos?.some((t) => t.status !== "completed" && t.status !== "cancelled")) return "todo"
+    // Self-improvement cycle running.
+    if (s?.improveDone > 0 && s?.improveTotal > 0) return "improving"
+    // Wrap-up proposal sent but not yet acknowledged.
+    if (s?.proposalSent) return "proposing"
+    // Armed but genuinely idle (no recent activity AND nothing pending) —
+    // require a substantial quiet window so freshly-completed tasks don't
+    // flicker from 🟢 → 💤 the moment they finish.
+    const quietFor = s ? Date.now() - (s.lastActivity ?? 0) : 0
+    if (quietFor > 5 * 60_000) return "idle"
+
     return "armed"
   }
 
+  /** Compose the human-readable sub-state suffix shown inside the trailing
+   *  `[auto-resume: <status>]` tag.  Returns a list of dot-separated
+   *  fragments; the caller joins them.  Sub-states are ranked by importance
+   *  so the most actionable signal lands first when space is tight. */
   let titleApiCache // undefined = not yet resolved; false = unavailable
   const resolveSessionUpdate = () => {
     if (titleApiCache !== undefined) return titleApiCache
@@ -2510,6 +2544,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
               }
               if (typeof info.cost === "number") state(info.sessionID).taskCost += info.cost
               if (info.error) detach(handleError(info.sessionID, info.error), "handleError")
+              // Cost increment may shift the title suffix ($1.20 → $1.85)
+              // and may tip the session into the "paused" state on the next
+              // statusKeyOf. Either way, the user wants to see the update.
+              queueTitleRefresh(info.sessionID)
             }
             break
           }
