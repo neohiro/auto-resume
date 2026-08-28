@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.8"
+const AUTO_RESUME_VERSION = "1.13.9"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1703,7 +1703,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
             return
           }
           s.lowBudgetStreak += 1; s.lowBudgetSig = sig; s.lowBudgetLastFired = false
+          // New model has the same budget constraint — go compact immediately.
+          schedule(sessionID, cfg.baseDelayMs, { kind: "lowBudget", prompt: buildResumePrompt(sessionID, kind, error, true, quotaFrom) })
+          return
         }
+        // Non-budget quota (free tier, etc.): full prompt after rotation.
         schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, quotaFrom) })
         return
       }
