@@ -187,5 +187,22 @@ const MSG = "body 'quoted' text"
     "N11: no string was formed by template-interpolating a command line")
 }
 
+// ---- 12: win32 payload attributes the toast to "auto-resume", not PowerShell -
+{
+  const { calls, $ } = recorder()
+  const notify = createOsNotifier({ $, platform: "win32", systemRoot: "C:\\Win" })
+  await notify("T", "M")
+  const encoded = calls[0][calls[0].length - 1]
+  const decoded = Buffer.from(encoded, "base64").toString("utf16le")
+  ok(!decoded.includes("WindowsPowerShell"),
+    `N12: payload no longer references the PowerShell AUMID (no "WindowsPowerShell" string)`)
+  ok(/auto-resume@neohiro/.test(decoded),
+    "N12: payload uses the auto-resume AUMID so the toast header shows 'auto-resume'")
+  ok(/SetCurrentProcessExplicitAppUserModelID/.test(decoded),
+    "N12: payload binds the AUMID to the toast process")
+  ok(/CreateToastNotifier\(\$aumid\)/.test(decoded),
+    "N12: CreateToastNotifier is called with the AUMID variable, not the PowerShell AUMID")
+}
+
 await sleep(50)
 console.log(process.exitCode ? "OSNOTIFY TESTS FAILED" : "ALL OSNOTIFY TESTS PASSED")

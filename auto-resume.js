@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.3"
+const AUTO_RESUME_VERSION = "1.13.4"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -508,14 +508,51 @@ const windowsToastPs = (title, message) => `
 $ErrorActionPreference = 'Stop'
 $title = ${psQuote(title)}
 $text  = ${psQuote(message)}
+# auto-resume's AUMID — registered lazily on first call so the toast shows
+# "auto-resume" in the header, not "Windows PowerShell".  Falls back to
+# the well-known PowerShell AUMID if Start Menu registration fails.
+$aumid = 'auto-resume@neohiro'
 try {
+  $startMenu = [Environment]::GetFolderPath('Programs')
+  $lnkPath   = Join-Path $startMenu 'auto-resume.lnk'
+  $iconPath  = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'auto-resume\\auto-resume.ico'
+  if (-not (Test-Path $iconPath)) {
+    $iconDir = Split-Path $iconPath -Parent
+    if (-not (Test-Path $iconDir)) { [void](New-Item -ItemType Directory -Path $iconDir -Force) }
+    Add-Type -AssemblyName System.Drawing
+    $bmp = New-Object System.Drawing.Bitmap 32,32
+    $g   = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.Clear([System.Drawing.Color]::FromArgb(255, 30, 30, 30))
+    $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 80, 200, 120))
+    $g.FillEllipse($brush, 4, 4, 24, 24)
+    $brush2 = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 255, 255, 255))
+    $font = New-Object System.Drawing.Font 'Segoe UI', 14, ([System.Drawing.FontStyle]::Bold)
+    $g.DrawString('A', $font, $brush2, 7, 4)
+    $g.Dispose(); $brush.Dispose(); $brush2.Dispose(); $font.Dispose()
+    $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    $fs = [System.IO.File]::Create($iconPath)
+    $icon.Save($fs); $fs.Close(); $icon.Dispose(); $bmp.Dispose()
+  }
+  if (-not (Test-Path $lnkPath)) {
+    $ws = New-Object -ComObject WScript.Shell
+    $sc = $ws.CreateShortcut($lnkPath)
+    $sc.TargetPath = 'powershell.exe'
+    $sc.IconLocation = "$iconPath,0"
+    $sc.Save()
+    [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($ws)
+  }
+  $sig = @"
+[System.Runtime.InteropServices.DllImport("shell32.dll")]
+public static extern void SetCurrentProcessExplicitAppUserModelID([System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPWStr)] string AppID);
+"@
+  if (-not ('Pinvoke' -as [type])) { Add-Type -MemberDefinition $sig -Name Pinvoke }
+  [Pinvoke]::SetCurrentProcessExplicitAppUserModelID($aumid)
   [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
   $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
   $nodes = $xml.GetElementsByTagName('text')
   [void]$nodes.Item(0).AppendChild($xml.CreateTextNode($title))
   [void]$nodes.Item(1).AppendChild($xml.CreateTextNode($text))
-  $appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
-  [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show(
+  [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($aumid).Show(
     [Windows.UI.Notifications.ToastNotification]::new($xml))
   exit 0
 } catch {
