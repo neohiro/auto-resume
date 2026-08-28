@@ -1618,7 +1618,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           // Last resort before giving up: inject a 3-word prompt so minimal it
           // can't exceed any token budget. If it also fails, nothing will work.
           s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = true
-          schedule(sessionID, cfg.baseDelayMs, { kind: "continue", prompt: `${RESUME_TAG} Continue.`, extra: { _lowBudgetLast: true } })
+          schedule(sessionID, cfg.baseDelayMs, { kind: "continue", prompt: `Continue`, extra: { _lowBudgetLast: true } })
           return
         }
         schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, false, null) })
