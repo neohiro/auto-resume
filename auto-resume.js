@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.4"
+const AUTO_RESUME_VERSION = "1.13.5"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1036,6 +1036,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         userStopped: false, takeoverAt: 0,
         lastInjectKind: null,
         lastEvalSig: null,
+        lastUserPromptAt: 0,
         taskCost: 0, costNotified: false, budgetNotified: false, gaveUpRearmed: false,
       lowBudgetStreak: 0, lowBudgetSig: null, lowBudgetLastFired: false,
         lowBudgetLastFired: false,
@@ -1425,6 +1426,23 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     log("info", `scheduled "${plan.kind}" in ${delayMs}ms`, { sessionID })
   }
 
+  /** Cancel any pending auto-injection on a session and clear its pendingResume
+   *  flag.  Called the moment we observe the user sending their own message —
+   *  a stale plan would otherwise fire AFTER the new user prompt and pollute
+   *  the conversation with a spurious "Continue" / "Auto-resume".  The plan's
+   *  createdTs is also recorded in session state so a race where the timer
+   *  fires before cancelPending can still be caught by runPlan. */
+  const cancelPending = (sessionID, why) => {
+    const t = timers.get(sessionID)
+    if (t) { clearTimeout(t); timers.delete(sessionID) }
+    const s = sessions.get(sessionID)
+    if (s) {
+      s.pendingResume = false
+      s.lastUserPromptAt = Date.now()
+    }
+    if (t) log("info", `cancelled pending auto-injection — ${why}`, { sessionID })
+  }
+
   const autonomousPrompt = (plan) =>
     plan.prompt instanceof Function
       ? plan.prompt(cfg.autonomy)
@@ -1455,9 +1473,15 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       }
       return
     }
-    // Stale-recovery guard: if the session already had a clean turn AFTER
-    // this plan was scheduled, core self-healed and the injection would be
-    // a spurious "transient error" prompt on a healthy session — drop it.
+    // Stale-plan guards:
+    // 1. A user prompt arrived AFTER we scheduled this plan → drop it.
+    //    (covers Continue, Auto-resume, todos, improve, etc. — every kind)
+    if (plan.createdTs && s0.lastUserPromptAt > plan.createdTs) {
+      log("info", `dropping "${plan.kind}" — user prompt arrived after this plan was scheduled`, { sessionID })
+      return
+    }
+    // 2. The session self-healed with a clean assistant turn AFTER we scheduled
+    //    this plan → drop it (resume plans only).
     if (plan.kind === "resume" && plan.createdTs &&
         s0.lastSuccessAt >= plan.createdTs) {
       log("info", "dropping recovery — session already recovered on its own", { sessionID })
@@ -2447,6 +2471,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
                 break
               }
               if (!ours) {
+                // Cancel any plugin-injected plan that was queued before this user
+                // prompt arrived — the new conversation must not be polluted by
+                // a stale "Continue" / "Auto-resume" that fires seconds later.
+                cancelPending(info.sessionID, "user prompt arrived")
                 // A REAL prompt starts a new workflow — lift the stop, on
                 // disk too, so future runs automate this session again.
                 // (An explicit opt-out is only lifted by "auto-resume on".)

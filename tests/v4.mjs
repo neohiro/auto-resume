@@ -310,4 +310,42 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(state.prompts.some((p) => p.id === "woke"), "EE: reconnect revives sessions orphaned by sleep")
 }
 
+// ---- FF: user prompt cancels any pending auto-injection ----------------------
+{
+  // The waterfall: error -> lowBudget prompt scheduled, then before it fires
+  // the user types a new message. The plugin must NOT inject the queued prompt
+  // on top of the user's fresh turn (especially critical for the last-resort
+  // "Continue" prompt, which carries no [auto-resume] tag for tight budgets).
+  process.env.OPENCODE_RESUME_BASE_DELAY_MS = "300" // delay long enough for user prompt to land
+  const state = makeState()
+  // credentials-style error (lowBudget path schedules an injection)
+  state.messagesBySession["ff"] = [
+    {
+      info: {
+        role: "assistant", providerID: "provA", modelID: "a-mini",
+        error: { name: "APIError", data: { statusCode: 402, message: "insufficient credits" } },
+      },
+      parts: [],
+    },
+  ]
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  // surface the error so handleError schedules a lowBudget plan
+  await hooks.event(ev("message.updated", { info: { role: "assistant", sessionID: "ff", providerID: "provA", modelID: "a-mini" } }))
+  await hooks.event(ev("session.error", {
+    sessionID: "ff",
+    error: { name: "APIError", data: { statusCode: 402, message: "insufficient credits, can afford 60" } },
+  }))
+  // user types before the 300ms delay elapses
+  await sleep(50)
+  await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "ff", id: "u-ff" } }))
+  state.msgStore["u-ff"] = "switch model please"
+  // wait past the originally-scheduled 300ms
+  await sleep(500)
+  ok(state.prompts.length === 0 || !state.prompts.some((p) => p.id === "ff"),
+    "FF: user prompt cancelled the queued lowBudget injection — no spurious 'Continue' or 'Auto-resume' on the new turn")
+  ok(state.logs.some((t) => t.includes("cancelled pending auto-injection")),
+    "FF: cancelPending logged the cancellation")
+  delete process.env.OPENCODE_RESUME_BASE_DELAY_MS
+}
+
 console.log(process.exitCode ? "V4 TESTS FAILED" : "ALL V4 TESTS PASSED")
