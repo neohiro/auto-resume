@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.7"
+const AUTO_RESUME_VERSION = "1.13.8"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -817,17 +817,29 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     "opt-outs",
     str("OPENCODE_RESUME_OFFSTORE", selfPath ? `${selfPath}.off.json` : ""),
   )
+  // Pause is a separate persisted store: "off" strips the title, "pause" keeps
+  // the 🚫 indicator visible.  Sharing offStore would conflate the two and
+  // we couldn't tell which mode to restore on startup.
+  const pauseStore = makeMapStore(
+    "user-pauses",
+    str("OPENCODE_RESUME_PAUSESTORE", selfPath ? `${selfPath}.paused.json` : ""),
+  )
   const persistedStops = stopStore.map
 
   /** Stopped = flagged live this run OR remembered from a previous run. */
   const isUserStopped = (sessionID) =>
     Boolean(sessions.get(sessionID)?.userStopped || persistedStops.has(sessionID))
 
+  /** Paused = user said "auto-resume pause" — visible 🚫, suppressed until "on". */
+  const isUserPaused = (sessionID) =>
+    Boolean(sessions.get(sessionID)?.userPaused || pauseStore.map.has(sessionID))
+
   /** Opted out = auto-resume fully disabled for this session by the user. */
   const isOptedOut = (sessionID) => offStore.map.has(sessionID)
 
   /** Anything automation might do for this session is blocked. */
-  const suppressed = (sessionID) => isUserStopped(sessionID) || isOptedOut(sessionID)
+  const suppressed = (sessionID) =>
+    isUserStopped(sessionID) || isOptedOut(sessionID) || isUserPaused(sessionID)
 
   // ── per-session title indicator ────────────────────────────────────────
   // While auto-resume is enabled for a session, its title is decorated as:
@@ -849,11 +861,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   const STATUS_STYLE = {
     armed:        { glyph: "🟢", label: "armed" },
     recovering:   { glyph: "🔁", label: "recovering" },
+    // User active stop (mid-turn): ⏸️ — the core Stop button was pressed.
     stopped:      { glyph: "⏸️", label: "stopped" },
-    paused:       { glyph: "🚫", label: "paused" },
-    // All paused sub-states share 🚫 as the leading glyph (user preference)
-    // and the label disambiguates the cause.  No new leading characters
-    // here on purpose — the eye only has to learn one "paused" symbol.
+    // User said "auto-resume pause": 🚫 visible in title; suppressed until "on".
+    userPaused:  { glyph: "⏸️", label: "paused by you" },
+    // Cap-based pauses: cause-built label, 🚫 glyph throughout.
     pausedCost:   { glyph: "🚫", label: "paused · cost cap" },
     pausedBudget: { glyph: "🚫", label: "paused · time budget" },
     pausedNudges: { glyph: "🚫", label: "paused · nudges" },
@@ -884,8 +896,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
   const statusKeyOf = (sessionID) => {
     const s = sessions.get(sessionID)
-    // User stop: always highest priority, shows ⏸️.
+    // User active stop (⏸️): highest priority — user pressed Stop mid-turn.
     if (s?.userStopped || persistedStops.has(sessionID)) return "stopped"
+    // User explicit pause (🚫): said "auto-resume pause" — suppress
+    // injections AND keep the title visible so the state is obvious.
+    if (isUserPaused(sessionID)) return "userPaused"
 
     // Cap-based pauses: cause-built glyph tells user WHY without opening the title.
     if (s?.costNotified || (cfg.maxTaskCostUsd > 0 && (s?.taskCost ?? 0) >= cfg.maxTaskCostUsd))
@@ -1016,19 +1031,24 @@ export const AutoResumePlugin = async ({ client, $ }) => {
    *  sweep every opted-out session once the stores are loaded. Idempotent
    *  (clean titles produce no PATCH). */
   const restoreOptedOutTitles = () => {
+    // off: strip the title; pause: re-apply the 🚫 indicator.
     for (const id of [...offStore.map.keys()]) queueTitleRefresh(id)
+    for (const id of [...pauseStore.map.keys()]) queueTitleRefresh(id)
   }
 
-  /** In-chat switch: "auto-resume off" disables everything for THIS session;
-   *  "auto-resume on" re-enables and starts fresh. Persisted across restarts. */
+  /** In-chat switch: "auto-resume off" (silent, strip title), "auto-resume pause"
+   *  (visible 🚫 title, suppress injections until "on"), "auto-resume on" re-arms.
+   *  Off and pause are both persisted across restarts via separate stores. */
   const handleToggleCommand = (sessionID, mode) => {
     const s = state(sessionID)
     if (mode === "off") {
       offStore.map.set(sessionID, Date.now())
       offStore.save()
-      // an explicit opt-out supersedes any stop marker
-      if (persistedStops.delete(sessionID)) stopStore.save()
+      // an explicit opt-out supersedes any stop/pause marker
       s.userStopped = false
+      s.userPaused = false
+      if (pauseStore.map.delete(sessionID)) pauseStore.save()
+      if (persistedStops.delete(sessionID)) stopStore.save()
       const t = timers.get(sessionID)
       if (t) { clearTimeout(t); timers.delete(sessionID) }
       log("info", "auto-resume disabled for session", { sessionID })
@@ -1036,11 +1056,30 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       queueTitleRefresh(sessionID)
       return
     }
+    if (mode === "pause") {
+      // "pause": suppress injections, keep title visible with 🚫 glyph.
+      // Persisted in pauseStore so it survives restarts too.
+      s.userStopped = false
+      s.userPaused = true
+      pauseStore.map.set(sessionID, Date.now())
+      pauseStore.save()
+      if (offStore.map.delete(sessionID)) offStore.save()
+      if (persistedStops.delete(sessionID)) stopStore.save()
+      const t = timers.get(sessionID)
+      if (t) { clearTimeout(t); timers.delete(sessionID) }
+      log("info", "auto-resume paused for session", { sessionID })
+      notice(`${RESUME_TAG}: Paused — say "auto-resume on" to resume.`, "info")
+      queueTitleRefresh(sessionID)
+      return
+    }
+    // mode === "on"
     const wasOff = isOptedOut(sessionID)
     if (offStore.map.delete(sessionID)) offStore.save()
+    if (pauseStore.map.delete(sessionID)) pauseStore.save()
     if (persistedStops.delete(sessionID)) stopStore.save()
     resetTaskScope(s)
     s.userStopped = false
+    s.userPaused = false
     s.currentModel = null
     s.emptyNudges = 0
     s.emptyStreak = false
@@ -1071,9 +1110,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         lastInjectKind: null,
         lastEvalSig: null,
         lastUserPromptAt: 0,
+        userPaused: false,
         taskCost: 0, costNotified: false, budgetNotified: false, gaveUpRearmed: false,
-      lowBudgetStreak: 0, lowBudgetSig: null, lowBudgetLastFired: false,
-        lowBudgetLastFired: false,
+        lowBudgetStreak: 0, lowBudgetSig: null, lowBudgetLastFired: false,
       }
       sessions.set(id, s)
     }
@@ -1097,7 +1136,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
       userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costNotified: false,
       budgetNotified: false, gaveUpRearmed: false, noTodoImproveFired: false,
-      lowBudgetStreak: 0, lowBudgetSig: null, emptyStreak: false,
+      lowBudgetStreak: 0, lowBudgetSig: null, userPaused: false, emptyStreak: false,
       lastErrorName: null, lastErrorSig: null,
     })
     if (!keepTimers) s.stallResumes = 0
@@ -2226,7 +2265,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   // that was mid-recovery or awaiting its first reply. On startup we scan
   // recent sessions and give those a fresh continuation.
   const reanimate = async () => {
-    await Promise.all([stopStore.load(), offStore.load()]) // markers known before any revival decision
+    await Promise.all([stopStore.load(), offStore.load(), pauseStore.load()]) // markers known before any revival decision
     if (!cfg.reanimate) return
     let list = []
     try {
@@ -2414,10 +2453,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const wd = setInterval(() => detach(checkStalls, "watchdog"), cfg.watchdogMs)
     wd.unref?.()
     detach(() => log("info", `auto-resume v${AUTO_RESUME_VERSION} initialized`), "init-log")
+    detach(pauseStore.load, "pause-store-load")
     detach(stopStore.load, "stop-store-load")
     detach(offStore.load, "off-store-load")
     detach(async () => {
-      await Promise.all([stopStore.load(), offStore.load()])
+      await Promise.all([stopStore.load(), offStore.load(), pauseStore.load()])
       restoreOptedOutTitles()
     }, "optout-title-restore")
     detach(checkForUpdates, "update-check")
@@ -2499,7 +2539,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
               }
               // In-chat switch: exactly "auto-resume off" / "auto-resume on"
               // (leading "/" allowed). Short exact match so prose never trips it.
-              const toggleCmd = /^\/?auto[- ]?resume[ :]?(off|on)[.!]?\s*$/i.exec(userText.trim())
+              const toggleCmd = /^\/?auto[- ]?resume[ :]?(off|on|pause)[.!]?\s*$/i.exec(userText.trim())
               if (toggleCmd) {
                 handleToggleCommand(info.sessionID, toggleCmd[1].toLowerCase())
                 break
