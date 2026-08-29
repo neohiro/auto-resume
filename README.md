@@ -147,7 +147,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_RETRY_FUTURE_CAP_MS` | `600000` | Next-retry scheduled further out ⇒ takeover |
 | `OPENCODE_RESUME_REANIMATE` | `true` | Revive crashed sessions on startup |
 | `OPENCODE_RESUME_REANIMATE_WINDOW_MS` | `600000` | Max age of sessions eligible for revival |
-| `OPENCODE_RESUME_AUTO_UPDATE` | `true` | Self-update daily from GitHub (applies on next OpenCode restart); a native OS notification announces the completed update |
+| `OPENCODE_RESUME_AUTO_UPDATE` | `true` | Self-update daily from GitHub (applies on next OpenCode restart); a native TUI toast (with an OS notification as backup) announces the completed update |
 | `OPENCODE_RESUME_NOTICE_THROTTLE_MS` | `3000` | Min gap between user notices in the OpenCode log (legacy `OPENCODE_RESUME_TOAST_THROTTLE_MS` still honored) |
 | `OPENCODE_RESUME_STOPSTORE` | `<plugin>/auto-resume.js.stopped.json` | Where user-stop markers are persisted across restarts |
 | `OPENCODE_RESUME_OFFSTORE` | `<plugin>/auto-resume.js.off.json` | Where per-session opt-outs (`auto-resume off`) are persisted |

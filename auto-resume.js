@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.11"
+const AUTO_RESUME_VERSION = "1.13.12"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -865,7 +865,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   // never changes between pause causes, only the text inside the brackets.
   // 🟢🔁⏸️⏳💰📋🧪💤🔴 are the active/armed/recovering glyphs; 🚫 is the
   // universal "paused by auto-resume" signal.
-  const GLYPH_LEAD_RE = /^\s*(?:🟢|🔁|⏸️|🚫|⏳|💸|🔕|🪙|📋|🧪|🔄|⏱|💤|🟡|🔴)\s+/u
+  const GLYPH_LEAD_RE = /^\s*(?:🟢|🔁|⏸️|🚫|⏳|💸|🔕|🪙|📋|🧪|✅|🏁|🔄|⏱|💤|🟡|🔴)\s+/u
   const STATUS_STYLE = {
     armed:        { glyph: "🟢", label: "armed" },
     recovering:   { glyph: "🔁", label: "recovering" },
@@ -884,6 +884,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     lowBudget:    { glyph: "🪙", label: "armed · tight budget" },
     todo:         { glyph: "📋", label: "armed · todo drive" },
     improving:    { glyph: "🧪", label: "armed · improving" },
+    improved:     { glyph: "✅", label: "armed · improved" },
     proposing:    { glyph: "🏁", label: "armed · wrap-up" },
     idle:         { glyph: "💤", label: "armed · idle" },
     fatal:        { glyph: "🔴", label: "armed · unrecoverable" },
@@ -904,13 +905,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
   const statusKeyOf = (sessionID) => {
     const s = sessions.get(sessionID)
-    // User active stop (⏸️): highest priority — user pressed Stop mid-turn.
     if (s?.userStopped || persistedStops.has(sessionID)) return "stopped"
-    // User explicit pause (🚫): said "auto-resume pause" — suppress
-    // injections AND keep the title visible so the state is obvious.
     if (isUserPaused(sessionID)) return "userPaused"
 
-    // Cap-based pauses: cause-built glyph tells user WHY without opening the title.
     if (s?.costNotified || (cfg.maxTaskCostUsd > 0 && (s?.taskCost ?? 0) >= cfg.maxTaskCostUsd))
       return "pausedCost"
     if (s?.chain >= cfg.maxChain) return "pausedRetry"
@@ -919,25 +916,30 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     if (cfg.budgetMs > 0 && s?.taskStartAt && Date.now() - s.taskStartAt >= cfg.budgetMs)
       return "pausedBudget"
 
-    // Active recovery: 🔁 only while something is genuinely happening.
+    // Armed sub-states: most actionable signal first.
+    // Fatal / auth error: 🔴 tells user it can't self-heal.
+    if (s?.lastErrorName === "fatal" || s?.lastErrorName === "auth") return "fatal"
+    if (s?.lowBudgetStreak > 0) return "lowBudget"
+    if (s?.todos?.some((t) => t.status !== "completed" && t.status !== "cancelled")) return "todo"
+
+    // Self-improvement active: 🧪 — set true when a cycle is in flight,
+    // cleared when all cycles are done. Checked before recovering so the
+    // model isn't masked by a generic 🔁 while it's actively working.
+    if (s?.improveActive) return "improving"
+
+    // Post-completion window: ✅ — shown briefly after all cycles finish so
+    // the user sees explicit confirmation before returning to armed/idle.
+    if (s?.improvedAt > 0 && (s?.improveDone ?? 0) >= (cfg.improveCycles ?? 1)) {
+      if (Date.now() - s.improvedAt < 180_000) return "improved"
+    }
+
+    // Active recovery: 🔁 only while something is genuinely happening and
+    // no more-specific armed sub-state is active.
     if (s && (s.pendingResume || s.retryEnteredAt > 0 || s.status === "retry" ||
         (s.status === "busy" && s.lastResumeAt > Math.max(s.lastErrorAt, s.lastSuccessAt))))
       return "recovering"
 
-    // Armed sub-states: most actionable signal first.
-    // Fatal / auth error: 🔴 tells user it can't self-heal.
-    if (s?.lastErrorName === "fatal" || s?.lastErrorName === "auth") return "fatal"
-    // Tight budget: 🪙 tells user to top up or switch model.
-    if (s?.lowBudgetStreak > 0) return "lowBudget"
-    // Todo drive active: 📋 (open items, autopilot driving them).
-    if (s?.todos?.some((t) => t.status !== "completed" && t.status !== "cancelled")) return "todo"
-    // Self-improvement cycle running.
-    if (s?.improveDone > 0 && s?.improveTotal > 0) return "improving"
-    // Wrap-up proposal sent but not yet acknowledged.
     if (s?.proposalSent) return "proposing"
-    // Armed but genuinely idle (no recent activity AND nothing pending) —
-    // require a substantial quiet window so freshly-completed tasks don't
-    // flicker from 🟢 → 💤 the moment they finish.
     const quietFor = s ? Date.now() - (s.lastActivity ?? 0) : 0
     if (quietFor > 5 * 60_000) return "idle"
 
@@ -1140,6 +1142,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       nudges: 0, driveCount: 0, staleDrives: -1,
       lastDriveCompleted: -1, proposalSent: false,
       improveDone, improveTotal, lastImprovedAt,
+      improveActive: false, improvedAt: 0, // 🧪 running, ✅ just-finished window
       proceedCount: 0, taskStartAt: Date.now(), toolErrs: 0,
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
       userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costNotified: false,
@@ -1157,10 +1160,33 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   const log = (level, message, extra) =>
     detach(() => client.app.log({ body: { service: "auto-resume", level, message, extra } }), "app.log")
 
-  /** User-facing notices go to the OpenCode log stream ONLY — the flaky TUI
-   *  toast surface was removed in v1.10. Rare milestone events (update
-   *  applied) additionally fire a native OS notification via osNotify. */
+  /** User-facing notices go to the OpenCode TUI toast first (native in-app
+   *  surface), then to the app log stream, with the OS notifier reserved as
+   *  a last-resort backup for hosts where the TUI channel is unavailable.
+   *  Rare milestone events (update applied) additionally fire a native OS
+   *  notification via announce so they reach the user when OpenCode is
+   *  backgrounded. */
   const NOTICE_LEVEL = { info: "info", success: "info", warning: "warn", error: "error" }
+  const TOAST_VARIANT = { info: "info", success: "success", warning: "warning", error: "error" }
+  let tuiToastCache // undefined = not yet resolved; false = unavailable
+  const resolveTuiToast = () => {
+    if (tuiToastCache !== undefined) return tuiToastCache
+    const tui = client.tui ?? {}
+    const fn = typeof tui.showToast === "function" ? tui.showToast : null
+    tuiToastCache = fn
+    log("info", fn
+      ? "native TUI toast channel bound (primary notice surface)"
+      : "native TUI toast channel unavailable — falling back to app log + OS")
+    return tuiToastCache
+  }
+  const showTuiToast = (message, variant) => {
+    const fn = resolveTuiToast()
+    if (!fn) return false
+    try {
+      const res = fn({ body: { title: "auto-resume", message, variant: TOAST_VARIANT[variant] ?? "info" } })
+      return res && typeof res.then === "function" ? res.then(() => true).catch(() => false) : true
+    } catch { return false }
+  }
   const notice = (message, variant = "warning") => {
     const nowMs = Date.now()
     if (cfg.noticeThrottleMs > 0 && nowMs - lastNoticeAt < cfg.noticeThrottleMs) {
@@ -1168,7 +1194,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       return
     }
     lastNoticeAt = nowMs
-    log(NOTICE_LEVEL[variant] ?? "warn", message)
+    // Native TUI toast is the primary surface. We don't block on it (toast
+    // promises are detached) so a slow toast never stalls the plugin, but
+    // the log line is always written so the message is never lost.
+    const tuiShown = showTuiToast(message, variant)
+    log(NOTICE_LEVEL[variant] ?? "warn", message, { tui: tuiShown })
   }
 
   // ── OS notifications + milestones ──────────────────────────────────────
@@ -1181,28 +1211,27 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     : null
   const osNotify = createOsNotifier({ $, dropFile: noticeDropFile })
 
-  /** Milestone events (update applied, …): pushed through the native OS
-   *  channel AND logged — throttle-exempt because their rarity self-caps
-   *  them; lastNoticeAt is reserved up front so ordinary notices stay spaced
-   *  even while a slow balloon-tip dispatch is in flight. With
-   *  requireDelivery, the durable log line only lands when the OS channel
-   *  accepted the job (retry loops then surface failures via their own
-   *  warn/debug path instead of implying success). Log entries carry
-   *  structured extra fields ({event, os}) for machine filtering. Resolves
-   *  true when the OS channel accepted the job.
-   *
-   *  Failures are ALWAYS written to the drop file (so users see something),
-   *  while the durable log line still only fires when the OS channel
-   *  actually accepted.  This keeps silent-failure modes impossible. */
+  /** Milestone events (update applied, …): pushed through the native TUI
+   *  toast first, with the OS notifier as a backup for hosts where the TUI
+   *  channel is unavailable. Throttle-exempt because their rarity self-caps
+   *  them; lastNoticeAt is reserved up front so ordinary notices stay
+   *  spaced even while a slow dispatch is in flight. With requireDelivery,
+   *  the durable log line only lands when at least one channel accepted the
+   *  job. Log entries carry structured extra fields ({event, tui, os}) for
+   *  machine filtering. Resolves true when ANY channel accepted the job. */
   const announce = async (message, {
     title = "auto-resume", requireDelivery = false, event = "milestone",
   } = {}) => {
     const body = message.startsWith(RESUME_TAG) ? message : `${RESUME_TAG}: ${message}`
     lastNoticeAt = Date.now()
+    const tuiShown = showTuiToast(message, "info")
     const delivered = await osNotify(title, message.replace(`${RESUME_TAG}: `, ""))
-    if (delivered || !requireDelivery) log("info", body, { event, os: delivered })
-    else log("warn", `${body} (OS channel unavailable; check ${noticeDropFile ?? "plugin log"})`, { event, os: false })
-    return delivered
+    if (delivered || tuiShown || !requireDelivery)
+      log("info", body, { event, tui: tuiShown, os: delivered })
+    else
+      log("warn", `${body} (all channels unavailable; check ${noticeDropFile ?? "plugin log"})`,
+        { event, tui: false, os: false })
+    return delivered || tuiShown
   }
 
   // ── circuit breaker ────────────────────────────────────────────────
@@ -2080,6 +2109,14 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       s.budgetNotified = false
       s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = false
 
+      // Self-improvement: a clean turn closes out the in-flight improve
+      // cycle. If that was the LAST scheduled cycle, latch improvedAt so the
+      // title shows ✅ for a short window before settling to armed/idle.
+      if (s.improveActive) {
+        s.improveActive = false
+        if (s.improveDone >= cfg.improveCycles) s.improvedAt = Date.now()
+      }
+
       const todos = s.todos ?? []
       const open = todos.filter((t) => t.status === "pending" || t.status === "in_progress")
       const finished = todos.filter((t) => t.status === "completed" || t.status === "cancelled")
@@ -2125,6 +2162,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           s.improveDone = cycle
           s.improveTotal += 1
           s.lastImprovedAt = Date.now()
+          s.improveActive = true
+          if (cycle >= cfg.improveCycles) s.improvedAt = 0 // will be set when this cycle ends
           s.nudges += 1
           log("info", "improvement pass", { sessionID, cycle: `${cycle}/${cfg.improveCycles}` })
           schedule(sessionID, cfg.nudgeDelayMs, {
@@ -2171,6 +2210,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           s.improveDone = cycle
           s.improveTotal += 1
           s.lastImprovedAt = Date.now()
+          s.improveActive = true
           s.nudges += 1
           s.noTodoImproveFired = true
           log("info", "no-todo autopilot: improvement pass on a non-todo model", {
