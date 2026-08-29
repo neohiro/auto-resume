@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.13"
+const AUTO_RESUME_VERSION = "1.13.14"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1116,6 +1116,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         toolErrs: 0, debugArmed: false, toolRunning: false,
         lastTurnHadText: false,
         retryEnteredAt: 0, retryNext: 0, child: false, reanimated: false,
+        rearmTimer: null, compactionTimer: null,
         userStopped: false, takeoverAt: 0,
         lastInjectKind: null,
         lastEvalSig: null,
@@ -1136,6 +1137,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const improveDone = followUp ? s.improveDone : 0
     const improveTotal = followUp ? s.improveTotal : 0
     const lastImprovedAt = followUp ? s.lastImprovedAt : 0
+    // Drop any pending rearm/compaction-watchdog timers from the previous
+    // task. Without this they fire on the new task, observe chain === 0
+    // (the condition is no longer met), and just sit in memory as a
+    // useless closure holding the old state until they expire.
+    if (s.rearmTimer) { clearTimeout(s.rearmTimer); s.rearmTimer = null }
+    if (s.compactionTimer) { clearTimeout(s.compactionTimer); s.compactionTimer = null }
     Object.assign(s, {
       chain: 0, continueCount: 0, compactAttempted: false,
       rlStreak: 0, failStreak: 0, rotations: 0,
@@ -1852,13 +1859,16 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           await summarizeWith(alt)
           log("info", "compaction requested on alternate model", { sessionID, model: modelKey(alt) })
         }
-        setTimeout(() => {
+        if (s.compactionTimer) clearTimeout(s.compactionTimer)
+        s.compactionTimer = setTimeout(() => {
           const cur = state(sessionID)
+          if (cur.compactionTimer) cur.compactionTimer = null
           if (cur.awaitingCompactionSince) {
             cur.awaitingCompactionSince = 0
             notice(`${RESUME_TAG}: Compaction did not complete — not resuming.`, "error")
           }
-        }, 180_000).unref?.()
+        }, 180_000)
+        s.compactionTimer.unref?.()
       }, "summarize")
       return
     }
@@ -1895,8 +1905,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       // must not permanently kill recovery until the user returns.
       if (!s.gaveUpRearmed && !suppressed(sessionID)) {
         s.gaveUpRearmed = true
-        const t = setTimeout(() => {
+        if (s.rearmTimer) clearTimeout(s.rearmTimer)
+        s.rearmTimer = setTimeout(() => {
           const cur = state(sessionID)
+          if (cur.rearmTimer) cur.rearmTimer = null
           if (cur.chain >= cfg.maxChain &&
               cur.lastResumeAt <= s.lastErrorAt && !suppressed(sessionID)) {
             cur.chain = 0
@@ -1904,7 +1916,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
             schedule(sessionID, jitter(cfg.baseDelayMs), { kind: "resume", prompt: PROMPTS.resume })
           }
         }, cfg.rearmMs)
-        t.unref?.()
+        s.rearmTimer.unref?.()
       }
       return
     }
@@ -2306,16 +2318,20 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       setTimeout(() => schedule(sessionID, 800, plan), 1_500).unref?.()
     }, "takeover-abort")
   }
-
   const checkStalls = () => {
     const nowMs = Date.now()
     // Memory hygiene: drop state for sessions that have been idle for hours.
     for (const [sessionID, s] of sessions) {
       if (s.status === "busy" || s.status === "retry") continue
       if (nowMs - s.lastActivity > 21_600_000) {
+        // Drop any orphaned timers first so the closures don't outlive the
+        // session and fire into a deleted state.
+        if (s.rearmTimer) { clearTimeout(s.rearmTimer); s.rearmTimer = null }
+        if (s.compactionTimer) { clearTimeout(s.compactionTimer); s.compactionTimer = null }
         sessions.delete(sessionID)
         knownTitles.delete(sessionID)
-        writtenTitles.delete(sessionID)
+        writtenTitles.delete(sessionID)
+
         for (const k of dirAskCounts.keys()) {
           if (k.startsWith(`${sessionID}|`)) dirAskCounts.delete(k)
         }
@@ -2845,24 +2861,41 @@ export const AutoResumePlugin = async ({ client, $ }) => {
             const s = sessions.get(p.sessionID)
             if (s?.awaitingCompactionSince) {
               s.awaitingCompactionSince = 0
+              if (s.compactionTimer) { clearTimeout(s.compactionTimer); s.compactionTimer = null }
               log("info", "compaction done, resuming", { sessionID: p.sessionID })
               schedule(p.sessionID, 3_000, { kind: "resume", prompt: PROMPTS.resume })
             }
             break
           }
-
           case "session.deleted": {
-            const id = p.info?.id ?? p.sessionID
+            // Match the rest of the file: session events use p.sessionID.
+            // Previously this read p.info?.id, which was a no-op when the
+            // payload shape was flat — the entire cleanup (permissionPending,
+            // stores, timers, dirAskCounts) silently skipped, leaking
+            // everything in-memory for that session.
+            const id = p.sessionID ?? p.info?.id
             if (id) {
+              // Orphaned timers (rearm / compaction-watchdog) hold closures
+              // over the session state; clear them BEFORE we drop the
+              // session so a no-op run on a deleted session can't touch
+              // live state later.
+              const s = sessions.get(id)
+              if (s?.rearmTimer) { clearTimeout(s.rearmTimer); s.rearmTimer = null }
+              if (s?.compactionTimer) { clearTimeout(s.compactionTimer); s.compactionTimer = null }
               sessions.delete(id)
               permissionPending.delete(id)
-              const hadMarker = persistedStops.delete(id) || offStore.map.delete(id)
+              const hadMarker =
+                persistedStops.delete(id) ||
+                offStore.map.delete(id) ||
+                pauseStore.map.delete(id)
               if (hadMarker) {
                 stopStore.save()
                 offStore.save()
+                pauseStore.save()
               }
               knownTitles.delete(id)
-              writtenTitles.delete(id)
+              writtenTitles.delete(id)
+
               for (const k of dirAskCounts.keys()) {
                 if (k.startsWith(`${id}|`)) dirAskCounts.delete(k)
               }
