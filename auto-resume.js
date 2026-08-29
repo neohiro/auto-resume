@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.16"
+const AUTO_RESUME_VERSION = "1.13.17"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1939,8 +1939,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       // Bounded self-re-arm for unattended runs: after a cool-down, reset the
       // chain and try ONCE more — long outages (502 storms, provider blips)
       // must not permanently kill recovery until the user returns. We also
-      // reset stallResumes here: the takeover cap (3) is a within-task
-      // anti-loop, NOT a hard kill — a long-afk session that hit the cap
+      // reset stallResumes here: the within-task takeover cap of 2 is a
+      // anti-loop guard, NOT a hard kill — a session that hit the cap
       // should get a fresh budget after the rearm window.
       if (!s.gaveUpRearmed && !suppressed(sessionID)) {
         s.gaveUpRearmed = true
@@ -1977,15 +1977,18 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     }
     return denyListCache
   }
-  // Stable delimiter for permission fingerprinting — avoids JSON.stringify on
-  // every permission event.  Using \x00 (null byte) as separator since permission
-  // titles, metadata, and call IDs are plain text and can't contain null bytes.
+  // Fingerprint for permission-based lookups.  Uses JSON for the outer structure
+  // so no byte in title or metadata can collide with the field boundary — a
+  // metadata string containing '\x00' would be indistinguishable from a metadata
+  // object whose JSON has '\x00' at the same offset (e.g. a directory named
+  // 'foo\x00bar' vs the object {foo:'bar'}).  JSON-encoding the outer array
+  // eliminates that ambiguity without changing the deny-list semantics.
   // Only includes title + metadata (not the tool name) to avoid false hits from
-  // tool names like "external_directory" matching denylist fragments.
+  // tool names like 'external_directory' matching denylist fragments.
   const permFingerprint = (perm) => {
     const meta = perm.metadata
     const metaStr = meta == null ? "" : Array.isArray(meta) ? meta.join(" ") : typeof meta === "object" ? JSON.stringify(meta) : String(meta)
-    return `${perm.title ?? ""}\x00${metaStr}`.toLowerCase()
+    return JSON.stringify([String(perm.title ?? ""), metaStr]).toLowerCase()
   }
 
   const looksDangerous = (perm) => {
