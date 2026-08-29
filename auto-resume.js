@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.10"
+const AUTO_RESUME_VERSION = "1.13.11"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -501,6 +501,14 @@ const jitter = (ms) => Math.round(ms + ms * 0.25 * (Math.random() * 2 - 1))
 
 const psQuote = (s) => "'" + String(s).replace(/'/g, "''") + "'"
 
+// WSL marker regex compiled once (used on every Linux notification dispatch).
+const WSL_PROBE_RE = /microsoft|wsl/i
+// Free/unlimited model-id markers — compiled once, used per-model in the
+// rotation rank function.  Model ids are short so a substring match is
+// enough; these never anchor.
+const UNLIMITED_RE = /unlimited/
+const FREE_RE = /free/
+
 /** PowerShell source for one Windows notification: tries the modern WinRT
  *  toast first; if the AUMID is blocked (common on hardened builds), falls
  *  back to a NotifyIcon balloon tip, which Windows 10/11 render as a toast. */
@@ -694,7 +702,7 @@ export const createOsNotifier = ({
       }
       // Linux/BSD: WSL hosts delegate to Windows PowerShell; bare metal uses
       // libnotify first and the raw D-Bus Notifications API as fallback.
-      if (/microsoft|wsl/i.test(await wslProbe())) {
+      if (WSL_PROBE_RE.test(await wslProbe())) {
         await runPowerShellToast("powershell.exe", title, message)
         return true
       }
@@ -1155,7 +1163,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   const NOTICE_LEVEL = { info: "info", success: "info", warning: "warn", error: "error" }
   const notice = (message, variant = "warning") => {
     const nowMs = Date.now()
-    if (cfg.noticeThrottleMs > 0 && nowMs - lastNoticeAt < cfg.noticeThrottleMs) return
+    if (cfg.noticeThrottleMs > 0 && nowMs - lastNoticeAt < cfg.noticeThrottleMs) {
+      log("debug", `notice throttled (${Math.round(cfg.noticeThrottleMs / 1000)}s gap): ${message.slice(0, 80)}`)
+      return
+    }
     lastNoticeAt = nowMs
     log(NOTICE_LEVEL[variant] ?? "warn", message)
   }
@@ -1416,8 +1427,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       // 2 = free, 3 = same-provider, 4 = other-provider.
       if (chainSet.has(modelKey(m))) return 0
       const id = String(m.modelID ?? "").toLowerCase()
-      if (/unlimited/.test(id)) return 1
-      if (/free/.test(id)) return 2
+      if (UNLIMITED_RE.test(id)) return 1
+      if (FREE_RE.test(id)) return 2
       if (exhausted && m.providerID === exhausted.providerID) return 3
       return 4
     }
@@ -1874,13 +1885,27 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     }
     return denyListCache
   }
+  // Stable delimiter for permission fingerprinting — avoids JSON.stringify on
+  // every permission event.  Using \x00 (null byte) as separator since permission
+  // titles, metadata, and call IDs are plain text and can't contain null bytes.
+  // Only includes title + metadata (not the tool name) to avoid false hits from
+  // tool names like "external_directory" matching denylist fragments.
+  const permFingerprint = (perm) => {
+    const meta = perm.metadata
+    const metaStr = meta == null ? "" : Array.isArray(meta) ? meta.join(" ") : typeof meta === "object" ? JSON.stringify(meta) : String(meta)
+    return `${perm.title ?? ""}\x00${metaStr}`.toLowerCase()
+  }
+
   const looksDangerous = (perm) => {
-    const blob = JSON.stringify({ t: perm.title, m: perm.metadata, c: perm.callID, p: perm.permission }).toLowerCase()
+    const blob = permFingerprint(perm)
+    // Cap at 4 KB so user-controlled regexes from OPENCODE_AUTOPILOT_EXTRA_DENY
+    // can't cause catastrophic backtracking (Redos).  Perm titles are short.
+    const capped = blob.length > 4096 ? blob.slice(0, 4096) : blob
     return denyList().some((entry) => {
       if (entry.startsWith("re:")) {
-        try { return new RegExp(entry.slice(3), "i").test(blob) } catch { return false }
+        try { return new RegExp(entry.slice(3), "i").test(capped) } catch { return false }
       }
-      return blob.includes(entry.toLowerCase())
+      return capped.includes(entry.toLowerCase())
     })
   }
 
@@ -1952,7 +1977,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     /[\\/]library[\\/]keychains?([\\/"']|$)/i,
   ]
   const sensitiveDirHit = (perm) => {
-    const blob = JSON.stringify({ t: perm.title, m: perm.metadata }).toLowerCase()
+    const blob = permFingerprint(perm)
     return SENSITIVE_DIR_RES.some((re) => re.test(blob))
   }
 
@@ -2235,6 +2260,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         const tt = titleTimers.get(sessionID)
         if (tt) clearTimeout(tt)
         titleTimers.delete(sessionID)
+        const pt = timers.get(sessionID)
+        if (pt) clearTimeout(pt)
+        timers.delete(sessionID)
+        permissionPending.delete(sessionID)
       }
     }
     for (const [sessionID, s] of sessions) {
