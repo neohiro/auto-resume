@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.14"
+const AUTO_RESUME_VERSION = "1.13.15"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -326,6 +326,17 @@ const MAX_TOKENS_PATTERNS = [
 
 /** Model ids that look like non-chat endpoints and must never receive prompts. */
 const NON_CHAT_PATTERN = /embed|whisper|tts|speech|transcri|image|imagen|dall|moderation|guard|rerank|vision-only|caption/i
+
+/** Router aggregators (OpenRouter, Groq, LiteLLM, etc.): the user's request
+ *  hits an upstream provider they don't directly pay, so a single brief
+ *  provider outage, a 429 from one upstream, or a quota exhaustion on the
+ *  FREE TIER behind the router can take a while to clear.  When we detect
+ *  one of these we (a) wait longer between retries, (b) compact the prompt
+ *  one extra time before giving up, and (c) escalate to bare "Continue"
+ *  only on the 4th attempt (not the 3rd) so the cost-saving variants have
+ *  one more chance.  Matched against either the provider id or the model id
+ *  so a user can name a custom provider that fronts these services. */
+const ROUTER_RE = /\b(openrouter|groq|litellm|portkey|together|deepinfra|anyscale|fireworks|octoai|replicate|cohere|perplexity|mistral|nousresearch|openai|anthropic|google|gemini|meta|llama|qwen|deepseek)\b/i
 
 /** Capability-tier hints used to prefer the strongest variant of a family.
  *  Word-boundary matched against the model id, case-insensitive. */
@@ -1385,6 +1396,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   // ── model catalog + rotation ───────────────────────────────────────
   const modelKey = (m) => `${m.providerID}/${m.modelID}`
   const cooling = (key) => (modelCooldown.get(key) ?? 0) > Date.now()
+  const isRouter = (m) => {
+    if (!m) return false
+    const id = String(m.providerID ?? "").toLowerCase()
+    const mid = String(m.modelID ?? "").toLowerCase()
+    return ROUTER_RE.test(id) || ROUTER_RE.test(mid)
+  }
 
   /** Pick the right prompt + model-note for an auto-resume injection.
    *  - sessionID: needed to read the (now-current) model state
@@ -1776,20 +1793,35 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       }
 
       // No rotation possible.  Cascade: compact → compact → Continue.
-      // Step 1 & 2: compact lowBudget (always for the first two attempts).
-      if (!sameBudget || s.lowBudgetStreak < 2) {
+      // Routers (OpenRouter, Groq, etc.) hide per-upstream capacity behind a
+      // single API: a brief outage on one upstream can throttle the WHOLE
+      // router for minutes. Give the cascade one extra compact attempt on
+      // a router so we don't burn straight through to bare "Continue" on
+      // what is usually a transient issue. Direct providers keep the 2+1
+      // cascade (their errors are usually permanent and an extra round is
+      // wasted tokens).
+      const compactRounds = isRouter(s.currentModel ?? s.lastModel) ? 3 : 2
+      if (!sameBudget || s.lowBudgetStreak < compactRounds) {
         if (sameBudget) s.lowBudgetStreak += 1
         else { s.lowBudgetStreak = 1; s.lowBudgetSig = sig }
         s.lowBudgetLastFired = false
-        schedule(sessionID, cfg.baseDelayMs, {
+        // Routers get a longer settle between compact attempts so the
+        // upstream has time to refill its token bucket; direct providers
+        // use the default short backoff (their errors usually don't clear).
+        const base = isRouter(s.currentModel ?? s.lastModel)
+          ? Math.max(cfg.baseDelayMs, 15_000)
+          : cfg.baseDelayMs
+        schedule(sessionID, base, {
           kind: "lowBudget",
           prompt: buildResumePrompt(sessionID, kind, error, false, null),
         })
         return
       }
 
-      // Step 3: same budget hit three times → bare "Continue" (8 chars, no tag).
-      if (s.lowBudgetStreak === 2) {
+      // Final attempt: same budget hit (compactRounds + 1) times → bare
+      // "Continue" (8 chars, no tag).  For routers this is attempt 5;
+      // for direct providers attempt 4.
+      if (s.lowBudgetStreak === compactRounds) {
         s.lowBudgetStreak += 1
         s.lowBudgetLastFired = true
         schedule(sessionID, cfg.baseDelayMs, {
@@ -1800,7 +1832,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         return
       }
 
-      // Step 4: everything failed.
+      // Everything failed.
       s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = false
       notice(`${RESUME_TAG}: Token/credit budget too tight — ${isCredits ? sig : "quota exhausted"}. Manual intervention required.`, "error")
       return
@@ -1815,7 +1847,14 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       const rlFrom = s.lastModel ? modelKey(s.lastModel) : null
       if (await rotateAwayFrom(sessionID, isExplicitRateLimit ? "rate limit exceeded" : "repeated rate limits")) {
         s.rlStreak = 0
-        schedule(sessionID, jitter(Math.min(cfg.baseDelayMs, 15_000)), { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, rlFrom) })
+        // Routers (OpenRouter, Groq, etc.) wrap many upstreams behind one
+        // quota. A 429 from a single upstream can throttle the whole router
+        // for a minute, so we wait longer before retrying. Direct providers
+        // get the 15s cap (their rate-limits usually clear faster).
+        const rlDelay = isRouter(s.currentModel ?? s.lastModel)
+          ? Math.max(cfg.baseDelayMs, 45_000)
+          : Math.min(cfg.baseDelayMs, 15_000)
+        schedule(sessionID, jitter(rlDelay), { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, rlFrom) })
         return
       }
     }
