@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.12"
+const AUTO_RESUME_VERSION = "1.13.13"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1410,6 +1410,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       catalogFetchedAt = Date.now()
     } catch (err) {
       log("warn", "could not fetch provider catalog", { err: err?.message ?? String(err) })
+      // Stamp the timestamp even on failure so we don't hammer a downed
+      // server, but KEEP the prior cache when one exists — an empty/stale
+      // catalog is better than no catalog at all (rotation just falls back
+      // to the fallback chain). Without this stamp the `[] && <ttl> ` check
+      // above would short-circuit the retry for 5 minutes.
+      catalogFetchedAt = Date.now()
       catalogCache = catalogCache ?? []
     }
     return catalogCache
@@ -1709,6 +1715,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       sessionID, name: error?.name, statusCode: error?.data?.statusCode, message: error?.data?.message,
     })
     queueTitleRefresh(sessionID)
+
+    // An error on the improve turn: the cycle isn't "in flight" anymore
+    // regardless of which kind of error fired. Clear here so the title
+    // drops 🧪 immediately instead of waiting for the next task boundary.
+    s.improveActive = false
 
     if (kind === "abort") {
       if (isOwnTakeoverAbort(s)) {
@@ -2092,6 +2103,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       if (!isOwnTakeoverAbort(s)) {
         markUserStopped(sessionID, "assistant message carries an abort error")
       }
+      // Aborted improve cycle: the cycle is no longer "in flight" regardless
+      // of the stop origin (user or our own takeover). Clearing the flag here
+      // prevents the title from being stuck at 🧪 until the next task reset.
+      s.improveActive = false
       return
     }
 
@@ -2163,7 +2178,6 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           s.improveTotal += 1
           s.lastImprovedAt = Date.now()
           s.improveActive = true
-          if (cycle >= cfg.improveCycles) s.improvedAt = 0 // will be set when this cycle ends
           s.nudges += 1
           log("info", "improvement pass", { sessionID, cycle: `${cycle}/${cfg.improveCycles}` })
           schedule(sessionID, cfg.nudgeDelayMs, {
@@ -2264,6 +2278,14 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       }
       schedule(sessionID, cfg.nudgeDelayMs, { kind: "empty", prompt: PROMPTS.empty })
     }
+
+    // Failsafe: if the turn ended in any non-success way (empty, errored,
+    // fall-through), the improve cycle is no longer "in flight". Without
+    // this, a non-success end leaves the title pinned at 🧪 until the next
+    // task boundary — masking the actual (non-improving) state of the
+    // session. The success branch already cleared this above; this catches
+    // the errored/empty paths.
+    if (errored || !hasContent) s.improveActive = false
   }
 
   // ── stall + stuck-retry watchdog ───────────────────────────────────
