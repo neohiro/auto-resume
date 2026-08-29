@@ -158,7 +158,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.15"
+const AUTO_RESUME_VERSION = "1.13.16"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1792,26 +1792,24 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         // No model to rotate to — fall through to cascade below.
       }
 
-      // No rotation possible.  Cascade: compact → compact → Continue.
+      // No rotation possible.  Cascade: compact × N → bare Continue.
       // Routers (OpenRouter, Groq, etc.) hide per-upstream capacity behind a
-      // single API: a brief outage on one upstream can throttle the WHOLE
-      // router for minutes. Give the cascade one extra compact attempt on
-      // a router so we don't burn straight through to bare "Continue" on
-      // what is usually a transient issue. Direct providers keep the 2+1
-      // cascade (their errors are usually permanent and an extra round is
-      // wasted tokens).
-      const compactRounds = isRouter(s.currentModel ?? s.lastModel) ? 3 : 2
+      // single API: a brief outage on one upstream can throttle the whole
+      // router for minutes. Give the cascade one extra compact attempt so we
+      // don't burn straight through to bare "Continue" on what is usually a
+      // transient issue. Direct providers keep 2+1 (compact × 2 → Continue).
+      // Routers get 3+1 (compact × 3 → Continue).
+      const routerModel = s.currentModel ?? s.lastModel
+      const compactRounds = isRouter(routerModel) ? 3 : 2
+      const settleBase = isRouter(routerModel)
+        ? Math.max(cfg.baseDelayMs, 15_000)  // let upstream token bucket refill
+        : cfg.baseDelayMs
+
       if (!sameBudget || s.lowBudgetStreak < compactRounds) {
         if (sameBudget) s.lowBudgetStreak += 1
         else { s.lowBudgetStreak = 1; s.lowBudgetSig = sig }
         s.lowBudgetLastFired = false
-        // Routers get a longer settle between compact attempts so the
-        // upstream has time to refill its token bucket; direct providers
-        // use the default short backoff (their errors usually don't clear).
-        const base = isRouter(s.currentModel ?? s.lastModel)
-          ? Math.max(cfg.baseDelayMs, 15_000)
-          : cfg.baseDelayMs
-        schedule(sessionID, base, {
+        schedule(sessionID, settleBase, {
           kind: "lowBudget",
           prompt: buildResumePrompt(sessionID, kind, error, false, null),
         })
@@ -1819,8 +1817,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       }
 
       // Final attempt: same budget hit (compactRounds + 1) times → bare
-      // "Continue" (8 chars, no tag).  For routers this is attempt 5;
-      // for direct providers attempt 4.
+      // "Continue".  Routers: attempt 5; direct: attempt 4.
       if (s.lowBudgetStreak === compactRounds) {
         s.lowBudgetStreak += 1
         s.lowBudgetLastFired = true
@@ -2174,6 +2171,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       s.gaveUpRearmed = false
       s.budgetNotified = false
       s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = false
+      s.emptyStreak = false  // recovered — clear the empty-loop latch
 
       // Self-improvement: a clean turn closes out the in-flight improve
       // cycle. If that was the LAST scheduled cycle, latch improvedAt so the
@@ -2319,15 +2317,24 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       return
     }
 
-    if (!errored && !hasContent && s.lastResumeAt && s.emptyNudges < 2) {
-      s.emptyNudges += 1
-      log("info", "empty response detected, nudging", { sessionID, emptyNudges: s.emptyNudges })
-      if (s.emptyNudges >= 2) {
-        notice(`${RESUME_TAG}: Two empty responses in a row (likely a context compaction or model loop). Pausing auto-resume — send a new prompt to resume.`, "warning")
-        s.emptyStreak = true
-        return
+    if (!errored && !hasContent && s.lastResumeAt) {
+      // Respond to consecutive empty turns (context compaction, streaming glitch, or
+      // a silent model).  Retry up to 3 times: the first two are a compact
+      // "empty" nudge; the third is an explicit "keep going" nudge that
+      // survives even if the model has nothing queued.  After that the nudges
+      // cap takes over so we don't spam indefinitely.
+      if (s.emptyNudges < 2) {
+        s.emptyNudges += 1
+        log("info", "empty response detected, nudging", { sessionID, emptyNudges: s.emptyNudges })
+        schedule(sessionID, cfg.nudgeDelayMs, { kind: "empty", prompt: PROMPTS.empty })
+      } else if (s.emptyNudges === 2 && s.nudges < cfg.maxNudges) {
+        s.emptyNudges += 1
+        log("info", "still empty after 2 nudges — explicit keep-going", { sessionID })
+        schedule(sessionID, cfg.nudgeDelayMs, { kind: "empty", prompt: PROMPTS.keepGoing })
       }
-      schedule(sessionID, cfg.nudgeDelayMs, { kind: "empty", prompt: PROMPTS.empty })
+      // Mark the session as stuck; cleared by any content-bearing response so
+      // the flag doesn't poison the next idle evaluation after we recover.
+      s.emptyStreak = true
     }
 
     // Failsafe: if the turn ended in any non-success way (empty, errored,
