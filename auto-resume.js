@@ -1938,7 +1938,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       notice(`${RESUME_TAG}: Gave up after ${s.chain} recovery attempts (${kind}). Send a message to try manually.`, "error")
       // Bounded self-re-arm for unattended runs: after a cool-down, reset the
       // chain and try ONCE more — long outages (502 storms, provider blips)
-      // must not permanently kill recovery until the user returns.
+      // must not permanently kill recovery until the user returns. We also
+      // reset stallResumes here: the takeover cap (3) is a within-task
+      // anti-loop, NOT a hard kill — a long-afk session that hit the cap
+      // should get a fresh budget after the rearm window.
       if (!s.gaveUpRearmed && !suppressed(sessionID)) {
         s.gaveUpRearmed = true
         if (s.rearmTimer) clearTimeout(s.rearmTimer)
@@ -1948,6 +1951,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           if (cur.chain >= cfg.maxChain &&
               cur.lastResumeAt <= s.lastErrorAt && !suppressed(sessionID)) {
             cur.chain = 0
+            cur.stallResumes = 0
             log("info", "post-give-up re-arm — retrying recovery", { sessionID })
             schedule(sessionID, jitter(cfg.baseDelayMs), { kind: "resume", prompt: PROMPTS.resume })
           }
@@ -2338,11 +2342,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     }
 
     // Failsafe: if the turn ended in any non-success way (empty, errored,
-    // fall-through), the improve cycle is no longer "in flight". Without
-    // this, a non-success end leaves the title pinned at 🧪 until the next
-    // task boundary — masking the actual (non-improving) state of the
-    // session. The success branch already cleared this above; this catches
-    // the errored/empty paths.
+    // fall-through), the improve cycle is no longer "in flight". Without this,
+    // a non-success end leaves the title pinned at 🧪 until the next task
+    // boundary — masking the actual state of the session. The success branch
+    // already cleared this above; this catches the errored/empty paths.
     if (errored || !hasContent) s.improveActive = false
   }
 
