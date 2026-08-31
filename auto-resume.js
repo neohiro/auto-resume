@@ -172,8 +172,7 @@
  *  OPENCODE_AUTOPILOT_IMPROVE_COOLDOWN_MS cooldown before re-arm    (600000 = 10min)
  *  OPENCODE_AUTOPILOT_MAX_NUDGES         max self-driven nudges/task(25)
  *  OPENCODE_AUTOPILOT_BUDGET_MS          wall-clock budget per task (28800000 = 8h, 0=off)
- *  OPENCODE_RESUME_AUTO_UPDATE           self-update daily from GitHub (false — set true
- *                                        to re-enable after pushing changes upstream)
+ *  OPENCODE_RESUME_AUTO_UPDATE           self-update daily from GitHub (true)
  *  OPENCODE_RESUME_STOPSTORE             user-stop memory file
  *                                        (<plugin dir>/auto-resume.js.stopped.json)
  *  OPENCODE_RESUME_OFFSTORE              per-session opt-out memory file
@@ -221,7 +220,7 @@ const DEFAULTS = {
   breakerCooldownMs: 300_000,
   compactOnOverflow: true,
   noticeThrottleMs: 3_000,
-  autoUpdate: false, // disabled until changes are pushed upstream (neohiro/auto-resume)
+  autoUpdate: true, // pulls latest from neohiro/auto-resume on daily schedule
   maxTaskCostUsd: 10,
   switchOnQuota: true,
   switchOnRateLimit: true,
