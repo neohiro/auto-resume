@@ -238,3 +238,5 @@ Additional hardening that keeps agents running unattended:
 
 [MIT](LICENSE)
 
+
+[![Visitors](https://api.visitorbadge.io/api/visitors?path=github.com/neohiro/auto-resume&label=Visitors&countColor=%23263759)](https://visitorbadge.io/status?path=github.com/neohiro/auto-resume)
