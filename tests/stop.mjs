@@ -302,4 +302,24 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ;["OPENCODE_RESUME_THINK_STALL_MS", "OPENCODE_RESUME_WATCHDOG_MS"].forEach((k) => delete process.env[k])
 }
 
+// ---- S14: race condition — session.idle fires BEFORE session.error (abort) -----
+// This tests the fix for: when user hits Stop, OpenCode may fire session.idle
+// before session.error. The evaluateIdle must not schedule nudges in that window.
+{
+  const state = makeState()
+  // Session has an empty assistant response (no content) to trigger empty nudge
+  state.messagesBySession.s14 = [{
+    info: { role: "assistant", error: null, id: "m1" },
+    parts: [], // empty response — would trigger empty nudge if not stopped
+  }]
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  // Fire session.idle FIRST (race condition: idle before error)
+  await hooks.event(ev("session.idle", { sessionID: "s14" }))
+  // Then fire session.error with abort (user hit Stop)
+  await hooks.event(ev("session.error", { sessionID: "s14", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
+  await sleep(350)
+  ok(state.prompts.length === 0, "S14: no empty nudge when idle fires before abort error")
+  ok(state.logs.some((t) => t.includes("Stopped by you")), "S14: stop acknowledged")
+}
+
 console.log(process.exitCode ? "STOP TESTS FAILED" : "ALL STOP TESTS PASSED")

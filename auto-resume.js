@@ -2179,6 +2179,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       entries = (res?.data ?? res) ?? []
     } catch { return }
 
+    // Re-check suppression after the async fetch — the session may have been
+    // stopped by a concurrent session.error handler while we were waiting.
+    if (suppressed(sessionID)) return
+
     let lastAssistant = null
     for (let i = entries.length - 1; i >= 0; i -= 1) {
       if (entries[i]?.info?.role === "assistant") { lastAssistant = entries[i]; break }
