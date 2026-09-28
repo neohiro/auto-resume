@@ -265,4 +265,96 @@ const ev = (type, properties) => ({ event: { type, properties } })
     "T8: new user task on recovered session shows 🟢, not a latched 🔁")
 }
 
+// ---- T9: ❓ asking glyph shown on question, cleared on user action --------
+{
+  process.env.OPENCODE_RESUME_OFFSTORE = titleOff0
+  const state = makeState(["qna"])
+  state.baseTitles.qna = "Refactor auth"
+  state.messagesBySession.qna = [{
+    info: { role: "assistant", error: null },
+    parts: [{ type: "text", text: "Should I proceed with the migration?" }],
+  }]
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  await hooks.event(ev("message.part.updated", {
+    part: { type: "text", sessionID: "qna", text: "Should I proceed with the migration?" },
+  }))
+  await hooks.event(ev("session.idle", { sessionID: "qna" }))
+  await sleep(400)
+  const qnaTitle = () => String(state.titles.qna ?? "")
+  ok(qnaTitle().includes("❓") && qnaTitle().includes("[auto-resume: asking]"),
+    "T9: ❓ asking glyph shown when model asks a question")
+  // user types an answer — cancelPending clears askingSince and queues
+  // the title refresh; no session.idle needed (cancelPending handles it)
+  await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "qna", id: "uq1" } }))
+  // give cancelPending's queued refresh time to fire (250ms debounce)
+  await sleep(450)
+  const afterUser = () => String(state.titles.qna ?? "")
+  ok(!afterUser().includes("❓") && afterUser().includes("[auto-resume: armed]"),
+    "T9: user action clears ❓ and returns to 🟢 armed")
+}
+
+// ---- T9.3: stubbed continuations do NOT get the ❓ asking glyph ---------
+// Regression: askingSince was set for both `asked` (real questions) and
+// `stubbed` (continuation stubs like "Continue to finalize."). The ❓ glyph
+// is a UX signal meaning "the model asked a question." A continuation stub
+// is not a question, so it should NOT trigger the asking glyph — the user
+// is not being asked anything.
+{
+  process.env.OPENCODE_RESUME_OFFSTORE = titleOff0
+  const state = makeState(["stub"])
+  state.baseTitles.stub = "Finish migration"
+  state.messagesBySession.stub = [{
+    info: { role: "assistant", error: null },
+    parts: [{ type: "text", text: "Continue to finalize." }],
+  }]
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  await hooks.event(ev("message.part.updated", {
+    part: { type: "text", sessionID: "stub", text: "Continue to finalize." },
+  }))
+  await hooks.event(ev("session.idle", { sessionID: "stub" }))
+  await sleep(500)
+  const stubTitle = () => String(state.titles.stub ?? "")
+  // Must show armed (proceed was scheduled), NOT ❓ asking (continuation
+  // stubs are not questions — askingSince should not be set for stubbed).
+  ok(stubTitle().includes("[auto-resume: armed]") && !stubTitle().includes("❓"),
+    "T9.3: stubbed continuation (no question mark) does not show ❓ asking glyph")
+}
+
+// ---- T9.2: ❓ clears on a clean next turn, not just user action ----------
+// Regression: askingSince has TWO clear paths (cancelPending + noteSuccess
+// on a clean turn). T9 covers the first; this covers the second. If the
+// clean-turn clear path is broken, the glyph latches ❓ after the model
+// answers its own question.
+{
+  process.env.OPENCODE_RESUME_OFFSTORE = titleOff0
+  const state = makeState(["q2"])
+  state.baseTitles.q2 = "API redesign"
+  state.messagesBySession.q2 = [{
+    info: { role: "assistant", error: null },
+    parts: [{ type: "text", text: "Should I proceed with v2 of the API?" }],
+  }]
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  await hooks.event(ev("message.part.updated", {
+    part: { type: "text", sessionID: "q2", text: "Should I proceed with v2 of the API?" },
+  }))
+  await hooks.event(ev("session.idle", { sessionID: "q2" }))
+  await sleep(400)
+  ok(state.titles.q2?.includes("❓"),
+    "T9.2 precondition: ❓ asking glyph shown")
+  // model self-resolved with a clean turn — replace messages so the next
+  // idle evaluates a fresh non-error assistant turn
+  state.messagesBySession.q2 = [{
+    info: { role: "assistant", error: null, id: "m2" },
+    parts: [{ type: "text", text: "v2 of the API is now in place." }],
+  }]
+  await hooks.event(ev("message.part.updated", {
+    part: { type: "text", sessionID: "q2", text: "v2 of the API is now in place." },
+  }))
+  await hooks.event(ev("session.idle", { sessionID: "q2" }))
+  await sleep(450)
+  const q2Title = () => String(state.titles.q2 ?? "")
+  ok(!q2Title().includes("❓") && q2Title().includes("[auto-resume: armed]"),
+    "T9.2: clean turn clears ❓ and returns to 🟢 armed")
+}
+
 console.log(process.exitCode ? "TITLE TESTS FAILED" : "ALL TITLE TESTS PASSED")

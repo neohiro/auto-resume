@@ -352,6 +352,39 @@ const ev = (type, properties) => ({ event: { type, properties } })
   delete process.env.OPENCODE_AUTOPILOT_MAX_NUDGES
 }
 
+// ---- P6: permission via CLIENT ROOT method (not client.session) ---------------
+// Regression: OpenCode's SDK exposes postSessionIdPermissionsPermissionId at
+// the TOP LEVEL (client.postSessionIdPermissionsPermissionId), not under
+// client.session. The plugin previously only scanned client.session and silently
+// failed on all real clients. Both paths are now scanned.
+{
+  const rootPermCalled = []
+  const testClient = {
+    app: { log: async () => true },
+    config: { providers: async () => ({ data: { providers: [] } }) },
+    postSessionIdPermissionsPermissionId: async ({ path, body }) => {
+      rootPermCalled.push({ sessionID: path.id, permissionID: path.permissionID, response: body.response })
+      return true
+    },
+    session: {
+      status: async () => ({ data: {} }),
+      prompt: async () => ({ data: {} }),
+      messages: async () => ({
+        data: [{ info: { role: "assistant", error: null }, parts: [{ type: "text", text: "ok" }] }],
+      }),
+    },
+  }
+  const hooks = await AutoResumePlugin({ client: testClient })
+  await hooks.event(ev("permission.updated", {
+    id: "root1", sessionID: "rtest", type: "bash", title: "ls",
+    metadata: { command: "npm install" },
+  }))
+  await sleep(200)
+  const byPerm = Object.fromEntries(rootPermCalled.map((r) => [r.permissionID, r.response]))
+  ok(byPerm.root1 === "once",
+    "P6: safe bash approved via client root-level permission method")
+}
+
 console.log(process.exitCode ? "V2 TESTS FAILED" : "ALL V2 TESTS PASSED")
 
 

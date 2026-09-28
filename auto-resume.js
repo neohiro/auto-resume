@@ -72,7 +72,11 @@
  *   • AUTONOMY DIRECTIVE: every injected prompt instructs the model to make
  *     its own decisions, never wait for confirmation, document assumptions
  *   • AUTO-PROCEED: if the agent ends its turn by asking a question
- *     ("Should I proceed...?"), it answers itself and continues (capped)
+ *     ("Should I proceed...?"), it answers itself and continues (capped).
+ *     While the model is asking, the session title is decorated with a
+ *     ❓ "asking" glyph; the moment the user sends a message OR the next
+ *     turn resolves the chain, the glyph clears (armed/recovering/etc.
+ *     takes over) so the user always sees the real state.
  *   • WRAP-UP: when the todo list completes → asks once for concrete
  *     improvement proposals (listed, not implemented) + success notice
  *   • BEYOND EXPECTATIONS: before wrapping up, runs a self-critique pass —
@@ -158,7 +162,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.17"
+const AUTO_RESUME_VERSION = "1.13.18"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -875,9 +879,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   // disambiguates the cause in the trailing label — the leading character
   // never changes between pause causes, only the text inside the brackets.
   // 🟢🔁⏸️⏳💰📋🧪💤🔴 are the active/armed/recovering glyphs; 🚫 is the
-  // universal "paused by auto-resume" signal.
-  const GLYPH_LEAD_RE = /^\s*(?:🟢|🔁|⏸️|🚫|⏳|💸|🔕|🪙|📋|🧪|✅|🏁|🔄|⏱|💤|🟡|🔴)\s+/u
+  // universal "paused by auto-resume" signal; ❓ is the model-is-asking
+  // state (set on question-pattern detection, cleared on user action or
+  // the next clean turn).
+  const GLYPH_LEAD_RE = /^\s*(?:🟢|🔁|⏸️|🚫|⏳|💸|🔕|🪙|📋|🧪|✅|🏁|🔄|⏱|💤|🟡|🔴|❓)\s+/u
   const STATUS_STYLE = {
+    asking:      { glyph: "❓", label: "asking" },
     armed:        { glyph: "🟢", label: "armed" },
     recovering:   { glyph: "🔁", label: "recovering" },
     // User active stop (mid-turn): ⏸️ — the core Stop button was pressed.
@@ -943,6 +950,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     if (s?.improvedAt > 0 && (s?.improveDone ?? 0) >= (cfg.improveCycles ?? 1)) {
       if (Date.now() - s.improvedAt < 180_000) return "improved"
     }
+
+    // Model asked a question (❓): set when the plugin detects a question
+    // pattern and schedules an auto-proceed. Cleared immediately when the user
+    // sends a new prompt or the next assistant turn resolves the chain.
+    if (s?.askingSince) return "asking"
 
     // Active recovery: 🔁 only while something is genuinely happening and
     // no more-specific armed sub-state is active.
@@ -1132,6 +1144,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         lastInjectKind: null,
         lastEvalSig: null,
         lastUserPromptAt: 0,
+        askingSince: null,
         userPaused: false,
         taskCost: 0, costNotified: false, budgetNotified: false, gaveUpRearmed: false,
         lowBudgetStreak: 0, lowBudgetSig: null, lowBudgetLastFired: false,
@@ -1161,6 +1174,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       lastDriveCompleted: -1, proposalSent: false,
       improveDone, improveTotal, lastImprovedAt,
       improveActive: false, improvedAt: 0, // 🧪 running, ✅ just-finished window
+      askingSince: null,
       proceedCount: 0, taskStartAt: Date.now(), toolErrs: 0,
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
       userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costNotified: false,
@@ -1592,6 +1606,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     if (s) {
       s.pendingResume = false
       s.lastUserPromptAt = Date.now()
+      if (s.askingSince) {
+        s.askingSince = null
+        queueTitleRefresh(sessionID)
+      }
     }
     if (t) log("info", `cancelled pending auto-injection — ${why}`, { sessionID })
   }
@@ -2014,24 +2032,51 @@ export const AutoResumePlugin = async ({ client, $ }) => {
    *  candidates are probed IN ORDER until one resolves — a wrong-shape call
    *  rejecting must not strand the ask. */
   const respondToPermission = async (sessionID, perm, response, why) => {
-    const ns = client.session ?? {}
-    // Known names first (SDK drift across versions), then any other
-    // permission-ish method as last resort. Deduped: the scan would otherwise
-    // re-add the primary and retry a known-bad shape needlessly.
-    const fns = [...new Set([
-      ns.postSessionByIdPermissionsByPermissionId,
-      ns.respondToPermission,
-      ns.postSessionIdPermissionsPermissionId,
-      ...Object.keys(ns)
-        .filter((k) => /permission/i.test(k) && typeof ns[k] === "function")
-        .map((k) => ns[k]),
-    ])].filter((f) => typeof f === "function")
+    // Probe the CLIENT ROOT (not client.session) — the permission method lives
+    // at the top level in OpenCode's SDK (postSessionIdPermissionsPermissionId).
+    // client.session has no permission methods; scanning it always returned [].
+    const root = client ?? {}
+    const sessionNS = client?.session ?? {}
+    // Track the receiver for each function so we can call it with the right
+    // `this`. The OpenCode SDK methods don't actually use `this` (they reach
+    // a global fetch via module-scope), so picking the wrong receiver is
+    // harmless — but doing it correctly future-proofs against any client
+    // that does bind state to `this`.
+    const candidates = [
+      [root.postSessionIdPermissionsPermissionId, root],
+      [sessionNS.postSessionByIdPermissionsByPermissionId, sessionNS],
+      [sessionNS.respondToPermission, sessionNS],
+      [sessionNS.postSessionIdPermissionsPermissionId, sessionNS],
+      ...Object.keys(root)
+        .filter((k) => /permission/i.test(k) && typeof root[k] === "function")
+        .map((k) => [root[k], root]),
+      ...Object.keys(sessionNS)
+        .filter((k) => /permission/i.test(k) && typeof sessionNS[k] === "function")
+        .map((k) => [sessionNS[k], sessionNS]),
+    ]
+    const seen = new Set()
+    const fns = candidates.filter(([f]) => {
+      if (typeof f !== "function" || seen.has(f)) return false
+      seen.add(f)
+      return true
+    })
     if (!fns.length) { log("warn", "permission API unavailable on this opencode version"); return false }
     const permID = permIdOf(perm)
+    // permID is the only path-segment we own; refuse to send an undefined
+    // identifier rather than let the SDK fabricate "session/.../permissions/undefined".
+    // The caller at the permission.updated event also guards this, but
+    // respondToPermission is a public-ish helper and may be called by future
+    // paths (e.g., periodic sweep of stale permissionPending entries).
+    if (!permID) {
+      log("warn", "permission response skipped — missing permID", {
+        sessionID, type: permTypeOf(perm), why,
+      })
+      return false
+    }
     let lastErr
-    for (const fn of fns) {
+    for (const [fn, receiver] of fns) {
       try {
-        await fn.call(ns, {
+        await fn.call(receiver, {
           path: { id: sessionID, permissionID: permID },
           body: { response },
         })
@@ -2179,6 +2224,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       s.budgetNotified = false
       s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = false
       s.emptyStreak = false  // recovered — clear the empty-loop latch
+      s.askingSince = null
 
       // Self-improvement: a clean turn closes out the in-flight improve
       // cycle. If that was the LAST scheduled cycle, latch improvedAt so the
@@ -2212,7 +2258,16 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           if (asked || stubbed) {
             s.proceedCount += 1
             s.nudges += 1
+            // The ❓ "asking" glyph is reserved for actual question turns —
+            // stubs ("Continue to finalize.") aren't a question, the user
+            // isn't being asked anything. Setting askingSince for a stub
+            // would mislead the user into thinking the model is waiting on
+            // them. The notice is already gated to `asked` only.
+            if (asked) s.askingSince = Date.now()
             log("info", asked ? "agent asked a question — proceeding autonomously" : "agent announced continuation but stopped — resuming", { sessionID })
+            if (asked) {
+              notice(`${RESUME_TAG}: model asked — answering autonomously.`, "info")
+            }
             schedule(sessionID, cfg.nudgeDelayMs, {
               kind: "proceed",
               prompt: asked ? PROMPTS.proceed : PROMPTS.keepGoing,
@@ -2222,7 +2277,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         }
       }
 
-        // Full completion → self-improvement passes → wrap-up proposals → notice
+      // Full completion → self-improvement passes → wrap-up proposals → notice
       if ((todos.length > 0 || boxes.length > 0) && open.length === 0 && cbOpen === 0) {
         // Quality passes are EXEMPT from the shared nudge budget: they have
         // their own hard caps (improveCycles / proposalSent), and burning the
