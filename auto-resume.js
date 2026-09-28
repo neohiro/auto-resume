@@ -1538,6 +1538,13 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       log("warn", "no alternate model available", { sessionID })
       return false
     }
+    // A user Stop can land while the catalog lookup is in flight. Rotating
+    // anyway would reset the retry counters and pop a "continuing on <model>"
+    // notice for a session the user just silenced, so bail out quietly.
+    if (suppressed(sessionID)) {
+      log("info", "rotation abandoned — session was stopped by the user", { sessionID, reason })
+      return false
+    }
     s.currentModel = { providerID: alt.providerID, modelID: alt.modelID }
     // Fresh lease on the new model — its reliability is unknown so far.
     s.chain = 0
@@ -1693,6 +1700,17 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const model = s.currentModel ?? s.lastModel
     const body = { parts: [{ type: "text", text: autonomousPrompt(plan) }] }
     if (model) body.model = model
+
+    // Re-check after the session.status() await above. A user Stop that lands
+    // while this plan was mid-flight must cancel the injection outright —
+    // otherwise the prompt is dispatched into a session the user just
+    // silenced, which is exactly the "Stop doesn't stick" behaviour this guard
+    // exists to prevent. (Non-resume kinds skip that await, but re-checking is
+    // free and keeps the invariant local to the dispatch site.)
+    if (suppressed(sessionID)) {
+      log("info", `suppressed "${plan.kind}" — user stopped the session while the plan was in flight`, { sessionID })
+      return
+    }
 
     s.lastInjectKind = plan.kind
     s.lastInjectAt = Date.now() // mark BEFORE dispatch: user-message event arrives at turn start
@@ -2533,6 +2551,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         const r = await client.session.messages({ path: { id: sess.id } })
         entries = (r?.data ?? r) ?? []
       } catch { continue }
+      // The scan is detached and runs at startup, so the user can press Stop
+      // while a session's history is being fetched. Everything below this point
+      // (resetTaskScope, the resume schedules, and the "Revived a session"
+      // notice) is user-visible and none of it re-checks suppression, so a Stop
+      // landing during the await must abandon the revival.
+      if (suppressed(sess.id)) continue
       if (!entries.length) continue
       const lastEntry = entries[entries.length - 1]
       const lastInfo = lastEntry?.info

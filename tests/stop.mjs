@@ -29,7 +29,15 @@ function makeClient(state) {
     ] } }) },
     session: {
       list: async () => ({ data: state.sessionList }),
-      status: async () => ({ data: Object.fromEntries([...state.idleIds].map((id) => [id, { type: "idle" }])) }),
+      status: async () => {
+        // Optional gate: hold the status probe open so a test can land a user
+        // Stop while runPlan is suspended deciding whether to inject.
+        if (state.statusGate) {
+          state.statusGate.entered?.()
+          await state.statusGate.promise
+        }
+        return { data: Object.fromEntries([...state.idleIds].map((id) => [id, { type: "idle" }])) }
+      },
       prompt: async ({ path, body }) => {
         state.prompts.push({ id: path.id, text: body.parts[0].text, model: body.model })
         return { data: {} }
@@ -37,6 +45,14 @@ function makeClient(state) {
       abort: async ({ path }) => { state.aborts.push(path.id); return true },
       summarize: async () => true,
       messages: async ({ path }) => {
+        // Optional gate: hold this session's fetch open so a test can land a
+        // concurrent event while evaluateIdle is suspended on the await.
+        // `entered` resolves once the fetch is actually parked, so the test
+        // can fire at the exact moment the caller is inside the await window.
+        if (state.messageGate && state.messageGate.id === path.id) {
+          state.messageGate.entered?.()
+          await state.messageGate.promise
+        }
         const entries = structuredClone(state.messagesBySession[path.id] ?? [
           { info: { role: "assistant", error: null }, parts: [{ type: "text", text: "ok" }] },
         ])
@@ -303,23 +319,99 @@ const ev = (type, properties) => ({ event: { type, properties } })
 }
 
 // ---- S14: race condition — session.idle fires BEFORE session.error (abort) -----
-// This tests the fix for: when user hits Stop, OpenCode may fire session.idle
-// before session.error. The evaluateIdle must not schedule nudges in that window.
+// Regression guard for the post-await suppression re-check in evaluateIdle().
+//
+// OpenCode can deliver session.idle before the session.error that carries the
+// user's Stop. evaluateIdle() is detached, so it is suspended on
+// `await client.session.messages(...)` while handleError() calls
+// markUserStopped(). Without the re-check, evaluation continues on a session the
+// user just stopped: it burns the nudge budget, latches emptyStreak, and logs a
+// misleading "empty response detected" line.
+//
+// The gate holds the fetch open so the Stop provably lands INSIDE the await
+// window -- without it the fetch resolves before the error is even dispatched
+// and the test passes no matter what the code does.
 {
   const state = makeState()
-  // Session has an empty assistant response (no content) to trigger empty nudge
+  // A resume must already have happened for the empty-nudge path to engage
+  // (it is gated on s.lastResumeAt), so make the session relevant up front.
   state.messagesBySession.s14 = [{
-    info: { role: "assistant", error: null, id: "m1" },
-    parts: [], // empty response — would trigger empty nudge if not stopped
+    info: { role: "assistant", error: null },
+    parts: [{ type: "text", text: "some output" }],
   }]
+  let release
+  let entered
+  const insideFetch = new Promise((r) => { entered = r })
+  state.messageGate = { id: "s14", entered, promise: new Promise((r) => { release = r }) }
   const hooks = await AutoResumePlugin({ client: makeClient(state) })
-  // Fire session.idle FIRST (race condition: idle before error)
+
+  // Arm the session: a real assistant turn with text, then a resume so
+  // lastResumeAt is set and the empty-nudge branch becomes reachable.
+  await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "s14", text: "working" } }))
+  await hooks.event(ev("session.error", { sessionID: "s14", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
+  await sleep(300)
+  state.prompts.length = 0 // forget the recovery injection; only the race matters
+
+  // The turn the user is aborting came back empty.
+  state.messagesBySession.s14 = [{ info: { role: "assistant", error: null }, parts: [] }]
+
+  // session.idle fires FIRST and parks inside the messages() fetch...
   await hooks.event(ev("session.idle", { sessionID: "s14" }))
-  // Then fire session.error with abort (user hit Stop)
+  // ...wait until evaluation is genuinely suspended on that await, so the Stop
+  // below provably lands inside the window rather than before it.
+  await insideFetch
+  // ...then the user's Stop lands while that fetch is still in flight.
   await hooks.event(ev("session.error", { sessionID: "s14", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
-  await sleep(350)
-  ok(state.prompts.length === 0, "S14: no empty nudge when idle fires before abort error")
   ok(state.logs.some((t) => t.includes("Stopped by you")), "S14: stop acknowledged")
+  release()
+  await sleep(400)
+
+  ok(state.prompts.length === 0, "S14: no empty nudge when idle fetch resumes after the abort")
+  // The guard's real job: evaluation must ABORT, not merely fail to schedule.
+  // Without it the stopped session still burns budget and latches state.
+  ok(!state.logs.some((t) => t.includes("empty response detected")),
+    "S14: aborted evaluation is abandoned (no empty-nudge bookkeeping on a stopped session)")
+  // A real user prompt re-arms the session and the automation must work
+  // normally again -- the guard must not permanently poison it. A new turn
+  // that ends in an empty response should nudge again, proving the empty-nudge
+  // path is reachable once the Stop is cleared.
+  state.messagesBySession.s14 = [{ info: { role: "assistant", error: null }, parts: [{ type: "text", text: "ok, continuing" }] }]
+  await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "s14", id: "u-s14" } }))
+  state.msgStore["u-s14"] = "carry on"
+  await sleep(50)
+  state.messagesBySession.s14 = [{ info: { role: "assistant", error: null }, parts: [] }]
+  await hooks.event(ev("session.idle", { sessionID: "s14" }))
+  await sleep(400)
+  ok(state.prompts.some((p) => p.id === "s14" && p.text.includes("Previous reply came back empty")),
+    "S14: a new user prompt re-arms automation and the empty-nudge path works again")
+}
+
+// ---- S15: user Stop landing WHILE the injection plan is in flight ------------
+// The most consequential variant of the same class. runPlan() checks
+// suppression, then awaits session.status() before deciding to inject. A Stop
+// that lands inside that window used to be ignored and the "Auto-resume" prompt
+// was dispatched anyway -- a real injection into a silenced session.
+{
+  const state = makeState()
+  let release
+  let entered
+  const insideStatus = new Promise((r) => { entered = r })
+  state.statusGate = { entered, promise: new Promise((r) => { release = r }) }
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+
+  // A rate-limit failure schedules a recovery injection...
+  await hooks.event(ev("session.error", { sessionID: "s15", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
+  // ...which is now parked inside runPlan's session.status() probe...
+  await insideStatus
+  // ...and the user hits Stop right in that window.
+  await hooks.event(ev("session.error", { sessionID: "s15", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
+  release()
+  await sleep(500)
+
+  ok(state.prompts.length === 0,
+    "S15: no resume injected when Stop lands while the plan is mid-flight")
+  ok(state.logs.some((t) => t.includes("while the plan was in flight")),
+    "S15: in-flight plan is cancelled explicitly (auditable in the log)")
 }
 
 console.log(process.exitCode ? "STOP TESTS FAILED" : "ALL STOP TESTS PASSED")
