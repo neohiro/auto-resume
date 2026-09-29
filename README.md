@@ -134,7 +134,9 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | Variable | Default | Meaning |
 |---|---|---|
 | `OPENCODE_RESUME_ENABLED` | `true` | Master switch |
-| `OPENCODE_RESUME_MAX_CHAIN` | `6` | Max recovery resumes per task |
+| `OPENCODE_RESUME_AGGRESSION` | `balanced` | `conservative` \| `balanced` \| `relentless` — one-word preset setting `MAX_CHAIN` + `MAX_STALL_TAKEOVERS` together |
+| `OPENCODE_RESUME_MAX_CHAIN` | `8` | Max recovery resumes per task (default from the aggression preset) |
+| `OPENCODE_RESUME_MAX_STALL_TAKEOVERS` | `4` | Max stall takeovers per task (default from the aggression preset; was a hard-coded 2) |
 | `OPENCODE_RESUME_BASE_DELAY_MS` | `5000` | Backoff base |
 | `OPENCODE_RESUME_MAX_DELAY_MS` | `120000` | Backoff cap |
 | `OPENCODE_RESUME_RATE_LIMIT_BASE_MS` | `20000` | Backoff base for 429s |
@@ -184,6 +186,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 - Per-task resume chain cap, reset by any real user message or clean completion
 - Shared autopilot nudge budget + wall-clock budget per task
 - Spin detection (todo drive stops when nothing progresses)
+- Anti-redundant-repeat: the same plan kind scheduled twice with no progress escalates to an explicit "change approach" prompt instead of re-injecting the same nudge (the empty-streak ladder is exempt — it has its own escalation)
 - Incident-signature dedupe (one failure never double-triggers)
 - Idle-status check immediately before every injection
 - Global circuit breaker with cool-down during full outages
