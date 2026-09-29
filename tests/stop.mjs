@@ -486,4 +486,85 @@ const ev = (type, properties) => ({ event: { type, properties } })
     `S16: empty nudges stay bounded (${emptyNotices} nudges)`)
 }
 
+// ---- S17: same-kind repeat pressure escalates to "change approach" ----------
+// schedule()'s anti-redundant-repeat heuristic is the mechanism that caused the
+// S16 regression, but S16 only proves it did NOT fire on the empty path. The
+// mechanism's *intended* behaviour -- a model stuck asking the same question
+// gets an explicit "stop and change approach" prompt instead of the same
+// proceed nudge forever -- had no direct test, so a regression in the
+// threshold (repeatCount >= 2), the watched-kind set, or the unmoved-chain
+// condition would have gone unnoticed.
+//
+// Mechanics that make this deterministic:
+//   * each ask must first stream a text part, because evaluateIdle's `relevant`
+//     gate (lastErrorName/lastResumeAt/continueCount/todos/lastTurnHadText)
+//     short-circuits a session that has produced no observable output at all;
+//   * NUDGE_DELAY_MS is raised so no injection lands between the schedules --
+//     runPlan clears the previousKind tracker when it injects, which would
+//     reset the counter and mask the escalation;
+//   * the error path is never used, so `chain` stays put, which is the
+//     "no observed progress" half of the condition;
+//   * maxProceeds is raised above the default of 3 so the 4th ask is not
+//     simply refused by the proceed budget before it ever reaches schedule().
+{
+  const prevNudge = process.env.OPENCODE_RESUME_NUDGE_DELAY_MS
+  const prevProceeds = process.env.OPENCODE_AUTOPILOT_MAX_PROCEEDS
+  const prevNudges = process.env.OPENCODE_AUTOPILOT_MAX_NUDGES
+  process.env.OPENCODE_RESUME_NUDGE_DELAY_MS = "1500"
+  process.env.OPENCODE_AUTOPILOT_MAX_PROCEEDS = "8"
+  process.env.OPENCODE_AUTOPILOT_MAX_NUDGES = "20"
+  const state = makeState()
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const askTurn = (n) => {
+    state.idleIds.add("s17")
+    state.messagesBySession.s17 = [
+      {
+        info: { role: "assistant", error: null },
+        parts: [{ type: "text", text: "I have one more step. Should I continue?" }],
+      },
+    ]
+    return hooks.event(ev("message.part.updated", {
+      part: { type: "text", sessionID: "s17", text: "I have one more step. Should I continue?" },
+    }))
+  }
+  for (let i = 0; i < 4; i += 1) {
+    await askTurn(i)
+    await hooks.event(ev("session.idle", { sessionID: "s17" }))
+    await sleep(120)
+  }
+  await sleep(1800)
+  const injected = state.prompts.filter((p) => p.id === "s17")
+  ok(injected.length === 1, `S17: the repeated asks collapse to a single injection (${injected.length})`)
+  // Escalated, and — the part that used to be wrong — still escalated on the
+  // final ask. Recording the post-escalation kind in the tracker made the 4th
+  // ask look like a fresh "proceed" and overwrite the debug plan, so a stuck
+  // model flip-flopped forever instead of converging on "change approach".
+  ok(injected.some((p) => p.text.includes("Multiple tool calls failed")),
+    "S17: repeated identical asks escalate to the change-approach (debug) prompt")
+  ok(!injected.some((p) => p.text.includes("Should I continue?")),
+    "S17: escalation is not undone on a later identical ask")
+  ok(state.logs.some((t) => t.includes("same-kind repeat")),
+    "S17: the escalation is explained in the log")
+  // The counter must allow exactly ONE repeat before escalating, not zero: a
+  // model that asks twice can legitimately be mid-thought, and escalating on
+  // the first repeat would fire the debug prompt at a healthy session.
+  // 4 asks => schedules 2, 3 and 4 all see an unmoved chain and the same kind.
+  const repeats = state.logs.filter((t) => t.includes("same-kind repeat")).length
+  ok(repeats === 3, `S17: allowed once, then escalated (${repeats} repeat decisions over 4 asks)`)
+  // Pin the grace period explicitly. Counting repeats is not enough: a
+  // threshold of >= 1 also produces 3 decisions, it just escalates one turn
+  // too early. Assert on which branch each repeat took.
+  ok(state.logs.some((t) => t.includes("allowing once before escalation")),
+    "S17: the first repeat is allowed, not escalated")
+  ok(!state.logs.some((t) => t.includes('same-kind repeat #1 for "proceed" — escalating')),
+    "S17: repeat #1 never escalates (grace period honoured)")
+  ok(state.logs.some((t) => t.includes('same-kind repeat #2 for "proceed" — escalating')),
+    "S17: repeat #2 is the escalation point")
+  process.env.OPENCODE_RESUME_NUDGE_DELAY_MS = prevNudge
+  if (prevProceeds === undefined) delete process.env.OPENCODE_AUTOPILOT_MAX_PROCEEDS
+  else process.env.OPENCODE_AUTOPILOT_MAX_PROCEEDS = prevProceeds
+  if (prevNudges === undefined) delete process.env.OPENCODE_AUTOPILOT_MAX_NUDGES
+  else process.env.OPENCODE_AUTOPILOT_MAX_NUDGES = prevNudges
+}
+
 console.log(process.exitCode ? "STOP TESTS FAILED" : "ALL STOP TESTS PASSED")

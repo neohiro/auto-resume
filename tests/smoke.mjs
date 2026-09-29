@@ -124,6 +124,22 @@ const ev = (type, properties) => ({ event: { type, properties } })
   delete process.env.OPENCODE_RESUME_WATCHDOG_MS
 }
 
+// ---- Scenario I: README env table is in sync with loadConfig ----------------
+// Drift here is invisible until a user sets a knob that the docs never mention,
+// or copies a documented name that no longer exists. Cheap to assert, and it is
+// the kind of thing that rots silently between releases.
+{
+  const code = await Bun.file(new URL("../auto-resume.js", import.meta.url)).text()
+  const readme = await Bun.file(new URL("../README.md", import.meta.url)).text()
+  const names = (src) => new Set(src.match(/OPENCODE_RESUME_[A-Z_]+/g) ?? [])
+  const inCode = names(code)
+  const inDoc = names(readme)
+  const undocumented = [...inCode].filter((n) => !inDoc.has(n))
+  const stale = [...inDoc].filter((n) => !inCode.has(n))
+  ok(undocumented.length === 0, `I1: every env var in the code is documented (${undocumented.join(", ") || "none missing"})`)
+  ok(stale.length === 0, `I2: no stale env vars documented (${stale.join(", ") || "none stale"})`)
+}
+
 console.log(process.exitCode ? "SMOKE TEST FAILED" : "ALL SMOKE TESTS PASSED")
 
 
