@@ -179,7 +179,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 
 ## Safety rails
 
-- **User Stop is absolute**: hitting Stop cancels every queued injection and pauses recovery, todo-drive, auto-proceed, improvement passes, proposals *and* permission autopilot until you send the next prompt — and the stop is **remembered across restarts** (small JSON sidecar file), so a stopped session is never automatically revived
+- **User Stop is absolute**: hitting Stop cancels every queued injection and pauses recovery, todo-drive, auto-proceed, improvement passes, proposals *and* permission autopilot until you send the next prompt — and the stop is **remembered across restarts** (small JSON sidecar file), so a stopped session is never automatically revived. This holds even mid-flight: a Stop that lands while the plugin is waiting on the server (history fetch, status probe, model rotation) still cancels the pending work instead of injecting into the session you just silenced
 - **Per-session kill switch**: `auto-resume off` in chat disables everything for that session only (survives restarts; title restored with no trace) — `auto-resume on` re-arms. On-by-default everywhere else: install and go
 - Per-task resume chain cap, reset by any real user message or clean completion
 - Shared autopilot nudge budget + wall-clock budget per task

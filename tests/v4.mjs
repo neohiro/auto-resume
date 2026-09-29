@@ -39,6 +39,14 @@ function makeClient(state) {
       abort: async ({ path }) => { state.aborts.push(path.id); return true },
       summarize: async () => true,
       messages: async ({ path }) => {
+        // Optional gate: hold this session's fetch open so a test can land a
+        // user Stop while the caller is suspended on the await. `entered`
+        // resolves once the fetch is actually parked, so the test can stop at
+        // the exact moment the caller is inside the await window.
+        if (state.messageGate && state.messageGate.id === path.id) {
+          state.messageGate.entered?.()
+          await state.messageGate.promise
+        }
         const entries = structuredClone(state.messagesBySession[path.id] ?? [
           { info: { role: "assistant", error: null }, parts: [{ type: "text", text: "ok" }] },
         ])
@@ -107,6 +115,37 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await AutoResumePlugin({ client: makeClient(st2) })
   await sleep(2200)
   ok(st2.prompts.some((p) => p.id === "unanswered"), "X2: prompt that never got a reply is re-sent")
+}
+
+// ---- X3: user Stop landing DURING the startup re-animation scan ---------------
+// The scan is detached and checks suppression before it fetches each session's
+// history. If the user presses Stop while that fetch is in flight, the revival
+// must be abandoned — otherwise a "Revived a session interrupted by the restart"
+// notice and a resume land on a session the user just stopped.
+{
+  const now = Date.now()
+  const state = makeState()
+  state.sessionList = [{ id: "stopped-mid-scan", time: { updated: now - 2_000 } }]
+  state.messagesBySession["stopped-mid-scan"] = [{
+    info: { role: "assistant", error: { name: "APIError", data: { statusCode: 502, message: "bad gateway" } }, providerID: "provA", modelID: "a-max" },
+    parts: [],
+  }]
+  let release
+  let entered
+  const insideFetch = new Promise((r) => { entered = r })
+  state.messageGate = { id: "stopped-mid-scan", entered, promise: new Promise((r) => { release = r }) }
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  // Wait until the scan is genuinely suspended inside the messages() fetch —
+  // firing the Stop any earlier would be caught by the pre-fetch check and
+  // would not exercise the post-await window at all.
+  await insideFetch
+  await hooks.event(ev("session.error", { sessionID: "stopped-mid-scan", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
+  release()
+  await sleep(2200)
+  ok(!state.prompts.some((p) => p.id === "stopped-mid-scan"),
+    "X3: session stopped mid-scan is NOT revived")
+  ok(!state.logs.some((t) => t.includes("Revived a session interrupted by the restart")),
+    "X3: no bogus 'revived' notice after the user stopped the session")
 }
 
 // ---- Y: auto-proceed when the agent ends by asking a question ----------------
