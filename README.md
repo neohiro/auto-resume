@@ -137,6 +137,9 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_AGGRESSION` | `balanced` | `conservative` \| `balanced` \| `relentless` — one-word preset setting `MAX_CHAIN` + `MAX_STALL_TAKEOVERS` together |
 | `OPENCODE_RESUME_MAX_CHAIN` | `8` | Max recovery resumes per task (default from the aggression preset) |
 | `OPENCODE_RESUME_MAX_STALL_TAKEOVERS` | `4` | Max stall takeovers per task (default from the aggression preset; was a hard-coded 2) |
+| `OPENCODE_RESUME_FAVORITE_RETURN` | `true` | Hand the session back to your original model once the alternate proves stable |
+| `OPENCODE_RESUME_FAVORITE_CHECK_AFTER_MS` | `300000` | Minimum time on the alternate before returning |
+| `OPENCODE_RESUME_FAVORITE_MIN_TURNS` | `3` | Stable turns on the alternate required before returning |
 | `OPENCODE_RESUME_BASE_DELAY_MS` | `5000` | Backoff base |
 | `OPENCODE_RESUME_MAX_DELAY_MS` | `120000` | Backoff cap |
 | `OPENCODE_RESUME_RATE_LIMIT_BASE_MS` | `20000` | Backoff base for 429s |
@@ -191,6 +194,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 - Idle-status check immediately before every injection
 - Global circuit breaker with cool-down during full outages
 - Rotation caps prevent endless provider hopping
+- Model rotation is self-healing: once the alternate has held up for a few clean turns and your original model's cool-down has expired, an idle session goes back to the model you picked (no SDK call — the model is carried on the next injected prompt)
 - Every injected prompt is tagged `[auto-resume]` so automation is always visible in chat
 - Dangerous shell commands are rejected, not silently approved
 
