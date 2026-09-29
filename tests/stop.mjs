@@ -305,10 +305,34 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("session.status", { sessionID: "think", status: { type: "busy" } }))
   await sleep(300) // past the 150ms think-stall window
   ok(state.aborts.includes("think"), "S13: silent thinking aborted at the fast threshold")
-  await sleep(2500)
+  // Wait for the takeover chain to run its course. Each stall takeover re-arms
+  // the next one on a 1500ms + 800ms delay, and OPENCODE_RESUME_MAX_STALL_TAKEOVERS
+  // now defaults to 4 (it was a hard 2 before), so the labelled retry prompt is
+  // injected on the LAST hop of that chain -- ~2.3s later than under the old cap.
+  // The 2500ms this used to wait was inside that window and only passed by luck.
+  await sleep(9000)
   ok(state.prompts.some((p) => p.id === "think" && p.text.includes("Auto-retry")),
     "S13: retry prompt is explicitly labelled")
   ok(state.logs.some((t) => t.includes("automatic retry")), "S13: notice says 'automatic retry'")
+  // OPENCODE_RESUME_MAX_STALL_TAKEOVERS replaced the old hard-coded cap of 2
+  // (balanced preset = 4). Pin it: the chain must reach the configured ceiling
+  // and stop there, never overshoot.
+  const stallAborts = state.aborts.filter((id) => id === "think").length
+  ok(stallAborts === 4, `S13: stall takeovers capped at maxStallTakeovers (${stallAborts}, expected 4)`)
+  // A deep retry (#4) must switch to the terse prompt — a model stuck in a retry
+  // loop re-emits a recap when the nudge keeps growing.
+  ok(state.prompts.some((p) => p.id === "think" && p.text.includes("(short)")),
+    "S13: deep retries get the terse prompt")
+  // Regression guard: the stall-retry chain must NEVER be escalated to the
+  // "debug" (change-approach) prompt. Once maxStallTakeovers is reached, chain
+  // and stallResumes are frozen at the cap, so the anti-redundant-repeat
+  // heuristic sees "chain unchanged" and would otherwise treat the watchdog's
+  // own re-ticks as a model loop -- rewriting the plan to a tool-failure prompt
+  // and never delivering the retry. The watchdog re-arms 4x on a 1500+800ms
+  // delay, so with a long enough wait the escalation DOES fire and the retry
+  // text disappears; this assertion is what catches it.
+  ok(state.prompts.every((p) => p.id !== "think" || !p.text.includes("Multiple tool calls failed")),
+    "S13: stall retries are never escalated to the debug (tool-failure) prompt")
   // tool activity keeps its grace: no fast abort for quiet-but-running tools
   await hooks.event(ev("session.status", { sessionID: "toolx", status: { type: "busy" } }))
   await hooks.event(ev("message.part.updated", { part: { type: "tool", sessionID: "toolx", state: { status: "running" }, tool: "bash" } }))
@@ -412,6 +436,54 @@ const ev = (type, properties) => ({ event: { type, properties } })
     "S15: no resume injected when Stop lands while the plan is mid-flight")
   ok(state.logs.some((t) => t.includes("while the plan was in flight")),
     "S15: in-flight plan is cancelled explicitly (auditable in the log)")
+}
+
+// ---- S16: the empty-nudge path keeps its own prompt under repeat pressure ----
+// The anti-redundant-repeat heuristic in schedule() escalates a repeated plan
+// kind to the "debug" (change-approach) prompt when the chain counter hasn't
+// moved between two back-to-back schedules. That is the intended behaviour for
+// a model stuck asking the same question, but it must not be able to hijack the
+// empty-streak nudge into a tool-failure prompt — the two are unrelated failure
+// modes, and the escalation rewrites plan.kind, so the swap is observable in
+// the injected text.
+{
+  const state = makeState()
+  // The empty-nudge path is gated on s.lastResumeAt, so the session needs a
+  // recovery first -- mirror S14's setup: a prior 429 resume, then an empty
+  // assistant turn on each idle.
+  state.messagesBySession.s16 = [
+    { info: { role: "assistant", error: null }, parts: [{ type: "text", text: "some output" }] },
+  ]
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  await hooks.event(ev("session.error", { sessionID: "s16", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
+  await sleep(500)
+  // Now the session is past a resume; feed genuinely empty assistant turns.
+  // NOTE: hasContent tests for the *presence* of a text/tool/reasoning part,
+  // not its length — a text part with "" still counts as content, so an
+  // "empty" turn must have NO parts at all.
+  state.idleIds.add("s16")
+  state.messagesBySession.s16 = [
+    { info: { role: "assistant", error: null }, parts: [] },
+  ]
+  for (let i = 0; i < 4; i += 1) {
+    await hooks.event(ev("session.idle", { sessionID: "s16" }))
+    await sleep(150)
+  }
+  await sleep(600)
+  const injected = state.prompts.filter((p) => p.id === "s16")
+  ok(injected.length > 0, "S16: empty-nudge path injected at least once")
+  // Every injection on this path must be an empty-streak nudge. The
+  // anti-redundant-repeat heuristic rewrites plan.kind to "debug" when a kind
+  // repeats with an unmoved chain; if that ever captured the empty path the
+  // model would be told to root-cause "multiple tool calls failed" when nothing
+  // of the sort happened.
+  ok(injected.every((p) => !p.text.includes("Multiple tool calls failed")),
+    "S16: empty-nudge never escalated to the debug (tool-failure) prompt")
+  // And the empty-streak latch must still latch: repeated empty responses are
+  // counted, not spammed forever (emptyNudges is capped at 2 + one keep-going).
+  const emptyNotices = state.logs.filter((t) => t.includes("empty response detected")).length
+  ok(emptyNotices >= 1 && emptyNotices <= 2,
+    `S16: empty nudges stay bounded (${emptyNotices} nudges)`)
 }
 
 console.log(process.exitCode ? "STOP TESTS FAILED" : "ALL STOP TESTS PASSED")

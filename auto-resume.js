@@ -162,13 +162,24 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.13.18"
+const AUTO_RESUME_VERSION = "1.14.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
+/** One-word aggression preset → (maxChain, maxStallTakeovers). Numeric
+ *  env vars (OPENCODE_RESUME_MAX_CHAIN, OPENCODE_RESUME_MAX_STALL_TAKEOVERS)
+ *  override the preset when set. conservative matches the pre-1.14 hard cap;
+ *  relentless buys maximum headroom for unattended free-tier runs where the
+ *  user genuinely wants the agent to keep trying. balanced is the default. */
+const AGGRESSION_PRESETS = {
+  conservative: { maxChain: 6, maxStallTakeovers: 2 },
+  balanced:     { maxChain: 8, maxStallTakeovers: 4 },
+  relentless:   { maxChain: 12, maxStallTakeovers: 8 },
+}
+const DEFAULT_AGGRESSION = "balanced"
+
 const DEFAULTS = {
   enabled: true,
-  maxChain: 6,
   baseDelayMs: 5_000,
   maxDelayMs: 120_000,
   rateLimitBaseMs: 20_000,
@@ -237,9 +248,19 @@ const AUTONOMY_DIRECTIVE_TIGHT =
 const QUALITY = " Senior-grade output: verify (build/test/lint) before claiming done. No TODOs, no apology, no recap. Exceed expectations."
 
 const PROMPTS = {
-  retry: (attempt) =>
-    `${RESUME_TAG} Auto-retry #${attempt}. Self-healing; the previous turn was busy ~60s with no output and got aborted.` +
-    ` Pick up exactly where you stopped; finish production-grade.`,
+  retry: (attempt) => {
+    // Later attempts get terser: a model stuck in a retry loop tends to
+    // re-emit a recap when the prompt grows, so shorten as we escalate.
+    if (attempt >= 4) {
+      return `${RESUME_TAG} Auto-retry #${attempt} (short). Stalled again — pick up where you stopped and finish. No recap, no preamble; just continue.`
+    }
+    if (attempt >= 2) {
+      return `${RESUME_TAG} Auto-retry #${attempt}. Self-healing; the previous turn was busy with no output and got aborted.` +
+        ` Continue from where you stopped. Verify progress (build/test/lint) before claiming done.`
+    }
+    return `${RESUME_TAG} Auto-retry #${attempt}. Self-healing; the previous turn was busy ~60s with no output and got aborted.` +
+      ` Pick up exactly where you stopped; finish production-grade.`
+  },
   resume: (auto, detail, modelNote) =>
     `${RESUME_TAG} Auto-resume. A provider turn failed (network / 5xx / rate-limit / timeout / quota).` +
     (detail ? ` Cause: "${detail}".` : "") +
@@ -261,6 +282,12 @@ const PROMPTS = {
   proceed: () =>
     `${RESUME_TAG} Proceed autonomously with what you just proposed/asked — answer is yes. Decide and continue.` +
     ` Execute end-to-end at senior level: full impl + tests + error handling + doc touches, verified against the real toolchain. Aim to exceed expectations.` +
+    AUTONOMY_DIRECTIVE,
+  proceedAll: () =>
+    `${RESUME_TAG} You asked "which of these should I tackle first?" — autonomous answer: do ALL of them, one by one, end-to-end.` +
+    ` Pick the most foundational first (whichever other proposals depend on, or the one with the broadest blast radius); build, test, lint, commit, then move to the next.` +
+    ` Don't ask for sign-off between proposals; don't stop to summarize between proposals; just drive them to completion in order.` +
+    ` If a proposal is genuinely risky or ambiguous, implement the safe core and document the assumption in one line — do not stop.` +
     AUTONOMY_DIRECTIVE,
   keepGoing: () =>
     `${RESUME_TAG} You paused mid-work ("continue", "finalize", etc.) — indicating there is still work to do. Pick up now and drive to perfect finalization: finish remaining steps, verify (build/test/lint), nothing half-done. Production-grade, not partial.` +
@@ -365,6 +392,21 @@ const QUESTION_PATTERNS = [
   /\bshould we\b/i, /\blet me know (if|when|whether)\b/i,
   /\bawait(ing)? (your|further) (confirmation|instructions|approval|input)\b/i,
   /\bwaiting for your\b/i, /\bprompt (me|you) when\b/i,
+  // Proposal-list / defer-to-user shapes: the agent is offering a menu of
+  // options rather than asking a yes/no proceed question. These route to the
+  // stronger PROMPTS.proceedAll ("do all of them, in order").
+  /\bwhich (of these|one) (do you want|should i|tackle|do|first|prioritize)/i,
+  /\bwhich (of the|proposal|task|item|option)s? (do you want|should i|tackle|do|first|prioritize|implement|start)/i,
+  /\bdraft a spec\b/i, /\bwrite a spec\b/i, /\bpropose a spec\b/i,
+  /\bwhich (is|would be) (most|best) (impactful|important|priority)/i,
+  /\bprioritize (these|them|the)\b/i,
+  /\bpick (one|the) (to start|to tackle|first|to begin)\b/i,
+  /\bwhere (should i|would you like me) (start|begin|tackle)\b/i,
+  /\bshould (i|we) (start|tackle|begin) with\b/i,
+  /\bgo for (the |)(proposal|task|most impactful|first|all)\b/i,
+  /\bdo all\b/i, /\bimplement all\b/i, /\ball of them\b/i,
+  /\bshall i (tackle|draft|write|implement|start|begin)/i,
+  /\bwhich approach\b/i,
 ]
 
 /** Turn-ending continuation stubs: the agent announced more work but stopped
@@ -434,9 +476,21 @@ function bool(name, fallback) {
 }
 
 function loadConfig() {
+  const aggressionRaw = str("OPENCODE_RESUME_AGGRESSION", DEFAULT_AGGRESSION).toLowerCase()
+  const aggressionKey = Object.hasOwn(AGGRESSION_PRESETS, aggressionRaw)
+    ? aggressionRaw
+    : DEFAULT_AGGRESSION
+  const preset = AGGRESSION_PRESETS[aggressionKey]
+  const hasRawChain = process.env.OPENCODE_RESUME_MAX_CHAIN !== undefined
+  const hasRawStall = process.env.OPENCODE_RESUME_MAX_STALL_TAKEOVERS !== undefined
   return {
     enabled: bool("OPENCODE_RESUME_ENABLED", DEFAULTS.enabled),
-    maxChain: num("OPENCODE_RESUME_MAX_CHAIN", DEFAULTS.maxChain),
+    maxChain: hasRawChain
+      ? num("OPENCODE_RESUME_MAX_CHAIN", preset.maxChain)
+      : preset.maxChain,
+    maxStallTakeovers: hasRawStall
+      ? Math.max(1, num("OPENCODE_RESUME_MAX_STALL_TAKEOVERS", preset.maxStallTakeovers))
+      : preset.maxStallTakeovers,
     baseDelayMs: num("OPENCODE_RESUME_BASE_DELAY_MS", DEFAULTS.baseDelayMs),
     maxDelayMs: num("OPENCODE_RESUME_MAX_DELAY_MS", DEFAULTS.maxDelayMs),
     rateLimitBaseMs: num("OPENCODE_RESUME_RATE_LIMIT_BASE_MS", DEFAULTS.rateLimitBaseMs),
@@ -803,23 +857,30 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       for (const [id, ts] of map) if (ts > cutoff) out[id] = ts
       const payload = JSON.stringify(out, null, 2)
       const tmp = `${path}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
-      await writeFile(tmp, payload, "utf8")
-      // Windows: freshly written files can be briefly locked (AV/indexer), so
-      // the atomic rename may fail with EPERM/EACCES/EBUSY — retry with
-      // backoff, then fall back to a plain overwrite of the final path.
-      for (const delayMs of [25, 50, 100, 200, 400]) {
-        try {
-          await rename(tmp, path)
-          return
-        } catch (err) {
-          if (!["EPERM", "EACCES", "EBUSY", "EEXIST"].includes(err?.code)) throw err
-          await new Promise((r) => setTimeout(r, delayMs))
-        }
-      }
       try {
+        await writeFile(tmp, payload, "utf8")
+        // Windows: freshly written files can be briefly locked (AV/indexer), so
+        // the atomic rename may fail with EPERM/EACCES/EBUSY — retry with
+        // backoff, then fall back to a plain overwrite of the final path. tmp is
+        // left intact for the finally block below to clean up.
+        for (const delayMs of [25, 50, 100, 200, 400]) {
+          try {
+            await rename(tmp, path)
+            return
+          } catch (err) {
+            if (!["EPERM", "EACCES", "EBUSY", "EEXIST"].includes(err?.code)) throw err
+            await new Promise((r) => setTimeout(r, delayMs))
+          }
+        }
+        // All retries failed: plain overwrite the final path. tmp is left
+        // intact for the finally block below to clean up.
         await writeFile(path, payload, "utf8")
       } finally {
-        try { await unlink(tmp) } catch { /* best effort */ }
+        // Cleanup the tmp file regardless of which path succeeded. Without
+        // this, every successful rename leaked one tmp file with a unique
+        // timestamp+random suffix — accumulating forever on Windows where
+        // the rename is the common success case.
+        try { await unlink(tmp) } catch { /* already gone or locked */ }
       }
     }
     // Serialize saves: overlapping renames on the same destination are the
@@ -1128,12 +1189,14 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         status: "unknown", lastActivity: Date.now(),
         lastErrorAt: 0, lastErrorSig: null, lastErrorName: null,
         chain: 0, continueCount: 0, stallResumes: 0, emptyNudges: 0, emptyStreak: false,
+        previousKind: null, previousKindChain: 0, previousKindRepeats: 0,
         compactAttempted: false, awaitingCompactionSince: 0,
         pendingResume: false, lastResumeAt: 0, lastInjectAt: 0, lastSuccessAt: 0,
         lastModel: null, currentModel: null, originalModel: null,
         rlStreak: 0, failStreak: 0, rotations: 0,
         todos: [], nudges: 0, driveCount: 0, staleDrives: -1,
         lastDriveCompleted: -1, proposalSent: false, taskStartAt: 0,
+      previousKind: null, previousKindChain: 0, previousKindRepeats: 0,
         improveDone: 0, improveTotal: 0, lastImprovedAt: 0, noTodoImproveFired: false,
         proceedCount: 0,
         toolErrs: 0, debugArmed: false, toolRunning: false,
@@ -1172,6 +1235,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       rlStreak: 0, failStreak: 0, rotations: 0,
       nudges: 0, driveCount: 0, staleDrives: -1,
       lastDriveCompleted: -1, proposalSent: false,
+      previousKind: null, previousKindChain: 0, previousKindRepeats: 0,
       improveDone, improveTotal, lastImprovedAt,
       improveActive: false, improvedAt: 0, // 🧪 running, ✅ just-finished window
       askingSince: null,
@@ -1589,6 +1653,36 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     // Stamp creation time once: recovery plans dispatched after a later clean
     // turn are stale and get dropped (see runPlan).
     if (!plan.createdTs) plan.createdTs = Date.now()
+    // Anti-redundant-repeats: a back-to-back plan of the SAME kind with no
+    // observed progress (chain counter unchanged) is almost always the agent
+    // asking the same question / stalling the same way twice. Escalate to
+    // an explicit "change approach" prompt instead of firing the same kind
+    // verbatim — this prevents the loop where auto-resume keeps injecting
+    // the same proceed/retry/empty message while the model re-emits the
+    // same deferring question.
+    const s = state(sessionID)
+    // "empty" is deliberately NOT watched. The empty-streak ladder already has
+    // its own escalation (empty -> empty -> explicit keep-going) and nothing
+    // increments `chain` on that path, so a second empty turn always looks like
+    // an unmoved-chain repeat — which used to rewrite the *third* nudge (the
+    // one designed to survive when the model has nothing queued) into the
+    // "multiple tool calls failed" debug prompt. No tool calls failed; the
+    // model returned an empty turn. Guarded by S16.
+    const SAME_KIND_WATCHED = new Set(["proceed", "drive"])
+    if (SAME_KIND_WATCHED.has(plan.kind) && s.previousKind === plan.kind && s.chain === s.previousKindChain) {
+      const repeatCount = (s.previousKindRepeats ?? 0) + 1
+      s.previousKindRepeats = repeatCount
+      if (repeatCount >= 2) {
+        log("warn", `same-kind repeat #${repeatCount} for "${plan.kind}" — escalating`, { sessionID })
+        plan = { ...plan, kind: "debug", prompt: PROMPTS.debug }
+      } else {
+        log("info", `same-kind repeat for "${plan.kind}" — allowing once before escalation`, { sessionID })
+      }
+    } else {
+      s.previousKindRepeats = 0
+    }
+    s.previousKind = plan.kind
+    s.previousKindChain = s.chain
     const existing = timers.get(sessionID)
     if (existing) clearTimeout(existing)
     const t = setTimeout(() => {
@@ -1617,6 +1711,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         s.askingSince = null
         queueTitleRefresh(sessionID)
       }
+      // A fresh user turn is the strongest "previousKind reset" signal:
+      // any auto-injection loop the model was stuck in is now broken.
+      s.previousKind = null
+      s.previousKindChain = 0
+      s.previousKindRepeats = 0
     }
     if (t) log("info", `cancelled pending auto-injection — ${why}`, { sessionID })
   }
@@ -1676,6 +1775,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         return
       }
       s.pendingResume = false
+      // We are about to inject a real prompt; clear the same-kind loop
+      // tracker so the NEXT schedule (after this turn resolves) starts fresh.
+      s.previousKind = null
+      s.previousKindChain = 0
+      s.previousKindRepeats = 0
       let status
       try {
         const res = await client.session.status()
@@ -1975,9 +2079,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       // Bounded self-re-arm for unattended runs: after a cool-down, reset the
       // chain and try ONCE more — long outages (502 storms, provider blips)
       // must not permanently kill recovery until the user returns. We also
-      // reset stallResumes here: the within-task takeover cap of 2 is a
-      // anti-loop guard, NOT a hard kill — a session that hit the cap
-      // should get a fresh budget after the rearm window.
+      // reset stallResumes here: the within-task stall-takeover cap
+      // (maxStallTakeovers, default 4) is an anti-loop guard, NOT a hard
+      // kill — a session that hit the cap should get a fresh budget after
+      // the rearm window.
       if (!s.gaveUpRearmed && !suppressed(sessionID)) {
         s.gaveUpRearmed = true
         if (s.rearmTimer) clearTimeout(s.rearmTimer)
@@ -2277,6 +2382,13 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         if (text && text.trim()) {
           const asked = QUESTION_PATTERNS.some((re) => re.test(text))
           const stubbed = looksLikeContinuationStub(text) || looksLikeContinuationLong(text)
+          // "Which of these do you want me to tackle first?" / "Should I tackle
+          // proposal 2?" / "Want me to do all of them?" / "draft a SPEC for X" —
+          // these are proposal-list / defer-to-user questions. Different from a
+          // simple yes/no proceed: the user wants unattended execution of N items,
+          // so fire a stronger "do all, step-by-step" prompt instead of the
+          // generic proceed nudge.
+          const proposalList = /\b(which (of these|one)|tackle (first|proposal)|do all\b|implement all\b|all of them|draft a spec|write a spec)\b/i.test(text)
           if (asked || stubbed) {
             s.proceedCount += 1
             s.nudges += 1
@@ -2286,13 +2398,17 @@ export const AutoResumePlugin = async ({ client, $ }) => {
             // would mislead the user into thinking the model is waiting on
             // them. The notice is already gated to `asked` only.
             if (asked) s.askingSince = Date.now()
-            log("info", asked ? "agent asked a question — proceeding autonomously" : "agent announced continuation but stopped — resuming", { sessionID })
+            log("info",
+              proposalList ? "agent asked a proposal-list question — proceeding to do all" :
+              asked ? "agent asked a question — proceeding autonomously" :
+              "agent announced continuation but stopped — resuming",
+              { sessionID })
             if (asked) {
               notice(`${RESUME_TAG}: model asked — answering autonomously.`, "info")
             }
             schedule(sessionID, cfg.nudgeDelayMs, {
               kind: "proceed",
-              prompt: asked ? PROMPTS.proceed : PROMPTS.keepGoing,
+              prompt: proposalList ? PROMPTS.proceedAll : (asked ? PROMPTS.proceed : PROMPTS.keepGoing),
             })
             return
           }
@@ -2432,7 +2548,15 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   // ── stall + stuck-retry watchdog ───────────────────────────────────
   const takeover = (sessionID, why, noticeMsg, plan = { kind: "resume", prompt: PROMPTS.resume }) => {
     const s = state(sessionID)
-    if (s.chain >= cfg.maxChain || s.stallResumes >= 2) return
+    // The previous hard cap of `s.stallResumes >= 2` forced babysitting on
+    // long free-tier stalls once the model hit retry #3. Stall takeovers are
+    // now capped independently via `cfg.maxStallTakeovers` (env:
+    // OPENCODE_RESUME_MAX_STALL_TAKEOVERS, default 4) on top of the
+    // `maxChain` ceiling — both must allow a retry. chain can also be
+    // advanced by non-stall retries (e.g. 429 backoffs), so the two caps
+    // are orthogonal: stall path is bounded by maxStallTakeovers, aggregate
+    // path by maxChain.
+    if (s.chain >= cfg.maxChain || s.stallResumes >= cfg.maxStallTakeovers) return
     s.stallResumes += 1
     s.chain += 1
     s.lastActivity = Date.now()
@@ -2700,8 +2824,16 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       } catch { /* keep empty backup */ }
       await writeFile(`${selfPath}.bak`, current, "utf8")
       const tmp = `${selfPath}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
-      await writeFile(tmp, src, "utf8")
-      await rename(tmp, selfPath)
+      try {
+        await writeFile(tmp, src, "utf8")
+        await rename(tmp, selfPath)
+      } finally {
+        // Self-updater renamed its tmp into place — drop the tmp now so a
+        // successful update doesn't leak a unique-suffix file next to the
+        // plugin. Windows locks on a freshly-written file can transiently
+        // fail unlink; that's fine, it self-cleans on the next update.
+        try { await unlink(tmp) } catch { /* best effort */ }
+      }
       log("info", "self-updated", { from: AUTO_RESUME_VERSION, to: match[1], path: selfPath })
       // Update completed → user-facing channels: an OpenCode log entry plus a
       // native OS notification (works even when no client window is open).
