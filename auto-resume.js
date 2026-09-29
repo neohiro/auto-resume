@@ -126,6 +126,13 @@
  *  OPENCODE_RESUME_SWITCH_ON_FAILURES    rotate after persistent
  *                                        network/5xx failures       (true)
  *  OPENCODE_RESUME_DISABLE_ROTATION      disable ALL model rotation (false)
+ *  OPENCODE_RESUME_FAVORITE_RETURN        hand the session back to the
+ *                                        user's original model once the
+ *                                        alternate proves stable        (true)
+ *  OPENCODE_RESUME_FAVORITE_CHECK_AFTER_MS  min time on the alternate
+ *                                        before returning            (300000)
+ *  OPENCODE_RESUME_FAVORITE_MIN_TURNS       stable turns on the alternate
+ *                                        required before returning    (3)
  *  OPENCODE_RESUME_RL_SWITCH_AFTER       429s before rotating       (1)
  *  OPENCODE_RESUME_ROTATE_AFTER_FAILURES failed rounds before
  *                                        rotating away              (3)
@@ -162,7 +169,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.14.0"
+const AUTO_RESUME_VERSION = "1.15.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -194,6 +201,9 @@ const DEFAULTS = {
   retryFutureCapMs: 600_000,
   reanimate: true,
   reanimateWindowMs: 600_000,
+  favoriteReturn: true,
+  favoriteCheckAfterMs: 300_000,
+  favoriteMinTurns: 3,
   breakerThreshold: 6,
   breakerWindowMs: 900_000,
   breakerCooldownMs: 300_000,
@@ -505,6 +515,9 @@ function loadConfig() {
     retryFutureCapMs: num("OPENCODE_RESUME_RETRY_FUTURE_CAP_MS", DEFAULTS.retryFutureCapMs),
     reanimate: bool("OPENCODE_RESUME_REANIMATE", DEFAULTS.reanimate),
     reanimateWindowMs: num("OPENCODE_RESUME_REANIMATE_WINDOW_MS", DEFAULTS.reanimateWindowMs),
+    favoriteReturn: bool("OPENCODE_RESUME_FAVORITE_RETURN", DEFAULTS.favoriteReturn),
+    favoriteCheckAfterMs: num("OPENCODE_RESUME_FAVORITE_CHECK_AFTER_MS", DEFAULTS.favoriteCheckAfterMs),
+    favoriteMinTurns: Math.max(1, num("OPENCODE_RESUME_FAVORITE_MIN_TURNS", DEFAULTS.favoriteMinTurns)),
     breakerThreshold: num("OPENCODE_RESUME_BREAKER_THRESHOLD", DEFAULTS.breakerThreshold),
     breakerWindowMs: num("OPENCODE_RESUME_BREAKER_WINDOW_MS", DEFAULTS.breakerWindowMs),
     breakerCooldownMs: num("OPENCODE_RESUME_BREAKER_COOLDOWN_MS", DEFAULTS.breakerCooldownMs),
@@ -1194,9 +1207,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         pendingResume: false, lastResumeAt: 0, lastInjectAt: 0, lastSuccessAt: 0,
         lastModel: null, currentModel: null, originalModel: null,
         rlStreak: 0, failStreak: 0, rotations: 0,
+        favoriteRotatedAt: 0, turnsSinceRotation: 0, rotatedTo: null,
         todos: [], nudges: 0, driveCount: 0, staleDrives: -1,
         lastDriveCompleted: -1, proposalSent: false, taskStartAt: 0,
-      previousKind: null, previousKindChain: 0, previousKindRepeats: 0,
         improveDone: 0, improveTotal: 0, lastImprovedAt: 0, noTodoImproveFired: false,
         proceedCount: 0,
         toolErrs: 0, debugArmed: false, toolRunning: false,
@@ -1615,10 +1628,91 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     s.failStreak = 0
     s.rlStreak = 0
     s.rotations += 1
+    // Arm the favorite-return tracker. `rotatedTo` records *which* model we
+    // chose so tryRestoreFavorite can tell "still on our alternate" apart
+    // from "the session has since moved on" and back off instead.
+    s.favoriteRotatedAt = Date.now()
+    s.turnsSinceRotation = 0
+    s.rotatedTo = { providerID: alt.providerID, modelID: alt.modelID }
     log("info", "rotated model", {
       sessionID, from: exhausted ? modelKey(exhausted) : null, to: modelKey(alt), reason,
     })
     notice(`${RESUME_TAG}: ${reason} on ${exhausted ? modelKey(exhausted) : "model"} — continuing on ${modelKey(alt)}.`)
+    queueTitleRefresh(sessionID)
+    return true
+  }
+
+  /** Hand an idle session back to the model the user originally picked, once
+   *  the alternate we rotated to has proven stable and the favorite's own
+   *  cool-down has expired.
+   *
+   *  Deliberately does NOT call the SDK. The model is carried per-prompt
+   *  (`currentModel` is merged into the body of the next injection), so
+   *  clearing the rotation is all that is needed for the *next* injected
+   *  prompt to use the favorite. The orphaned `master` branch shipped a
+   *  `client.session.chat(...)` call here instead, but that method does not
+   *  exist in the OpenCode SDK — the session surface is `session.prompt` —
+   *  so the call would have thrown on every idle tick. It was also
+   *  unnecessary: `rotateAwayFrom` has always worked this way.
+   *
+   *  Synchronous, so there is no re-entrancy window to guard.
+   *  @returns true if a restore was committed. */
+  const tryRestoreFavorite = (sessionID) => {
+    if (!cfg.favoriteReturn) return false
+    const s = state(sessionID)
+    const fav = s.originalModel
+    if (!fav || !s.favoriteRotatedAt) return false
+
+    const current = s.currentModel ?? s.lastModel
+    // Our rotation is no longer the one in effect (the rotation lease was
+    // cleared by a completed task and the session has since moved on). Drop
+    // the tracker rather than yanking the model back.
+    if (s.rotatedTo && (!current
+        || current.providerID !== s.rotatedTo.providerID
+        || current.modelID !== s.rotatedTo.modelID)) {
+      log("info", "favorite-return skipped — session moved off our alternate", { sessionID })
+      s.favoriteRotatedAt = 0
+      s.turnsSinceRotation = 0
+      s.rotatedTo = null
+      return false
+    }
+    // Already home.
+    if (current
+        && current.providerID === fav.providerID
+        && current.modelID === fav.modelID) {
+      s.favoriteRotatedAt = 0
+      s.turnsSinceRotation = 0
+      s.rotatedTo = null
+      return false
+    }
+    // Still inside the cool-down window, or the alternate hasn't proven
+    // itself yet.
+    if (Date.now() - s.favoriteRotatedAt < cfg.favoriteCheckAfterMs) return false
+    if (s.turnsSinceRotation < cfg.favoriteMinTurns) return false
+    // The favorite is probably still rate-limited — that is why we left.
+    if (cooling(modelKey(fav))) return false
+    // Never swap while a recovery is already queued: the model is read when
+    // the injection body is built, so a pending resume would go out on the
+    // alternate and leave the session straddling two models. Busy/retry is
+    // already excluded by the call site, which only offers idle sessions.
+    if (s.pendingResume) return false
+
+    log("info", "restoring favorite model", {
+      sessionID,
+      from: current ? modelKey(current) : null,
+      to: modelKey(fav),
+      turnsOnAlternate: s.turnsSinceRotation,
+    })
+    s.currentModel = { providerID: fav.providerID, modelID: fav.modelID }
+    s.rotatedTo = null
+    s.favoriteRotatedAt = 0
+    s.turnsSinceRotation = 0
+    // A fresh lease, exactly like rotateAwayFrom hands the alternate: we have
+    // no evidence yet that the favorite is healthy again.
+    s.chain = 0
+    s.failStreak = 0
+    s.rlStreak = 0
+    notice(`${RESUME_TAG}: ${modelKey(fav)} is available again — returning to it.`)
     queueTitleRefresh(sessionID)
     return true
   }
@@ -2352,6 +2446,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = false
       s.emptyStreak = false  // recovered — clear the empty-loop latch
       s.askingSince = null
+      // A clean turn is the evidence that the alternate is working. Count it
+      // toward the favorite-return stability gate.
+      if (s.favoriteRotatedAt) s.turnsSinceRotation += 1
 
       // Self-improvement: a clean turn closes out the in-flight improve
       // cycle. If that was the LAST scheduled cycle, latch improvedAt so the
@@ -2619,7 +2716,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         continue
       }
 
-      if (s.status !== "busy") continue
+      if (s.status !== "busy") {
+        // Idle: the user isn't mid-turn, so this is the safe moment to give
+        // the session back to their favorite model if it's due.
+        tryRestoreFavorite(sessionID)
+        continue
+      }
       if (permissionPending.has(sessionID)) continue
       const silentFor = nowMs - s.lastActivity
       // Fast lane: model "thinking" with zero events for a short window -> labelled
