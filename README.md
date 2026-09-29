@@ -144,19 +144,24 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_MAX_DELAY_MS` | `120000` | Backoff cap |
 | `OPENCODE_RESUME_RATE_LIMIT_BASE_MS` | `20000` | Backoff base for 429s |
 | `OPENCODE_RESUME_OUTPUT_LENGTH_MAX` | `3` | Truncation continue-nudges |
+| `OPENCODE_RESUME_NUDGE_DELAY_MS` | `1500` | Delay before the "continue" nudge fires on a finished turn |
 | `OPENCODE_RESUME_STALL_TIMEOUT_MS` | `240000` | Busy-without-events ⇒ stalled |
 | `OPENCODE_RESUME_THINK_STALL_MS` | `60000` | Busy "thinking" silence ⇒ labelled automatic retry |
 | `OPENCODE_RESUME_WATCHDOG_MS` | `10000` | Stall check interval |
 | `OPENCODE_RESUME_RUNNING_TOOL_FACTOR` | `4` | Stall grace multiplier while a tool is running |
 | `OPENCODE_RESUME_RETRY_TAKEOVER_MS` | `900000` | Max time in OpenCode's internal retry loop before takeover |
 | `OPENCODE_RESUME_RETRY_FUTURE_CAP_MS` | `600000` | Next-retry scheduled further out ⇒ takeover |
+| `OPENCODE_RESUME_REARM_MS` | `600000` | Cool-down before one bounded recovery re-arm after giving up |
 | `OPENCODE_RESUME_REANIMATE` | `true` | Revive crashed sessions on startup |
 | `OPENCODE_RESUME_REANIMATE_WINDOW_MS` | `600000` | Max age of sessions eligible for revival |
 | `OPENCODE_RESUME_AUTO_UPDATE` | `true` | Self-update daily from GitHub (applies on next OpenCode restart); a native TUI toast (with an OS notification as backup) announces the completed update |
 | `OPENCODE_RESUME_NOTICE_THROTTLE_MS` | `3000` | Min gap between user notices in the OpenCode log (legacy `OPENCODE_RESUME_TOAST_THROTTLE_MS` still honored) |
 | `OPENCODE_RESUME_STOPSTORE` | `<plugin>/auto-resume.js.stopped.json` | Where user-stop markers are persisted across restarts |
 | `OPENCODE_RESUME_OFFSTORE` | `<plugin>/auto-resume.js.off.json` | Where per-session opt-outs (`auto-resume off`) are persisted |
-| `OPENCODE_RESUME_BREAKER_THRESHOLD` / `_WINDOW_MS` / `_COOLDOWN_MS` | `6` / `900000` / `300000` | Global circuit breaker |
+| `OPENCODE_RESUME_PAUSESTORE` | `<plugin>/auto-resume.js.paused.json` | Where "user paused" markers are persisted across restarts (set to a path, or empty to keep the default) |
+| `OPENCODE_RESUME_BREAKER_THRESHOLD` | `6` | Failures inside the window before the global breaker opens |
+| `OPENCODE_RESUME_BREAKER_WINDOW_MS` | `900000` | Circuit-breaker rolling window |
+| `OPENCODE_RESUME_BREAKER_COOLDOWN_MS` | `300000` | Circuit-breaker cool-down once open |
 | `OPENCODE_RESUME_COMPACT_ON_OVERFLOW` | `true` | Summarize + resume on overflow |
 | `OPENCODE_RESUME_SWITCH_ON_QUOTA` | `true` | Rotate on free-tier exhaustion |
 | `OPENCODE_RESUME_SWITCH_ON_RATELIMIT` | `true` | Rotate on repeated 429s |

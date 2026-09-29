@@ -812,6 +812,18 @@ export const createOsNotifier = ({
   }
 }
 
+/** Plan kinds that take part in the anti-redundant-repeat heuristic in
+ *  schedule(). A back-to-back repeat of one of these, with no observed
+ *  progress, is almost always the model asking the same question twice.
+ *
+ *  "empty" is deliberately excluded: the empty-streak ladder has its own
+ *  escalation, and nothing increments `chain` on that path, so an empty turn
+ *  would always look like an unmoved-chain repeat and hijack the third nudge
+ *  into the tool-failure prompt. "debug" is excluded because it is the
+ *  escalation target itself. "retry"/"takeover" are excluded: they only fire
+ *  after real failures, and S13 pins that they never escalate. */
+const SAME_KIND_WATCHED = new Set(["proceed", "drive"])
+
 export const AutoResumePlugin = async ({ client, $ }) => {
   const cfg = loadConfig()
 
@@ -874,10 +886,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         await writeFile(tmp, payload, "utf8")
         // Windows: freshly written files can be briefly locked (AV/indexer), so
         // the atomic rename may fail with EPERM/EACCES/EBUSY — retry with
-        // backoff, then fall back to a plain overwrite of the final path. tmp is
-        // left intact for the finally block below to clean up.
+        // backoff, then fall back to a plain overwrite of the final path.
         for (const delayMs of [25, 50, 100, 200, 400]) {
           try {
+            // A successful rename consumes `tmp`, so the finally below has
+            // nothing left to remove on this path.
             await rename(tmp, path)
             return
           } catch (err) {
@@ -889,10 +902,13 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         // intact for the finally block below to clean up.
         await writeFile(path, payload, "utf8")
       } finally {
-        // Cleanup the tmp file regardless of which path succeeded. Without
-        // this, every successful rename leaked one tmp file with a unique
-        // timestamp+random suffix — accumulating forever on Windows where
-        // the rename is the common success case.
+        // The store used to clean up only on the "all retries failed" path, so
+        // a non-retryable rename error (ENOSPC, EROFS, ...) propagated out of
+        // writeOnce and orphaned a uniquely-suffixed tmp file. Every orphan is
+        // permanent: the name embeds a timestamp + random suffix, so nothing
+        // ever overwrites or collects it. Hoisting the cleanup to `finally`
+        // covers the throw path too. On the success path unlink is a no-op
+        // (rename already moved the file) and its ENOENT is swallowed.
         try { await unlink(tmp) } catch { /* already gone or locked */ }
       }
     }
@@ -1755,27 +1771,27 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     // the same proceed/retry/empty message while the model re-emits the
     // same deferring question.
     const s = state(sessionID)
-    // "empty" is deliberately NOT watched. The empty-streak ladder already has
-    // its own escalation (empty -> empty -> explicit keep-going) and nothing
-    // increments `chain` on that path, so a second empty turn always looks like
-    // an unmoved-chain repeat — which used to rewrite the *third* nudge (the
-    // one designed to survive when the model has nothing queued) into the
-    // "multiple tool calls failed" debug prompt. No tool calls failed; the
-    // model returned an empty turn. Guarded by S16.
-    const SAME_KIND_WATCHED = new Set(["proceed", "drive"])
-    if (SAME_KIND_WATCHED.has(plan.kind) && s.previousKind === plan.kind && s.chain === s.previousKindChain) {
+    // The ORIGINAL kind, captured before any escalation below. The escalation
+    // rewrites plan.kind to "debug", so recording the rewritten value would
+    // make the next same-kind plan look like a *different* kind, reset the
+    // counter to 0 via the else-branch, and silently undo the escalation one
+    // turn later -- a stuck model would then flip-flop forever between the
+    // "continue anyway" nudge and the "root-cause it" prompt instead of
+    // converging on the latter.
+    const kind = plan.kind
+    if (SAME_KIND_WATCHED.has(kind) && s.previousKind === kind && s.chain === s.previousKindChain) {
       const repeatCount = (s.previousKindRepeats ?? 0) + 1
       s.previousKindRepeats = repeatCount
       if (repeatCount >= 2) {
-        log("warn", `same-kind repeat #${repeatCount} for "${plan.kind}" — escalating`, { sessionID })
+        log("warn", `same-kind repeat #${repeatCount} for "${kind}" — escalating`, { sessionID })
         plan = { ...plan, kind: "debug", prompt: PROMPTS.debug }
       } else {
-        log("info", `same-kind repeat for "${plan.kind}" — allowing once before escalation`, { sessionID })
+        log("info", `same-kind repeat for "${kind}" — allowing once before escalation`, { sessionID })
       }
     } else {
       s.previousKindRepeats = 0
     }
-    s.previousKind = plan.kind
+    s.previousKind = kind
     s.previousKindChain = s.chain
     const existing = timers.get(sessionID)
     if (existing) clearTimeout(existing)
