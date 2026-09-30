@@ -45,6 +45,14 @@ const invokedDirectly =
   typeof process.argv[1] === "string" &&
   resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
+if (!invokedDirectly && process.argv[2] !== undefined) {
+  // A mode flag was passed but the main-module check failed (symlinked
+  // checkout, case-mismatched drive letter, exotic launcher). Exiting 0
+  // here would silently disable the CI --check gate, so fail loudly.
+  console.error("coverage.mjs: mode flag passed but script was not invoked as the main module")
+  process.exit(1)
+}
+
 if (invokedDirectly) {
   const root = dirname(dirname(fileURLToPath(import.meta.url)))
   const mode = process.argv[2]
