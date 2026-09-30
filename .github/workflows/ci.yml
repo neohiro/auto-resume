@@ -52,6 +52,8 @@ jobs:
           node-version: ${{ matrix.node }}
       - name: Verify version consistency
         run: node scripts/check-version.cjs
+      - name: Verify README coverage metadata is generated, not hand-edited
+        run: node scripts/coverage.mjs --check
       - name: Run test suites
         run: npm test
 

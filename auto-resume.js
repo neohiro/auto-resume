@@ -684,6 +684,12 @@ const NOTIFIER_TIMEOUT_MS = 15_000
  *  few hundred lines preserves a useful window of recent history. */
 const NOTICE_DROP_MAX_BYTES = 1_048_576
 const NOTICE_DROP_KEEP_LINES = 200
+/** Cross-process lock budget for the drop file: how long a drop waits for a
+ *  foreign lock before giving up on compaction (the notice itself still
+ *  appends), and how old a lock must be before it is treated as a crashed
+ *  holder's orphan and reaped. */
+const NOTICE_DROP_LOCK_TIMEOUT_MS = 2_000
+const NOTICE_DROP_LOCK_STALE_MS = 30_000
 export const createOsNotifier = ({
   $,
   platform = process.platform,
@@ -693,6 +699,8 @@ export const createOsNotifier = ({
   dropFile = null, // tests: inject a memory-backed drop instead of writing disk
   dropMaxBytes = NOTICE_DROP_MAX_BYTES,
   dropKeepLines = NOTICE_DROP_KEEP_LINES,
+  dropLockTimeoutMs = NOTICE_DROP_LOCK_TIMEOUT_MS,
+  dropLockStaleMs = NOTICE_DROP_LOCK_STALE_MS,
 } = {}) => {
   const withTimeout = (p) =>
     Promise.race([
@@ -739,7 +747,9 @@ export const createOsNotifier = ({
    *
    *  Concurrent drops share one in-flight compaction: without the guard two
    *  notices arriving together could each read the full oversized file and
-   *  write back overlapping tails, resurrecting entries the other dropped. */
+   *  write back overlapping tails, resurrecting entries the other dropped.
+   *  (Cross-process concurrency is handled one level up, by the file lock
+   *  in drop(); this guard covers same-process re-entrancy.) */
   let compacting = null
   const compactDropFile = async (fs) => {
     if (!dropFile || dropMaxBytes <= 0) return
@@ -767,6 +777,66 @@ export const createOsNotifier = ({
     await compacting
   }
 
+  /** Cross-process mutual exclusion for the compact-then-append sequence.
+   *  The in-process `compacting` guard below only serialises drops inside
+   *  THIS process; two OpenCode instances sharing one plugin directory need
+   *  a file lock, or one instance can append between the other's
+   *  compact-read and compact-write and lose its notice to the rename.
+   *
+   *  The lock is existence-based (`wx` exclusive create) with a JSON
+   *  {pid, ts, token} payload. Only a lock whose timestamp is provably
+   *  older than dropLockStaleMs is ever reaped — an unreadable or fresh
+   *  lock is waited on, never stolen, so a slow holder is delayed, not
+   *  corrupted. Release deletes the lock only when its token still
+   *  matches, so we can never remove a successor's fresh lock.
+   *
+   *  Failing to acquire the lock forfeits COMPACTION for this notice, not
+   *  the notice itself: the caller still appends. A best-effort log must
+   *  degrade to unbounded-before-silent, never the reverse. */
+  const acquireDropLock = async (fs, lockPath) => {
+    const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
+    const deadline = Date.now() + dropLockTimeoutMs
+    for (;;) {
+      try {
+        const handle = await fs.open(lockPath, "wx")
+        await handle.writeFile(JSON.stringify({ pid: process.pid, ts: Date.now(), token }))
+        await handle.close()
+        let released = false
+        return async () => {
+          if (released) return
+          released = true
+          try {
+            const raw = await fs.readFile(lockPath, "utf8").catch(() => "")
+            if (raw.includes(token)) await fs.unlink(lockPath).catch(() => {})
+          } catch { /* best effort */ }
+        }
+      } catch (err) {
+        if (err?.code !== "EEXIST") return null
+        let stale = false
+        try {
+          const ts = JSON.parse(await fs.readFile(lockPath, "utf8"))?.ts
+          stale = Number.isFinite(ts) && Date.now() - ts > dropLockStaleMs
+        } catch { /* unreadable lock: wait, never steal */ }
+        if (stale) {
+          await fs.unlink(lockPath).catch(() => {})
+          continue
+        }
+        if (Date.now() >= deadline) return null
+        await new Promise((r) => setTimeout(r, 25))
+      }
+    }
+  }
+
+  /** Serialise drops inside this process so same-process notices never
+   *  contend on the file lock with each other — they queue here instead,
+   *  and the file lock stays purely a cross-process mechanism. */
+  let dropChain = Promise.resolve()
+  const serializeDrop = (fn) => {
+    const run = dropChain.then(fn, fn)
+    dropChain = run.catch(() => {})
+    return run
+  }
+
   /** Best-effort user-visible fallback: append a tiny JSON line to a drop file
    *  next to the plugin.  The TUI / launcher tails this file and surfaces
    *  unread entries as transient banners — guaranteed to land somewhere the
@@ -776,17 +846,26 @@ export const createOsNotifier = ({
       try { await dropFile(title, message); return true } catch { return false }
     }
     if (!dropFile) return false
-    try {
-      const { mkdir, appendFile, stat, readFile, writeFile, rename, unlink } = await import("node:fs/promises")
-      const { dirname } = await import("node:path")
-      await mkdir(dirname(dropFile), { recursive: true })
-      // Deliberately swallowed: failing to compact must never cost us the
-      // notice itself, so the append below is attempted either way.
-      await compactDropFile({ stat, readFile, writeFile, rename, unlink }).catch(() => {})
-      const line = JSON.stringify({ ts: Date.now(), title, message }) + "\n"
-      await appendFile(dropFile, line, "utf8")
-      return true
-    } catch { return false }
+    return serializeDrop(async () => {
+      try {
+        const { mkdir, appendFile, stat, readFile, writeFile, rename, unlink, open } = await import("node:fs/promises")
+        const { dirname } = await import("node:path")
+        await mkdir(dirname(dropFile), { recursive: true })
+        const release = await acquireDropLock({ open, readFile, unlink }, `${dropFile}.lock`).catch(() => null)
+        try {
+          // Deliberately swallowed: failing to compact must never cost us the
+          // notice itself, so the append below is attempted either way.
+          if (release) {
+            await compactDropFile({ stat, readFile, writeFile, rename, unlink }).catch(() => {})
+          }
+          const line = JSON.stringify({ ts: Date.now(), title, message }) + "\n"
+          await appendFile(dropFile, line, "utf8")
+          return true
+        } finally {
+          await release?.().catch(() => {})
+        }
+      } catch { return false }
+    })
   }
 
   let wslCache
