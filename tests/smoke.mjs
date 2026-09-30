@@ -138,6 +138,17 @@ const ev = (type, properties) => ({ event: { type, properties } })
   const stale = [...inDoc].filter((n) => !inCode.has(n))
   ok(undocumented.length === 0, `I1: every env var in the code is documented (${undocumented.join(", ") || "none missing"})`)
   ok(stale.length === 0, `I2: no stale env vars documented (${stale.join(", ") || "none stale"})`)
+  // N13 proves the notice drop file is bounded, but only with an injected cap --
+  // writing the real 1 MiB default in a test is not worth the wall-clock. So
+  // pin the default statically instead: a regression that set it to Infinity (or
+  // deleted it) would silently restore the unbounded-append leak on every host
+  // where the OS notification channel is broken.
+  const cap = /const NOTICE_DROP_MAX_BYTES = ([\d_]+)/.exec(code)?.[1]
+  const capNum = cap ? Number(cap.replace(/_/g, "")) : NaN
+  ok(Number.isFinite(capNum) && capNum > 0 && capNum <= 16 * 1_048_576,
+    `I3: the notice drop cap is a finite, sane byte budget (${cap ?? "not found"})`)
+  const keep = /const NOTICE_DROP_KEEP_LINES = (\d+)/.exec(code)?.[1]
+  ok(Number(keep) > 0, `I4: compaction retains a non-zero tail (${keep ?? "not found"})`)
 }
 
 console.log(process.exitCode ? "SMOKE TEST FAILED" : "ALL SMOKE TESTS PASSED")

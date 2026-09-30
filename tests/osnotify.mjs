@@ -204,5 +204,52 @@ const MSG = "body 'quoted' text"
     "N12: CreateToastNotifier is called with the AUMID variable, not the PowerShell AUMID")
 }
 
+// ---- 13: the drop file is bounded, and compaction keeps the newest lines -----
+// The drop file is append-only and the plugin runs for weeks, so on any host
+// where the OS channel is broken EVERY notice falls back to this file. Without
+// a cap that is unbounded growth on precisely the worst-affected hosts. The
+// caps are injected small here so the behaviour is observable in a test.
+{
+  const dir = await mkdtemp(join(tmpdir(), "ar-cap-"))
+  const drop = join(dir, "notices.jsonl")
+  const { readFile } = await import("node:fs/promises")
+  const notify = createOsNotifier({ platform: "win32", dropFile: drop, dropMaxBytes: 512, dropKeepLines: 5 })
+  for (let i = 0; i < 60; i += 1) await notify("t", `entry-${i}`)
+  const text = await readFile(drop, "utf8")
+  const lines = text.split("\n").filter(Boolean)
+  // The cap is BYTE-triggered, not line-triggered: compaction runs when the
+  // file exceeds dropMaxBytes, rewrites it down to dropKeepLines, and the file
+  // then grows again until it trips. So the steady state oscillates between
+  // keepLines and however many lines fit in the byte cap -- not a flat
+  // keepLines. What must hold is that it is bounded, and nowhere near the 60
+  // notices written.
+  const lineBytes = Buffer.byteLength(lines[0] ?? "", "utf8") || 1
+  const ceiling = Math.max(6, Math.ceil(512 / lineBytes) + 2)
+  ok(lines.length <= ceiling,
+    `N13: drop file stays bounded under sustained notices (${lines.length} lines, ceiling ${ceiling}, 60 written)`)
+  ok(Buffer.byteLength(text, "utf8") <= 512 + 256,
+    `N13: bytes stay near the cap (${Buffer.byteLength(text, "utf8")} vs 512 cap)`)
+  // Compaction must retain the MOST RECENT entries -- that is the only part
+  // the TUI has any use for -- and must not corrupt the JSON.
+  const last = JSON.parse(lines[lines.length - 1])
+  ok(last.message === "entry-59", `N13: newest notice survives compaction (${last.message})`)
+  // The newest line is always the one being appended right now, so asserting
+  // on it alone proves nothing: keeping the OLDEST entries would still pass.
+  // Check the whole retained window is recent.
+  const keptIdx = lines.map((l) => Number(/entry-(\d+)/.exec(JSON.parse(l).message)?.[1]))
+  ok(Math.min(...keptIdx) >= 50,
+    `N13: compaction keeps a RECENT window, not the oldest entries (oldest kept: entry-${Math.min(...keptIdx)})`)
+  ok(lines.every((l) => { try { JSON.parse(l); return true } catch { return false } }),
+    "N13: every retained line is still valid JSON")
+  ok(text.endsWith("\n"), "N13: file still ends with a newline (line-oriented tailers)")
+  const { readdir } = await import("node:fs/promises")
+  const leftovers = (await readdir(dir)).filter((name) => name.endsWith(".tmp"))
+  ok(leftovers.length === 0, `N13: compaction cleans up its temporary file (${leftovers.join(", ") || "none left"})`)
+  // A compaction that fails must not cost us the notice it was compacting for.
+  const notify2 = createOsNotifier({ platform: "win32", dropFile: join(dir, "nested", "deep", "notices.jsonl") })
+  ok(await notify2("t2", "m2") === true, "N13: missing parent dirs are still created")
+  await rm(dir, { recursive: true, force: true })
+}
+
 await sleep(50)
 console.log(process.exitCode ? "OSNOTIFY TESTS FAILED" : "ALL OSNOTIFY TESTS PASSED")

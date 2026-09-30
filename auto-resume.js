@@ -678,6 +678,12 @@ public static extern void SetCurrentProcessExplicitAppUserModelID([System.Runtim
  *  to a tiny JSON drop-file next to the plugin so the TUI / launcher can
  *  surface the notice to the user — better than going silent. */
 const NOTIFIER_TIMEOUT_MS = 15_000
+/** Cap for the append-only notice drop file, and how many of the most recent
+ *  lines compaction keeps once it trips. See compactDropFile(). 1 MiB of
+ *  notices is already far more than the TUI will ever surface, and keeping a
+ *  few hundred lines preserves a useful window of recent history. */
+const NOTICE_DROP_MAX_BYTES = 1_048_576
+const NOTICE_DROP_KEEP_LINES = 200
 export const createOsNotifier = ({
   $,
   platform = process.platform,
@@ -685,6 +691,8 @@ export const createOsNotifier = ({
   wslVersionFile = "/proc/version",
   timeoutMs = NOTIFIER_TIMEOUT_MS,
   dropFile = null, // tests: inject a memory-backed drop instead of writing disk
+  dropMaxBytes = NOTICE_DROP_MAX_BYTES,
+  dropKeepLines = NOTICE_DROP_KEEP_LINES,
 } = {}) => {
   const withTimeout = (p) =>
     Promise.race([
@@ -717,6 +725,48 @@ export const createOsNotifier = ({
     }
   }
 
+  /** Bound the drop file's growth. The file is append-only and this plugin
+   *  runs for weeks at a time, and every notice that cannot reach a real OS
+   *  channel lands here as a line — so without a cap it grows without bound on
+   *  exactly the hosts that can least afford the disk churn (those where the
+   *  notifier is broken and *every* notice falls back to the file).
+   *
+   *  Compaction rewrites the SAME path in place rather than rotating to a
+   *  sidecar: the TUI tails this file, and rotating would strand a tailer on
+   *  the old inode. The rewrite goes through a tmp + rename so a tailer never
+   *  observes a half-written file, with a plain overwrite as the fallback for
+   *  the Windows sharing violations that path exists to absorb.
+   *
+   *  Concurrent drops share one in-flight compaction: without the guard two
+   *  notices arriving together could each read the full oversized file and
+   *  write back overlapping tails, resurrecting entries the other dropped. */
+  let compacting = null
+  const compactDropFile = async (fs) => {
+    if (!dropFile || dropMaxBytes <= 0) return
+    let size = 0
+    try { size = (await fs.stat(dropFile)).size } catch { return } // missing file: nothing to compact
+    if (size <= dropMaxBytes) return
+    compacting ??= (async () => {
+      const raw = await fs.readFile(dropFile, "utf8")
+      const kept = raw.split("\n").filter(Boolean).slice(-dropKeepLines)
+      if (!kept.length) return
+      const text = `${kept.join("\n")}\n`
+      const tmp = `${dropFile}.${process.pid}.${Date.now()}.tmp`
+      try {
+        await fs.writeFile(tmp, text, "utf8")
+        try { await fs.rename(tmp, dropFile) }
+        catch {
+          // Windows: the tailer may hold the destination open. Losing atomicity
+          // is preferable to losing the log.
+          await fs.writeFile(dropFile, text, "utf8")
+        }
+      } finally {
+        try { await fs.unlink(tmp) } catch { /* renamed away, or already gone */ }
+      }
+    })().finally(() => { compacting = null })
+    await compacting
+  }
+
   /** Best-effort user-visible fallback: append a tiny JSON line to a drop file
    *  next to the plugin.  The TUI / launcher tails this file and surfaces
    *  unread entries as transient banners — guaranteed to land somewhere the
@@ -727,9 +777,12 @@ export const createOsNotifier = ({
     }
     if (!dropFile) return false
     try {
-      const { mkdir, appendFile } = await import("node:fs/promises")
+      const { mkdir, appendFile, stat, readFile, writeFile, rename, unlink } = await import("node:fs/promises")
       const { dirname } = await import("node:path")
       await mkdir(dirname(dropFile), { recursive: true })
+      // Deliberately swallowed: failing to compact must never cost us the
+      // notice itself, so the append below is attempted either way.
+      await compactDropFile({ stat, readFile, writeFile, rename, unlink }).catch(() => {})
       const line = JSON.stringify({ ts: Date.now(), title, message }) + "\n"
       await appendFile(dropFile, line, "utf8")
       return true
