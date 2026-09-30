@@ -226,10 +226,10 @@ Reply delivery probes the SDK surface (`postSessionByIdPermissionsByPermissionId
 
 ```sh
 git clone https://github.com/neohiro/auto-resume && cd auto-resume
-npm test        # 185+ assertions across 9 suites (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
+npm test        # 240+ assertions across 10 suites (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
 ```
 
-The nine Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
+The ten Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
 
 ### Windows unattended notes (UAC / SmartScreen)
 

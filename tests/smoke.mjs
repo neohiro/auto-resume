@@ -7,6 +7,7 @@ process.env.OPENCODE_RESUME_NOTICE_THROTTLE_MS ??= "0"
 process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { readFile, readdir } from "node:fs/promises"
 
 // Per-run isolated sidecar stores: never touch the real plugin directory and
 // never leak state between runs (a persisted stop/opt-out would poison the
@@ -129,8 +130,11 @@ const ev = (type, properties) => ({ event: { type, properties } })
 // or copies a documented name that no longer exists. Cheap to assert, and it is
 // the kind of thing that rots silently between releases.
 {
-  const code = await Bun.file(new URL("../auto-resume.js", import.meta.url)).text()
-  const readme = await Bun.file(new URL("../README.md", import.meta.url)).text()
+  const [code, readme, packageText] = await Promise.all([
+    readFile(new URL("../auto-resume.js", import.meta.url), "utf8"),
+    readFile(new URL("../README.md", import.meta.url), "utf8"),
+    readFile(new URL("../package.json", import.meta.url), "utf8"),
+  ])
   const names = (src) => new Set(src.match(/OPENCODE_RESUME_[A-Z_]+/g) ?? [])
   const inCode = names(code)
   const inDoc = names(readme)
@@ -149,6 +153,16 @@ const ev = (type, properties) => ({ event: { type, properties } })
     `I3: the notice drop cap is a finite, sane byte budget (${cap ?? "not found"})`)
   const keep = /const NOTICE_DROP_KEEP_LINES = (\d+)/.exec(code)?.[1]
   ok(Number(keep) > 0, `I4: compaction retains a non-zero tail (${keep ?? "not found"})`)
+  // A suite that exists but is never invoked is worse than a missing suite: it
+  // reports green locally while CI stays blind to the regression it guards.
+  // The favorite suite was exactly that until this check.
+  const suiteFiles = (await readdir(new URL("../tests/", import.meta.url), { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".mjs"))
+    .map((entry) => entry.name)
+    .sort()
+  const testCommand = JSON.parse(packageText).scripts.test
+  const uninvoked = suiteFiles.filter((name) => !testCommand.includes(`tests/${name}`))
+  ok(uninvoked.length === 0, `I5: npm test invokes every suite (${uninvoked.join(", ") || "none missing"})`)
 }
 
 console.log(process.exitCode ? "SMOKE TEST FAILED" : "ALL SMOKE TESTS PASSED")
