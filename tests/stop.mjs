@@ -567,4 +567,41 @@ const ev = (type, properties) => ({ event: { type, properties } })
   else process.env.OPENCODE_AUTOPILOT_MAX_NUDGES = prevNudges
 }
 
+// ---- S18: Stop during the model-catalog lookup abandons rotation ------------
+{
+  const state = makeState()
+  let catalogStarted = () => {}
+  let releaseCatalog = () => {}
+  const catalogEntered = new Promise((resolve) => { catalogStarted = resolve })
+  const catalogGate = new Promise((resolve) => { releaseCatalog = resolve })
+  const baseClient = makeClient(state)
+  const client = {
+    ...baseClient,
+    config: {
+      providers: async () => {
+        catalogStarted()
+        await catalogGate
+        return { data: { providers: [
+          { id: "provA", models: { "a-max": {} } },
+          { id: "provB", models: { "b-max": {} } },
+        ] } }
+      },
+    },
+  }
+  const hooks = await AutoResumePlugin({ client })
+  // Start a rotation-triggering auth failure, but do not await it: the test
+  // needs to land a Stop while pickAlternateModel is suspended on the catalog.
+  const recovery = hooks.event(ev("session.error", { sessionID: "s18", error: { name: "ProviderAuthError", data: { message: "auth failed" } } }))
+  await catalogEntered
+  await hooks.event(ev("session.error", { sessionID: "s18", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
+  releaseCatalog()
+  await recovery
+  await sleep(300)
+  ok(state.prompts.length === 0, "S18: no recovery is injected after Stop abandons rotation")
+  ok(!state.logs.some((t) => t.includes("rotated model")), "S18: the alternate model is never selected")
+  ok(state.logs.some((t) => t.includes("rotation abandoned — session was stopped by the user")),
+    "S18: the abandoned rotation is explained in the log")
+  ok(state.logs.some((t) => t.includes("Stopped by you")), "S18: the Stop itself is still acknowledged")
+}
+
 console.log(process.exitCode ? "STOP TESTS FAILED" : "ALL STOP TESTS PASSED")
