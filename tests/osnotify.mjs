@@ -251,5 +251,31 @@ const MSG = "body 'quoted' text"
   await rm(dir, { recursive: true, force: true })
 }
 
+// ---- 14: cross-process lock protocol for compaction -------------------------
+// Two OpenCode instances can share one plugin directory, so the
+// compact-then-append sequence takes a file lock. The protocol's two promises
+// are pinned here without spawning a second process: a stale lock (crashed
+// holder) is reaped, while a fresh foreign lock is neither stolen nor
+// allowed to cost us the notice.
+{
+  const dir = await mkdtemp(join(tmpdir(), "ar-lock-"))
+  const drop = join(dir, "notices.jsonl")
+  const { readFile } = await import("node:fs/promises")
+  const lockGone = async () => (await readFile(`${drop}.lock`, "utf8").catch(() => null)) === null
+  await writeFile(`${drop}.lock`, JSON.stringify({ pid: 1, ts: Date.now() - 120_000, token: "dead" }), "utf8")
+  const notify = createOsNotifier({ platform: "win32", dropFile: drop, dropLockTimeoutMs: 500 })
+  ok(await notify("t", "stale-lock-notice") === true, "N14: notice lands despite a stale lock file")
+  ok(await lockGone(), "N14: the stale lock was reaped, not waited on")
+  ok((await readFile(drop, "utf8")).includes("stale-lock-notice"), "N14: notice appended after reaping")
+  const foreign = JSON.stringify({ pid: 424242, ts: Date.now(), token: "someone-else" })
+  await writeFile(`${drop}.lock`, foreign, "utf8")
+  const notify2 = createOsNotifier({ platform: "win32", dropFile: drop, dropLockTimeoutMs: 150 })
+  ok(await notify2("t", "contended-notice") === true, "N14: notice lands even when the lock is held elsewhere")
+  ok((await readFile(drop, "utf8")).includes("contended-notice"), "N14: contended notice appended without compaction")
+  ok((await readFile(`${drop}.lock`, "utf8").catch(() => null)) === foreign,
+    "N14: the fresh foreign lock was neither stolen nor deleted")
+  await rm(dir, { recursive: true, force: true })
+}
+
 await sleep(50)
 console.log(process.exitCode ? "OSNOTIFY TESTS FAILED" : "ALL OSNOTIFY TESTS PASSED")

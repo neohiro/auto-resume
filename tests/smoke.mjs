@@ -8,6 +8,7 @@ process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0" // never hit the network in CI
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { readFile, readdir } from "node:fs/promises"
+import { collectCoverage, coverageMarker } from "../scripts/coverage.mjs"
 
 // Per-run isolated sidecar stores: never touch the real plugin directory and
 // never leak state between runs (a persisted stop/opt-out would poison the
@@ -163,6 +164,12 @@ const ev = (type, properties) => ({ event: { type, properties } })
   const testCommand = JSON.parse(packageText).scripts.test
   const uninvoked = suiteFiles.filter((name) => !testCommand.includes(`tests/${name}`))
   ok(uninvoked.length === 0, `I5: npm test invokes every suite (${uninvoked.join(", ") || "none missing"})`)
+  // I6 pins the GENERATED coverage line (see scripts/coverage.mjs): the same
+  // collector the writer uses, so the README figure cannot be hand-edited
+  // into a lie in either direction.
+  const meta = await collectCoverage(new URL("..", import.meta.url))
+  ok(readme.includes(coverageMarker(meta)),
+    `I6: README coverage line matches generated metadata (${meta.text}; ${meta.assertions} static)`)
 }
 
 console.log(process.exitCode ? "SMOKE TEST FAILED" : "ALL SMOKE TESTS PASSED")
