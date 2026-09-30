@@ -703,15 +703,18 @@ export const createOsNotifier = ({
   dropLockStaleMs = NOTICE_DROP_LOCK_STALE_MS,
 } = {}) => {
   const withTimeout = (p) =>
-    Promise.race([
-      p,
-      new Promise((_, reject) => {
-        // Deliberately NOT unref'd: this timer is what resolves hung
-        // dispatches — an unref'd timer on an otherwise idle event loop
-        // would let the process exit (code 13) without settling anything.
-        setTimeout(() => reject(new Error(`notifier timed out after ${timeoutMs}ms`)), timeoutMs)
-      }),
-    ])
+    new Promise((resolve, reject) => {
+      // Keep this timer ref'd while a dispatch is pending: it is what resolves
+      // hung dispatches on an otherwise idle event loop.
+      const timer = setTimeout(() => reject(new Error(`notifier timed out after ${timeoutMs}ms`)), timeoutMs)
+      // Clear the watchdog as soon as the dispatch settles. Without this,
+      // every successful notification leaves a timeout-length timer behind,
+      // keeping the event loop (and sometimes the host process) alive needlessly.
+      Promise.resolve(p).then(
+        (value) => { clearTimeout(timer); resolve(value) },
+        (err) => { clearTimeout(timer); reject(err) },
+      )
+    })
 
   /** Invoke the host shell runner with an argv array.  Bun's $\`…\` returns
    *  a thenable with .quiet; a plain function returns a Promise.  Both shapes
@@ -745,42 +748,36 @@ export const createOsNotifier = ({
    *  observes a half-written file, with a plain overwrite as the fallback for
    *  the Windows sharing violations that path exists to absorb.
    *
-   *  Concurrent drops share one in-flight compaction: without the guard two
-   *  notices arriving together could each read the full oversized file and
-   *  write back overlapping tails, resurrecting entries the other dropped.
-   *  (Cross-process concurrency is handled one level up, by the file lock
-   *  in drop(); this guard covers same-process re-entrancy.) */
-  let compacting = null
+   *  Same-process drops are serialised by drop() before this runs, so no
+   *  additional in-process compaction guard is needed here. Cross-process
+   *  overlap is prevented by the file lock acquired in drop(). */
   const compactDropFile = async (fs) => {
     if (!dropFile || dropMaxBytes <= 0) return
     let size = 0
     try { size = (await fs.stat(dropFile)).size } catch { return } // missing file: nothing to compact
     if (size <= dropMaxBytes) return
-    compacting ??= (async () => {
-      const raw = await fs.readFile(dropFile, "utf8")
-      const kept = raw.split("\n").filter(Boolean).slice(-dropKeepLines)
-      if (!kept.length) return
-      const text = `${kept.join("\n")}\n`
-      const tmp = `${dropFile}.${process.pid}.${Date.now()}.tmp`
-      try {
-        await fs.writeFile(tmp, text, "utf8")
-        try { await fs.rename(tmp, dropFile) }
-        catch {
-          // Windows: the tailer may hold the destination open. Losing atomicity
-          // is preferable to losing the log.
-          await fs.writeFile(dropFile, text, "utf8")
-        }
-      } finally {
-        try { await fs.unlink(tmp) } catch { /* renamed away, or already gone */ }
+    const raw = await fs.readFile(dropFile, "utf8")
+    const kept = raw.split("\n").filter(Boolean).slice(-dropKeepLines)
+    if (!kept.length) return
+    const text = `${kept.join("\n")}\n`
+    const tmp = `${dropFile}.${process.pid}.${Date.now()}.tmp`
+    try {
+      await fs.writeFile(tmp, text, "utf8")
+      try { await fs.rename(tmp, dropFile) }
+      catch {
+        // Windows: the tailer may hold the destination open. Losing atomicity
+        // is preferable to losing the log.
+        await fs.writeFile(dropFile, text, "utf8")
       }
-    })().finally(() => { compacting = null })
-    await compacting
+    } finally {
+      try { await fs.unlink(tmp) } catch { /* renamed away, or already gone */ }
+    }
   }
 
   /** Cross-process mutual exclusion for the compact-then-append sequence.
-   *  The in-process `compacting` guard below only serialises drops inside
-   *  THIS process; two OpenCode instances sharing one plugin directory need
-   *  a file lock, or one instance can append between the other's
+   *  Same-process drops are already serialised by drop(), so this lock only
+   *  needs to coordinate separate OpenCode instances sharing one plugin
+   *  directory: without it, one instance could append between another's
    *  compact-read and compact-write and lose its notice to the rename.
    *
    *  The lock is existence-based (`wx` exclusive create) with a JSON
@@ -797,19 +794,9 @@ export const createOsNotifier = ({
     const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
     const deadline = Date.now() + dropLockTimeoutMs
     for (;;) {
+      let handle
       try {
-        const handle = await fs.open(lockPath, "wx")
-        await handle.writeFile(JSON.stringify({ pid: process.pid, ts: Date.now(), token }))
-        await handle.close()
-        let released = false
-        return async () => {
-          if (released) return
-          released = true
-          try {
-            const raw = await fs.readFile(lockPath, "utf8").catch(() => "")
-            if (raw.includes(token)) await fs.unlink(lockPath).catch(() => {})
-          } catch { /* best effort */ }
-        }
+        handle = await fs.open(lockPath, "wx")
       } catch (err) {
         if (err?.code !== "EEXIST") return null
         let stale = false
@@ -823,6 +810,23 @@ export const createOsNotifier = ({
         }
         if (Date.now() >= deadline) return null
         await new Promise((r) => setTimeout(r, 25))
+        continue
+      }
+      try {
+        // A failed payload write must not leak the lock handle, even though
+        // acquisition itself is about to be abandoned.
+        await handle.writeFile(JSON.stringify({ pid: process.pid, ts: Date.now(), token }))
+      } finally {
+        await handle.close().catch(() => {})
+      }
+      let released = false
+      return async () => {
+        if (released) return
+        released = true
+        try {
+          const raw = await fs.readFile(lockPath, "utf8").catch(() => "")
+          if (raw.includes(token)) await fs.unlink(lockPath).catch(() => {})
+        } catch { /* best effort */ }
       }
     }
   }
