@@ -43,13 +43,14 @@ This is what auto-resume is for.
 | Free-tier / quota exhaustion (`402`, "free usage exceeded", "Insufficient balance", "requires more credits, or fewer max_tokens"…) | **Rotates to another model instantly — no user input**; if OpenRouter-style max_tokens/credits constraint and no alternate model, resumes with a compact low-token-budget prompt so the same model can finish under the tighter limit |
 | Truncated output (`MessageOutputLengthError`) | Seamless *"continue exactly where you stopped"* nudge |
 | Context-window overflow | Triggers compaction, resumes automatically afterwards |
-| Empty responses | Re-nudges once |
+| Empty responses | Re-nudges up to twice, then one explicit keep-going nudge (capped) |
 | Silently stalled streams (busy but no events) | Fast automatic retry after ~60s of silent "thinking" (labelled as such), full restart after the extended stall window |
 | Quiet-but-running tools (builds, test suites) | Extended grace window (×4) before any stall verdict |
 | Internal retry loops that never end (huge provider `Retry-After` values) | Taken over: aborted and resumed on the plugin's own schedule |
 | Client restarts / server crashes mid-task | On startup, recently-interrupted sessions ("Interrupted") are **re-animated** automatically — a restart is never mistaken for a Stop |
 | Subagent sessions | Left alone — their parent orchestrator owns them |
 | User aborts (**Stop**) | Detected — everything queued is cancelled and automation stays fully quiet until your next prompt |
+| Message reverts (**Revert**) | Treated like a Stop — queued autoprompts are cancelled and nothing is injected while you edit and reprompt manually |
 | Auth errors | Surfaced — never hammered |
 
 ### 2 — Model rotation
@@ -158,6 +159,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_NOTICE_THROTTLE_MS` | `3000` | Min gap between user notices in the OpenCode log (legacy `OPENCODE_RESUME_TOAST_THROTTLE_MS` still honored) |
 | `OPENCODE_RESUME_STOPSTORE` | `<plugin>/auto-resume.js.stopped.json` | Where user-stop markers are persisted across restarts |
 | `OPENCODE_RESUME_OFFSTORE` | `<plugin>/auto-resume.js.off.json` | Where per-session opt-outs (`auto-resume off`) are persisted |
+| `OPENCODE_RESUME_MAX_DIR_ASK_COUNTS` | `1000` | Maximum entries in directory ask counter before forced cleanup (`0` = unlimited) |
 | `OPENCODE_RESUME_PAUSESTORE` | `<plugin>/auto-resume.js.paused.json` | Where "user paused" markers are persisted across restarts (set to a path, or empty to keep the default) |
 | `OPENCODE_RESUME_BREAKER_THRESHOLD` | `6` | Failures inside the window before the global breaker opens |
 | `OPENCODE_RESUME_BREAKER_WINDOW_MS` | `900000` | Circuit-breaker rolling window |
@@ -190,6 +192,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 ## Safety rails
 
 - **User Stop is absolute**: hitting Stop cancels every queued injection and pauses recovery, todo-drive, auto-proceed, improvement passes, proposals *and* permission autopilot until you send the next prompt — and the stop is **remembered across restarts** (small JSON sidecar file), so a stopped session is never automatically revived. This holds even mid-flight: a Stop that lands while the plugin is waiting on the server (history fetch, status probe, model rotation) still cancels the pending work instead of injecting into the session you just silenced
+- **Revert means manual control**: reverting a message cancels every queued injection and pauses automation until your next prompt — same mechanics as a Stop, so no autoprompt ever fires into the reverted session while you edit and reprompt by hand
 - **Per-session kill switch**: `auto-resume off` in chat disables everything for that session only (survives restarts; title restored with no trace) — `auto-resume on` re-arms. On-by-default everywhere else: install and go
 - Per-task resume chain cap, reset by any real user message or clean completion
 - Shared autopilot nudge budget + wall-clock budget per task
@@ -205,9 +208,9 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 
 ## Compatibility
 
-Works anywhere OpenCode runs — **Windows, macOS, Linux**. The plugin is a single zero-dependency file using only the OpenCode SDK client, timers, and environment variables, plus the tiny local files it manages itself: the self-update backup (`.bak`), the update-ack marker (`.acked`), the user-stop memory (`auto-resume.js.stopped.json`), and the per-session opt-out memory (`auto-resume.js.off.json`). Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
+Works anywhere OpenCode runs — **Windows, macOS, Linux**. The plugin is a single zero-dependency file using only the OpenCode SDK client, timers, and environment variables, plus the tiny local files it manages itself: the self-update backup (`.bak`), the update-ack marker (`.acked`), the user-stop memory (`auto-resume.js.stopped.json`), the per-session opt-out memory (`auto-resume.js.off.json`), and the pause memory (`auto-resume.js.paused.json`). Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
 
-Tested against OpenCode's event API: `session.error`, `session.status`, `session.idle`, `message.updated`, `message.part.updated`, `todo.updated`, `permission.asked/updated/replied`, `session.compacted`.
+Tested against OpenCode's event API: `session.error/status/idle/created/updated/deleted/compacted`, `message.updated/removed`, `message.part.updated/removed`, `todo.updated`, `permission.asked/updated/replied`, `server.connected`.
 
 ### Permission payload shapes
 

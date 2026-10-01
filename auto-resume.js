@@ -236,7 +236,54 @@ const DEFAULTS = {
   improveCooldownMs: 600_000,
   maxNudges: 25,
   budgetMs: 28_800_000,
+  // Maximum entries in dirAskCounts before forced cleanup (0 = unlimited, but
+  // periodic cleanup in checkStalls will still run). Default 1000 entries.
+  maxDirAskCounts: 1000,
 }
+
+// ── Named constants for magic numbers ─────────────────────────────────────
+// Session idle timeout before cleanup (6 hours)
+const SESSION_IDLE_CLEANUP_MS = 21_600_000
+// Title refresh debounce delay
+const TITLE_REFRESH_DEBOUNCE_MS = 250
+// Max output length for continuation stub detection
+const CONTINUATION_STUB_MAX_LEN = 250
+// Minimum text length for no-todo improvement pass
+const NO_TODO_IMPROVE_MIN_CHARS = 80
+// Improved title display window (3 minutes)
+const IMPROVED_TITLE_WINDOW_MS = 180_000
+// Compaction watchdog timeout (3 minutes)
+const COMPACTION_WATCHDOG_MS = 180_000
+// Takeover retry delay
+const TAKEOVER_RETRY_DELAY_MS = 1_500
+// Takeover schedule delay
+const TAKEOVER_SCHEDULE_DELAY_MS = 800
+// Poll interval for busy sessions
+const BUSY_POLL_INTERVAL_MS = 5_000
+// Max polls for resume plans
+const MAX_RESUME_POLLS = 60
+// Max polls for other plans
+const MAX_OTHER_POLLS = 12
+// Reanimate scan interval (5 minutes)
+const REANIMATE_SCAN_INTERVAL_MS = 300_000
+// Update check interval (1 hour)
+const UPDATE_CHECK_INTERVAL_MS = 3_600_000
+// Update notice delivery retry interval (30 seconds)
+const NOTICE_DELIVERY_RETRY_MS = 30_000
+// OS notification timeout
+const OS_NOTIFICATION_TIMEOUT_MS = 15_000
+// Notice drop file max size (1 MiB)
+const NOTICE_DROP_MAX_BYTES = 1_048_576
+// Notice drop file keep lines
+const NOTICE_DROP_KEEP_LINES = 200
+// Notice drop lock timeout
+const NOTICE_DROP_LOCK_TIMEOUT_MS = 2_000
+// Notice drop lock stale threshold
+const NOTICE_DROP_LOCK_STALE_MS = 30_000
+// Perm fingerprint max length
+const PERM_FINGERPRINT_MAX_LEN = 4096
+// Store TTL (14 days)
+const STORE_TTL_MS = 14 * 86_400_000
 
 const RESUME_TAG = "[auto-resume]"
 
@@ -438,7 +485,7 @@ const CONTINUATION_STEM = /^(continue|continuing|resumed?|proceeding|finalizing|
 /** A short closing line announcing unfinished work. */
 const looksLikeContinuationStub = (text) => {
   const t = String(text ?? "").trim()
-  if (!t || t.length > 250) return false
+  if (!t || t.length > CONTINUATION_STUB_MAX_LEN) return false
   return CONTINUATION_STEM.test(t) || CONTINUATION_ANYWHERE.some((re) => re.test(t))
 }
 
@@ -455,6 +502,12 @@ const tierScore = (modelID) => {
   for (const [re, pts] of TIER_PENALTY) if (re.test(modelID)) score += pts
   return score
 }
+
+/** Regex patterns that indicate potentially dangerous user-supplied regexes
+ *  (ReDoS vectors). Used to reject malicious patterns in OPENCODE_AUTOPILOT_EXTRA_DENY.
+ *  This is a heuristic filter, not a guarantee — it catches common catastrophic
+ *  backtracking constructs but cannot detect all ReDoS vectors. */
+const DANGEROUS_REGEX_PATTERN = /\(\?[:=!]|\(\?<[^>]+>|\{[0-9]*,[0-9]*\}|\?\?|\+\+|\*\*|\(\s*\(\?|\(\?\+|\(\?\*|\(\?<[=!]|\(\?P<|\(\?P=|(\w)\1*[+*]\1*[+*]|[+*][+*]|[+*]\?[+*]/g
 
 /** Shell fragments considered too dangerous to auto-approve in safe mode.
  *  Plain case-insensitive substrings by default; "re:<body>" opts into regex
@@ -555,6 +608,7 @@ function loadConfig() {
     improveCooldownMs: num("OPENCODE_AUTOPILOT_IMPROVE_COOLDOWN_MS", DEFAULTS.improveCooldownMs),
     maxNudges: num("OPENCODE_AUTOPILOT_MAX_NUDGES", DEFAULTS.maxNudges),
     budgetMs: num("OPENCODE_AUTOPILOT_BUDGET_MS", DEFAULTS.budgetMs),
+    maxDirAskCounts: num("OPENCODE_RESUME_MAX_DIR_ASK_COUNTS", DEFAULTS.maxDirAskCounts),
   }
 }
 
@@ -677,19 +731,7 @@ public static extern void SetCurrentProcessExplicitAppUserModelID([System.Runtim
  *  create.  When no shell runner is provided, every platform falls through
  *  to a tiny JSON drop-file next to the plugin so the TUI / launcher can
  *  surface the notice to the user — better than going silent. */
-const NOTIFIER_TIMEOUT_MS = 15_000
-/** Cap for the append-only notice drop file, and how many of the most recent
- *  lines compaction keeps once it trips. See compactDropFile(). 1 MiB of
- *  notices is already far more than the TUI will ever surface, and keeping a
- *  few hundred lines preserves a useful window of recent history. */
-const NOTICE_DROP_MAX_BYTES = 1_048_576
-const NOTICE_DROP_KEEP_LINES = 200
-/** Cross-process lock budget for the drop file: how long a drop waits for a
- *  foreign lock before giving up on compaction (the notice itself still
- *  appends), and how old a lock must be before it is treated as a crashed
- *  holder's orphan and reaped. */
-const NOTICE_DROP_LOCK_TIMEOUT_MS = 2_000
-const NOTICE_DROP_LOCK_STALE_MS = 30_000
+const NOTIFIER_TIMEOUT_MS = OS_NOTIFICATION_TIMEOUT_MS
 export const createOsNotifier = ({
   $,
   platform = process.platform,
@@ -964,7 +1006,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   const cfg = loadConfig()
 
   const sessions = new Map() // sessionID -> state
-  const permissionPending = new Map() // sessionID -> ts
+  const permissionPending = new Map() // sessionID -> timestamp (for watchdog)
+  const permissionPendingById = new Map() // "sessionID|permID" -> timestamp (for dedupe)
   const modelCooldown = new Map() // "provider/model" -> untilTs
   const timers = new Map()
   const breakerFailures = []
@@ -973,6 +1016,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   let lastNoticeAt = 0
   let catalogCache = null
   let catalogFetchedAt = 0
+  let cachedPermFns = null
 
   // This file's own path on disk (also used by the self-updater below).
   const selfPath = (() => {
@@ -983,10 +1027,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   })()
 
   // ── persistent JSON sidecars next to this file ─────────────────────────
-  // Two tiny maps survive OpenCode restarts:
+  // Three tiny maps survive OpenCode restarts:
   //   • .stopped.json — sessions the user STOPPED (quiet until next prompt)
   //   • .off.json     — sessions where auto-resume is turned OFF entirely
-  const STORE_TTL_MS = 14 * 86_400_000 // forget ancient markers
+  //   • .paused.json  — sessions the user PAUSED (visible 🚫, quiet until "on")
+  // Ancient markers are forgotten after STORE_TTL_MS (module scope).
 
   const makeMapStore = (label, path) => {
     const map = new Map() // sessionID -> timestamp
@@ -1174,7 +1219,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     // Post-completion window: ✅ — shown briefly after all cycles finish so
     // the user sees explicit confirmation before returning to armed/idle.
     if (s?.improvedAt > 0 && (s?.improveDone ?? 0) >= (cfg.improveCycles ?? 1)) {
-      if (Date.now() - s.improvedAt < 180_000) return "improved"
+      if (Date.now() - s.improvedAt < IMPROVED_TITLE_WINDOW_MS) return "improved"
     }
 
     // Model asked a question (❓): set when the plugin detects a question
@@ -1280,7 +1325,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const t = setTimeout(() => {
       titleTimers.delete(sessionID)
       detach(refreshTitleNow(sessionID), "title-refresh")
-    }, 250)
+    }, TITLE_REFRESH_DEBOUNCE_MS)
     t.unref?.()
     titleTimers.set(sessionID, t)
   }
@@ -1361,7 +1406,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         rlStreak: 0, failStreak: 0, rotations: 0,
         favoriteRotatedAt: 0, turnsSinceRotation: 0, rotatedTo: null,
         todos: [], nudges: 0, driveCount: 0, staleDrives: -1,
-        lastDriveCompleted: -1, proposalSent: false, taskStartAt: 0,
+        proposalSent: false, taskStartAt: 0,
         improveDone: 0, improveTotal: 0, lastImprovedAt: 0, noTodoImproveFired: false,
         proceedCount: 0,
         toolErrs: 0, debugArmed: false, toolRunning: false,
@@ -1376,6 +1421,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         userPaused: false,
         taskCost: 0, costNotified: false, budgetNotified: false, gaveUpRearmed: false,
         lowBudgetStreak: 0, lowBudgetSig: null, lowBudgetLastFired: false,
+        lowBudgetPending: false,
+        lastNudgeCompletedCount: -1,
       }
       sessions.set(id, s)
     }
@@ -1399,7 +1446,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       chain: 0, continueCount: 0, compactAttempted: false,
       rlStreak: 0, failStreak: 0, rotations: 0,
       nudges: 0, driveCount: 0, staleDrives: -1,
-      lastDriveCompleted: -1, proposalSent: false,
+      proposalSent: false,
       previousKind: null, previousKindChain: 0, previousKindRepeats: 0,
       improveDone, improveTotal, lastImprovedAt,
       improveActive: false, improvedAt: 0, // 🧪 running, ✅ just-finished window
@@ -1408,15 +1455,21 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
       userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costNotified: false,
       budgetNotified: false, gaveUpRearmed: false, noTodoImproveFired: false,
-      lowBudgetStreak: 0, lowBudgetSig: null, userPaused: false, emptyStreak: false,
+      lowBudgetStreak: 0, lowBudgetSig: null, lowBudgetPending: false, userPaused: false, emptyStreak: false,
       lastErrorName: null, lastErrorSig: null,
+      lastNudgeCompletedCount: -1,
     })
     if (!keepTimers) s.stallResumes = 0
   }
 
   const detach = (promise, label) =>
     Promise.resolve().then(promise).catch(
-      (err) => console.error(`${RESUME_TAG} ${label} failed:`, err?.message ?? err))
+      (err) => {
+        const msg = `${RESUME_TAG} ${label} failed: ${err?.message ?? err}`
+        console.error(msg)
+        // Also log through the app.log system for persistence
+        log("error", msg, { label })
+      })
 
   const log = (level, message, extra) =>
     detach(() => client.app.log({ body: { service: "auto-resume", level, message, extra } }), "app.log")
@@ -1668,8 +1721,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     return (a) => PROMPTS.resume(a, detail, modelNote)
   }
 
+  // Catalog cache TTL (5 minutes)
+  const CATALOG_CACHE_TTL_MS = 300_000
+
   const getCatalog = async () => {
-    if (catalogCache && Date.now() - catalogFetchedAt < 300_000) return catalogCache
+    if (catalogCache && Date.now() - catalogFetchedAt < CATALOG_CACHE_TTL_MS) return catalogCache
     try {
       const res = await client.config.providers()
       const data = res?.data ?? res
@@ -1677,12 +1733,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       catalogFetchedAt = Date.now()
     } catch (err) {
       log("warn", "could not fetch provider catalog", { err: err?.message ?? String(err) })
-      // Stamp the timestamp even on failure so we don't hammer a downed
-      // server, but KEEP the prior cache when one exists — an empty/stale
-      // catalog is better than no catalog at all (rotation just falls back
-      // to the fallback chain). Without this stamp the `[] && <ttl> ` check
-      // above would short-circuit the retry for 5 minutes.
-      catalogFetchedAt = Date.now()
+      // Do NOT stamp catalogFetchedAt on failure — we want to retry on the next
+      // call instead of waiting 5 minutes. Keep the prior cache (if any) as a
+      // stale fallback so rotation can still work with old data.
       catalogCache = catalogCache ?? []
     }
     return catalogCache
@@ -1885,6 +1938,34 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     queueTitleRefresh(sessionID)
   }
 
+  /** User reverted a message: they want the time to edit and reprompt
+   *  manually, so go fully quiet — cancel everything queued, inject nothing,
+   *  auto-answer no permissions — until a REAL user prompt starts a new task.
+   *  Same mechanics as a Stop (including the persisted marker, so a restart
+   *  before reprompting never auto-revives the reverted session); only the
+   *  wording differs. The next real user prompt lifts it via the
+   *  message.updated handler, exactly like a Stop. */
+  const markReverted = (sessionID, why) => {
+    const s = state(sessionID)
+    // Bump the user-activity clock even when already stopped: any plan that
+    // was scheduled before this revert is stale and runPlan must drop it.
+    s.lastUserPromptAt = Date.now()
+    if (s.userStopped) {
+      cancelPending(sessionID, "revert")
+      return
+    }
+    s.userStopped = true
+    persistedStops.set(sessionID, Date.now())
+    stopStore.save()
+    const t = timers.get(sessionID)
+    if (t) { clearTimeout(t); timers.delete(sessionID) }
+    s.pendingResume = false
+    s.lowBudgetPending = false
+    log("info", "user revert detected — automation paused until next prompt", { sessionID, why })
+    notice(`${RESUME_TAG}: Reverted by you — staying quiet while you edit and reprompt manually.`, "info")
+    queueTitleRefresh(sessionID)
+  }
+
   /** Aborts issued by our own takeover (stall/retry restarts) must never read
    *  as user stops — the takeover schedules its own resume right after. */
   const isOwnTakeoverAbort = (s) =>
@@ -1914,20 +1995,22 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     // turn later -- a stuck model would then flip-flop forever between the
     // "continue anyway" nudge and the "root-cause it" prompt instead of
     // converging on the latter.
-    const kind = plan.kind
-    if (SAME_KIND_WATCHED.has(kind) && s.previousKind === kind && s.chain === s.previousKindChain) {
+    const originalKind = plan.kind
+    if (SAME_KIND_WATCHED.has(originalKind) && s.previousKind === originalKind && s.chain === s.previousKindChain) {
       const repeatCount = (s.previousKindRepeats ?? 0) + 1
       s.previousKindRepeats = repeatCount
       if (repeatCount >= 2) {
-        log("warn", `same-kind repeat #${repeatCount} for "${kind}" — escalating`, { sessionID })
+        log("warn", `same-kind repeat #${repeatCount} for "${originalKind}" — escalating`, { sessionID })
         plan = { ...plan, kind: "debug", prompt: PROMPTS.debug }
       } else {
-        log("info", `same-kind repeat for "${kind}" — allowing once before escalation`, { sessionID })
+        log("info", `same-kind repeat for "${originalKind}" — allowing once before escalation`, { sessionID })
       }
     } else {
       s.previousKindRepeats = 0
     }
-    s.previousKind = kind
+    // Record the ORIGINAL kind (before escalation) so repeat detection
+    // correctly identifies subsequent identical asks and keeps escalating.
+    s.previousKind = originalKind
     s.previousKindChain = s.chain
     const existing = timers.get(sessionID)
     if (existing) clearTimeout(existing)
@@ -1952,6 +2035,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const s = sessions.get(sessionID)
     if (s) {
       s.pendingResume = false
+      s.lowBudgetPending = false
       s.lastUserPromptAt = Date.now()
       if (s.askingSince) {
         s.askingSince = null
@@ -2020,7 +2104,6 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         }
         return
       }
-      s.pendingResume = false
       // We are about to inject a real prompt; clear the same-kind loop
       // tracker so the NEXT schedule (after this turn resolves) starts fresh.
       s.previousKind = null
@@ -2037,9 +2120,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         // prompt would fire right after and duplicate the work. If the busy
         // turn dies on its own, its session.error re-arms recovery anyway.
         plan.polls = (plan.polls || 0) + 1
-        const maxPolls = plan.kind === "resume" ? 60 : 12
+        const maxPolls = plan.kind === "resume" ? MAX_RESUME_POLLS : MAX_OTHER_POLLS
         if (plan.polls <= maxPolls) {
-          schedule(sessionID, 5_000, plan) // core busy/retrying — check again shortly
+          schedule(sessionID, BUSY_POLL_INTERVAL_MS, plan) // core busy/retrying — check again shortly
           return
         }
         log("info", "session stayed busy — dropping stale injection", { sessionID, kind: plan.kind })
@@ -2061,6 +2144,13 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       log("info", `suppressed "${plan.kind}" — user stopped the session while the plan was in flight`, { sessionID })
       return
     }
+    // Also re-check for a user prompt that arrived during the status await:
+    // the stale-plan guard at the top runs BEFORE the await, so a prompt
+    // landing during the async call would be missed. This check catches it.
+    if (plan.createdTs && s.lastUserPromptAt > plan.createdTs) {
+      log("info", `dropping "${plan.kind}" — user prompt arrived during status check`, { sessionID })
+      return
+    }
 
     s.lastInjectKind = plan.kind
     s.lastInjectAt = Date.now() // mark BEFORE dispatch: user-message event arrives at turn start
@@ -2075,6 +2165,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         await asyncPrompt.call(ns, { path: { id: sessionID }, body })
       } else {
         await ns.prompt({ path: { id: sessionID }, body })
+      }
+      s.pendingResume = false
+      // Clear lowBudgetPending for lowBudget/continue plans so subsequent
+      // quota errors can schedule new plans if this one succeeded.
+      if (plan.kind === "lowBudget" || plan.kind === "continue") {
+        s.lowBudgetPending = false
       }
       log("info", `injected "${plan.kind}"`, {
         sessionID,
@@ -2098,6 +2194,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
   // ── central failure handler ────────────────────────────────────────
   const handleError = async (sessionID, error) => {
+    if (!sessionID) return
     if (sessions.get(sessionID)?.child) {
       log("info", "ignoring error in subagent session (parent orchestrates)", { sessionID })
       return
@@ -2191,10 +2288,19 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         ? Math.max(cfg.baseDelayMs, 15_000)  // let upstream token bucket refill
         : cfg.baseDelayMs
 
+      // Guard against duplicate scheduling: if a lowBudget plan is already
+      // pending for this same budget signature, don't schedule another.
+      // Multiple quota errors can arrive rapidly before the plan executes.
+      if (s.lowBudgetPending && sameBudget) {
+        log("info", "lowBudget plan already pending — skipping duplicate", { sessionID })
+        return
+      }
+
       if (!sameBudget || s.lowBudgetStreak < compactRounds) {
         if (sameBudget) s.lowBudgetStreak += 1
         else { s.lowBudgetStreak = 1; s.lowBudgetSig = sig }
         s.lowBudgetLastFired = false
+        s.lowBudgetPending = true
         schedule(sessionID, settleBase, {
           kind: "lowBudget",
           prompt: buildResumePrompt(sessionID, kind, error, false, null),
@@ -2207,6 +2313,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       if (s.lowBudgetStreak === compactRounds) {
         s.lowBudgetStreak += 1
         s.lowBudgetLastFired = true
+        s.lowBudgetPending = true
         schedule(sessionID, cfg.baseDelayMs, {
           kind: "continue",
           prompt: `Continue`,
@@ -2217,6 +2324,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
       // Everything failed.
       s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = false
+      s.lowBudgetPending = false
       notice(`${RESUME_TAG}: Token/credit budget too tight — ${isCredits ? sig : "quota exhausted"}. Manual intervention required.`, "error")
       return
     }
@@ -2289,7 +2397,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
             cur.awaitingCompactionSince = 0
             notice(`${RESUME_TAG}: Compaction did not complete — not resuming.`, "error")
           }
-        }, 180_000)
+        }, COMPACTION_WATCHDOG_MS)
         s.compactionTimer.unref?.()
       }, "summarize")
       return
@@ -2381,11 +2489,18 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   const looksDangerous = (perm) => {
     const blob = permFingerprint(perm)
     // Cap at 4 KB so user-controlled regexes from OPENCODE_AUTOPILOT_EXTRA_DENY
-    // can't cause catastrophic backtracking (Redos).  Perm titles are short.
+    // can't cause catastrophic backtracking (ReDoS).  Perm titles are short.
     const capped = blob.length > 4096 ? blob.slice(0, 4096) : blob
     return denyList().some((entry) => {
       if (entry.startsWith("re:")) {
-        try { return new RegExp(entry.slice(3), "i").test(capped) } catch { return false }
+        const pattern = entry.slice(3)
+        // ReDoS protection: limit regex complexity and execution time
+        // Reject patterns with nested quantifiers, excessive alternation, or other dangerous constructs
+        if (DANGEROUS_REGEX_PATTERN.test(pattern)) {
+          log("warn", "Rejected potentially dangerous regex in extraDeny", { pattern: pattern.slice(0, 50) })
+          return false
+        }
+        try { return new RegExp(pattern, "i").test(capped) } catch { return false }
       }
       return capped.includes(entry.toLowerCase())
     })
@@ -2401,34 +2516,29 @@ export const AutoResumePlugin = async ({ client, $ }) => {
    *  candidates are probed IN ORDER until one resolves — a wrong-shape call
    *  rejecting must not strand the ask. */
   const respondToPermission = async (sessionID, perm, response, why) => {
-    // Probe the CLIENT ROOT (not client.session) — the permission method lives
-    // at the top level in OpenCode's SDK (postSessionIdPermissionsPermissionId).
-    // client.session has no permission methods; scanning it always returned [].
-    const root = client ?? {}
-    const sessionNS = client?.session ?? {}
-    // Track the receiver for each function so we can call it with the right
-    // `this`. The OpenCode SDK methods don't actually use `this` (they reach
-    // a global fetch via module-scope), so picking the wrong receiver is
-    // harmless — but doing it correctly future-proofs against any client
-    // that does bind state to `this`.
-    const candidates = [
-      [root.postSessionIdPermissionsPermissionId, root],
-      [sessionNS.postSessionByIdPermissionsByPermissionId, sessionNS],
-      [sessionNS.respondToPermission, sessionNS],
-      [sessionNS.postSessionIdPermissionsPermissionId, sessionNS],
-      ...Object.keys(root)
-        .filter((k) => /permission/i.test(k) && typeof root[k] === "function")
-        .map((k) => [root[k], root]),
-      ...Object.keys(sessionNS)
-        .filter((k) => /permission/i.test(k) && typeof sessionNS[k] === "function")
-        .map((k) => [sessionNS[k], sessionNS]),
-    ]
-    const seen = new Set()
-    const fns = candidates.filter(([f]) => {
-      if (typeof f !== "function" || seen.has(f)) return false
-      seen.add(f)
-      return true
-    })
+    if (!cachedPermFns) {
+      const root = client ?? {}
+      const sessionNS = client?.session ?? {}
+      const candidates = [
+        [root.postSessionIdPermissionsPermissionId, root],
+        [sessionNS.postSessionByIdPermissionsByPermissionId, sessionNS],
+        [sessionNS.respondToPermission, sessionNS],
+        [sessionNS.postSessionIdPermissionsPermissionId, sessionNS],
+        ...Object.keys(root)
+          .filter((k) => /permission/i.test(k) && typeof root[k] === "function")
+          .map((k) => [root[k], root]),
+        ...Object.keys(sessionNS)
+          .filter((k) => /permission/i.test(k) && typeof sessionNS[k] === "function")
+          .map((k) => [sessionNS[k], sessionNS]),
+      ]
+      const seen = new Set()
+      cachedPermFns = candidates.filter(([f]) => {
+        if (typeof f !== "function" || seen.has(f)) return false
+        seen.add(f)
+        return true
+      })
+    }
+    const fns = cachedPermFns
     if (!fns.length) { log("warn", "permission API unavailable on this opencode version"); return false }
     const permID = permIdOf(perm)
     // permID is the only path-segment we own; refuse to send an undefined
@@ -2439,6 +2549,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     if (!permID) {
       log("warn", "permission response skipped — missing permID", {
         sessionID, type: permTypeOf(perm), why,
+      })
+      return false
+    }
+    if (String(permID).length > 256) {
+      log("warn", "permission response skipped — permID too long", {
+        sessionID, type: permTypeOf(perm), why, len: String(permID).length,
       })
       return false
     }
@@ -2499,6 +2615,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     return `${sessionID}|${permTypeOf(perm)}|${JSON.stringify(pattern)}`
   }
   const dirAskCounts = new Map() // "<sessionID>|<type>|<pattern>" -> benign answers
+  const dirAskCountsBySession = new Map() // sessionID -> Set of keys
 
   const decidePermission = (sessionID, perm) => {
     if (!cfg.autonomy || !cfg.permissions) return null
@@ -2518,6 +2635,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         const sig = dirSignature(sessionID, perm)
         const seen = (dirAskCounts.get(sig) ?? 0) + 1
         dirAskCounts.set(sig, seen)
+        // Track key for efficient per-session cleanup
+        let keySet = dirAskCountsBySession.get(sessionID)
+        if (!keySet) { keySet = new Set(); dirAskCountsBySession.set(sessionID, keySet) }
+        keySet.add(sig)
         return seen > cfg.dirAlwaysAfter ? "always" : "once"
       }
       return "once"
@@ -2596,6 +2717,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       s.gaveUpRearmed = false
       s.budgetNotified = false
       s.lowBudgetStreak = 0; s.lowBudgetSig = null; s.lowBudgetLastFired = false
+      s.lowBudgetPending = false
       s.emptyStreak = false  // recovered — clear the empty-loop latch
       s.askingSince = null
       // A clean turn is the evidence that the alternate is working. Count it
@@ -2737,18 +2859,24 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       }
 
       // Unfinished todos → drive continuation (with spin detection + caps)
+      // Spin detection tracks progress SINCE THE LAST NUDGE, not total progress.
+      // This prevents false "progress" when the model completes unrelated todos
+      // between nudges without actually addressing the stuck items.
       if (cfg.autonomy && cfg.todoDrive && (open.length > 0 || cbOpen > 0) &&
           s.nudges < cfg.maxNudges && budgetLeft(s)) {
         const doneNow = finished.length + cbDone
-        if (doneNow === s.lastDriveCompleted) {
+        // Compare against completed count at last nudge (or initial -1)
+        const baseline = s.lastNudgeCompletedCount >= 0 ? s.lastNudgeCompletedCount : doneNow
+        if (doneNow === baseline) {
           s.staleDrives += 1
         } else {
           s.staleDrives = 0
-          s.lastDriveCompleted = doneNow
         }
         if (s.staleDrives < 2) {
           s.nudges += 1
           s.driveCount += 1
+          // Record completed count AT THE TIME OF THIS NUDGE for next comparison
+          s.lastNudgeCompletedCount = doneNow
           log("info", "todo-drive nudge", { sessionID, open: open.length + cbOpen, drive: s.driveCount })
           schedule(sessionID, cfg.nudgeDelayMs, { kind: "todos", prompt: PROMPTS.todos })
           return
@@ -2817,15 +2945,44 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     queueTitleRefresh(sessionID)
     detach(async () => {
       try { await client.session.abort({ path: { id: sessionID } }) } catch { /* already dead */ }
-      setTimeout(() => schedule(sessionID, 800, plan), 1_500).unref?.()
+      setTimeout(() => schedule(sessionID, TAKEOVER_SCHEDULE_DELAY_MS, plan), TAKEOVER_RETRY_DELAY_MS).unref?.()
     }, "takeover-abort")
   }
   const checkStalls = () => {
     const nowMs = Date.now()
+    // Periodic cleanup for dirAskCounts to prevent unbounded growth.
+    // Remove entries for sessions that no longer exist, and enforce max size.
+    if (dirAskCounts.size > 0) {
+      // Use dirAskCountsBySession for efficient per-session cleanup
+      for (const [sessionID, keySet] of dirAskCountsBySession) {
+        if (!sessions.has(sessionID)) {
+          for (const k of keySet) dirAskCounts.delete(k)
+          dirAskCountsBySession.delete(sessionID)
+        }
+      }
+      // If still over limit, remove oldest entries (first inserted).
+      if (cfg.maxDirAskCounts > 0 && dirAskCounts.size > cfg.maxDirAskCounts) {
+        const toRemove = dirAskCounts.size - cfg.maxDirAskCounts
+        let removed = 0
+        for (const k of dirAskCounts.keys()) {
+          if (removed >= toRemove) break
+          dirAskCounts.delete(k)
+          // Also remove from per-session index to prevent unbounded Set growth
+          const sid = k.split("|")[0]
+          const keySet = dirAskCountsBySession.get(sid)
+          if (keySet) {
+            keySet.delete(k)
+            if (keySet.size === 0) dirAskCountsBySession.delete(sid)
+          }
+          removed++
+        }
+        log("debug", "dirAskCounts size limit exceeded, removed oldest entries", { removed })
+      }
+    }
     // Memory hygiene: drop state for sessions that have been idle for hours.
     for (const [sessionID, s] of sessions) {
       if (s.status === "busy" || s.status === "retry") continue
-      if (nowMs - s.lastActivity > 21_600_000) {
+      if (nowMs - s.lastActivity > SESSION_IDLE_CLEANUP_MS) {
         // Drop any orphaned timers first so the closures don't outlive the
         // session and fire into a deleted state.
         if (s.rearmTimer) { clearTimeout(s.rearmTimer); s.rearmTimer = null }
@@ -2834,8 +2991,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         knownTitles.delete(sessionID)
         writtenTitles.delete(sessionID)
 
-        for (const k of dirAskCounts.keys()) {
-          if (k.startsWith(`${sessionID}|`)) dirAskCounts.delete(k)
+        // Efficient dirAskCounts cleanup using per-session index
+        const keySet = dirAskCountsBySession.get(sessionID)
+        if (keySet) {
+          for (const k of keySet) dirAskCounts.delete(k)
+          dirAskCountsBySession.delete(sessionID)
         }
         const tt = titleTimers.get(sessionID)
         if (tt) clearTimeout(tt)
@@ -2874,6 +3034,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         tryRestoreFavorite(sessionID)
         continue
       }
+      // Check if any permission is pending for this session
       if (permissionPending.has(sessionID)) continue
       const silentFor = nowMs - s.lastActivity
       // Fast lane: model "thinking" with zero events for a short window -> labelled
@@ -2916,6 +3077,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const cutoff = Date.now() - cfg.reanimateWindowMs
     for (const sess of list) {
       if (!sess?.id || sess.parentID) continue // subagents belong to parents
+      if (typeof sess.id !== "string" || sess.id.length > 256) continue
       // The user stopped this session or turned auto-resume off here:
       // never auto-start it, whatever happened.
       if (suppressed(sess.id)) continue
@@ -2944,8 +3106,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
       // A prompt that never received any reply: the turn died at submission.
       if (lastInfo.role === "user") {
+        if (suppressed(sess.id)) continue
         log("info", "reanimating session with unanswered prompt", { sessionID: sess.id })
-        schedule(sess.id, 1_500, { kind: "resume", prompt: PROMPTS.resume })
+        schedule(sess.id, TAKEOVER_RETRY_DELAY_MS, { kind: "resume", prompt: PROMPTS.resume })
         notice(`${RESUME_TAG}: Revived a session interrupted by the restart.`)
         continue
       }
@@ -2973,11 +3136,14 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         }
         if (kind === "quota" || kind === "rate_limit") {
           await rotateAwayFrom(sess.id, "quota/rate limit (after restart)", true)
+          // User could have stopped the session during rotation — bail out
+          if (suppressed(sess.id)) continue
         }
+        if (suppressed(sess.id)) continue
         log("info", "reanimating interrupted session", { sessionID: sess.id, kind })
         schedule(
           sess.id,
-          1_500,
+          TAKEOVER_RETRY_DELAY_MS,
           kind === "output_length"
             ? { kind: "continue", prompt: PROMPTS.truncated }
             : { kind: "resume", prompt: PROMPTS.resume },
@@ -3006,7 +3172,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
    *  hosts) downgrades to debug after 3 tries so busy logs aren't flooded. */
   const deliverPendingNotice = async () => {
     if (!pendingUpdateNotice || noticeDelivering) return
-    if (Date.now() - lastNoticeTryAt < 30_000) return
+    if (Date.now() - lastNoticeTryAt < NOTICE_DELIVERY_RETRY_MS) return
     noticeDelivering = true
     try {
       const n = pendingUpdateNotice
@@ -3103,6 +3269,28 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   if (cfg.enabled) {
     const wd = setInterval(() => detach(checkStalls, "watchdog"), cfg.watchdogMs)
     wd.unref?.()
+    const upd = setInterval(() => detach(checkForUpdates, "update-check"), 3_600_000)
+    upd.unref?.()
+    // Track active timers for cleanup
+    const activeIntervals = [wd, upd]
+    const activeTimeouts = [...deliveryTimers]
+    // Cleanup function for graceful shutdown
+    const cleanup = () => {
+      for (const t of activeIntervals) clearInterval(t)
+      for (const t of activeTimeouts) clearTimeout(t)
+      // Save any pending stores
+      stopStore.save().catch(() => {})
+      offStore.save().catch(() => {})
+      pauseStore.save().catch(() => {})
+    }
+    // Attach cleanup to process signals for graceful shutdown
+    const signals = ["SIGTERM", "SIGINT", "SIGHUP"]
+    for (const sig of signals) {
+      try { process.on(sig, cleanup) } catch { /* not available in all environments */ }
+    }
+    // Also expose cleanup on the plugin for external callers
+    globalThis.__autoResumeCleanup = cleanup
+
     detach(() => log("info", `auto-resume v${AUTO_RESUME_VERSION} initialized`), "init-log")
     detach(pauseStore.load, "pause-store-load")
     detach(stopStore.load, "stop-store-load")
@@ -3112,10 +3300,6 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       restoreOptedOutTitles()
     }, "optout-title-restore")
     detach(checkForUpdates, "update-check")
-    // Long-lived processes: re-probe hourly; the built-in 24h window makes
-    // this an actual daily check while OpenCode stays open.
-    const upd = setInterval(() => detach(checkForUpdates, "update-check"), 3_600_000)
-    upd.unref?.()
     // One-shot update confirmations are delivered as native OS notifications:
     // a short settle delay after init avoids racing server startup, then the
     // first session/message activity, a server.connected event, or an 15s
@@ -3137,10 +3321,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           // has been observed never firing unref'd timers once the host
           // loop goes quiet — exactly when a headless CI test waits on them.
           // deliverPendingNotice clears both once the notice resolves.
-          deliveryTimers = [
+          const timers = [
             setTimeout(() => detach(deliverPendingNotice, "notice-deliver"), 800),
-            setTimeout(() => detach(deliverPendingNotice, "notice-fallback"), 15_000),
+            setTimeout(() => detach(deliverPendingNotice, "notice-fallback"), OS_NOTIFICATION_TIMEOUT_MS),
           ]
+          deliveryTimers = timers
+          activeTimeouts.push(...timers)
         } catch { /* cosmetic only */ }
       }, "update-notice")
     }
@@ -3297,7 +3483,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
             if (s.status === "busy") s.lastTurnHadText = false
             if (s.status === "idle") {
               s.pendingResume = false
-              detach(evaluateIdle(p.sessionID), "evaluateIdle")
+              // Defer to session.idle which fires for the same turn;
+              // evaluateIdle deduplicates via lastEvalSig, but we skip here
+              // to avoid double-scheduling when both events fire.
             }
             break
           }
@@ -3323,9 +3511,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
             const perm = p.permission && typeof p.permission === "object" ? p.permission : p
             const sessionID = perm.sessionID ?? p.sessionID
             if (!sessionID) break
-            permissionPending.set(sessionID, Date.now()) // always: watchdog depends on it
             const permID = permIdOf(perm)
-            if (!permID) break
+            permissionPending.set(sessionID, Date.now()) // for watchdog: any perm pending for session
+            // Composite key: permIDs alone can't be attributed back to a
+            // session, which left the session.deleted prefix-scan dead code.
+            if (permID) permissionPendingById.set(`${sessionID}|${permID}`, Date.now())
             // After a user Stop, the human owns every decision again.
             const decision = suppressed(sessionID) ? null : decidePermission(sessionID, perm)
             if (decision) {
@@ -3343,7 +3533,19 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           }
 
           case "permission.replied": {
+            const permID = p.permissionID ?? p.id
             if (p.sessionID) permissionPending.delete(p.sessionID)
+            if (permID) {
+              if (p.sessionID) {
+                permissionPendingById.delete(`${p.sessionID}|${permID}`)
+              } else {
+                // No session attribution on the reply: fall back to a suffix
+                // scan so the entry can't leak.
+                for (const k of permissionPendingById.keys()) {
+                  if (k === String(permID) || k.endsWith(`|${permID}`)) permissionPendingById.delete(k)
+                }
+              }
+            }
             break
           }
 
@@ -3351,7 +3553,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
             // Laptop woke up / client reconnected: rescan for sessions that
             // were orphaned while the machine was asleep (throttled).
             const nowMs = Date.now()
-            if (cfg.reanimate && nowMs - lastReanimateAt > 300_000) {
+            if (cfg.reanimate && nowMs - lastReanimateAt > REANIMATE_SCAN_INTERVAL_MS) {
               lastReanimateAt = nowMs
               detach(reanimate, "reanimate")
             }
@@ -3363,6 +3565,14 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           case "session.updated": {
             const info = p.info
             if (info?.id) {
+              // Revert sets a revert marker on the session (messageID [+ partID]
+              // of the truncation point). The user is taking manual control to
+              // edit and reprompt — cancel any queued autoprompt and stay quiet
+              // until their next prompt, exactly like a Stop.
+              if (info.revert?.messageID ?? info.revert) {
+                markReverted(info.id, "session carries a revert marker")
+                break
+              }
               const s = state(info.id)
               if (info.parentID) s.child = true
               // Adopt external renames: if the user (or core) retitled the
@@ -3375,6 +3585,21 @@ export const AutoResumePlugin = async ({ client, $ }) => {
                 }
               }
             }
+            break
+          }
+
+          case "message.removed":
+          case "message.part.removed": {
+            // Revert cleanup deletes messages/parts after the truncation point
+            // (sessions.removeMessage/removePart). Even when the revert marker
+            // above was missed or ordered differently, a deletion means the
+            // conversation just changed under us: any queued auto-injection was
+            // planned against the pre-deletion history and must not fire into
+            // the reverted session. Lightweight on purpose — cancel the pending
+            // plan and stamp user activity so in-flight plans drop as stale —
+            // without persistent suppression (compaction also prunes history).
+            const id = p.sessionID ?? p.info?.sessionID ?? p.part?.sessionID
+            if (id) cancelPending(id, "message removed")
             break
           }
 
@@ -3405,6 +3630,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
               if (s?.compactionTimer) { clearTimeout(s.compactionTimer); s.compactionTimer = null }
               sessions.delete(id)
               permissionPending.delete(id)
+              // permissionPendingById is keyed "sessionID|permID"; drop this session's entries
+              for (const k of permissionPendingById.keys()) {
+                if (k.startsWith(`${id}|`)) permissionPendingById.delete(k)
+              }
               const hadMarker =
                 persistedStops.delete(id) ||
                 offStore.map.delete(id) ||
@@ -3417,8 +3646,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
               knownTitles.delete(id)
               writtenTitles.delete(id)
 
-              for (const k of dirAskCounts.keys()) {
-                if (k.startsWith(`${id}|`)) dirAskCounts.delete(k)
+              // Efficient dirAskCounts cleanup using per-session index
+              const keySet = dirAskCountsBySession.get(id)
+              if (keySet) {
+                for (const k of keySet) dirAskCounts.delete(k)
+                dirAskCountsBySession.delete(id)
               }
               const tt = titleTimers.get(id)
               if (tt) clearTimeout(tt)
