@@ -190,7 +190,10 @@ const settle = async (hooks, state, id, model, times) => {
   // first tick that sees an open gate also sees "busy".
   cleanTurn(state, "t5", ALT)
   await hooks.event(ev("session.idle", { sessionID: "t5" }))
-  await sleep(10)
+  // No sleep here: idle and busy must land in the same microtask drain. Any
+  // macrotask gap (even sleep(10)) admits a watchdog tick that observes an
+  // open gate on a still-idle session and restores — a test-timing flake, not
+  // a plugin bug (busy sessions are correctly skipped once busy is observed).
   await hooks.event(ev("session.status", { sessionID: "t5", status: { type: "busy" } }))
   await sleep(700) // several watchdog ticks
   ok(restoredLog(state) === 0, "T5: no swap while the session is busy")
