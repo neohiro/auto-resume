@@ -20,6 +20,32 @@ const ok = (cond, label) => {
   if (!cond) process.exitCode = 1
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+/** Wait for a plugin gate (status/message probe) with a ref'd watchdog timer.
+ *  Recovery timers are unref'd by design (they must not keep the host alive),
+ *  so awaiting a gate bare lets node exit with "unsettled top-level await"
+ *  before the timer fires. The ref'd watchdog keeps the loop alive and doubles
+ *  as a failure timeout so a never-opening gate fails loudly instead of
+ *  hanging (or vacuously passing) the suite. Resolves true when the gate won. */
+const waitGate = async (gate, ms = 10000) => {
+  let timer
+  try {
+    return await Promise.race([
+      // A rejecting gate is a broken gate, not a crash: fail the assertion loudly.
+      gate.then(() => true, () => false),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(false), ms) }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// ---- waitGate unit pins: fast, deterministic, no plugin involved -----------
+{
+  ok(await waitGate(Promise.resolve(), 50) === true, "waitGate: an already-open gate resolves true immediately")
+  ok(await waitGate(new Promise(() => {}), 50) === false, "waitGate: a never-opening gate times out false instead of hanging")
+  ok(await waitGate(Promise.reject(new Error("boom")), 50) === false,
+    "waitGate: a rejecting gate fails cleanly instead of crashing the suite")
+}
 
 function makeClient(state) {
   return {
@@ -426,7 +452,10 @@ const ev = (type, properties) => ({ event: { type, properties } })
   // A rate-limit failure schedules a recovery injection...
   await hooks.event(ev("session.error", { sessionID: "s15", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
   // ...which is now parked inside runPlan's session.status() probe...
-  await insideStatus
+  // waitGate (not a bare await): the recovery timer is unref'd by design, so
+  // a bare await lets node exit before the timer fires; the ref'd watchdog
+  // inside waitGate keeps the loop alive and fails loudly on timeout.
+  ok(await waitGate(insideStatus), "S15 precondition: plan parked inside the status probe")
   // ...and the user hits Stop right in that window.
   await hooks.event(ev("session.error", { sessionID: "s15", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
   release()
@@ -602,6 +631,69 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ok(state.logs.some((t) => t.includes("rotation abandoned — session was stopped by the user")),
     "S18: the abandoned rotation is explained in the log")
   ok(state.logs.some((t) => t.includes("Stopped by you")), "S18: the Stop itself is still acknowledged")
+}
+
+// ---- S19: Revert marker cancels a queued recovery and stays quiet ----------
+// "Revert message" means the user wants time to edit and reprompt manually.
+// A rate-limit failure schedules a resume ~40ms out; the revert lands first
+// (session.updated carrying core's revert marker) and the autoprompt must
+// never fire into the reverted session.
+{
+  const state = makeState()
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  await hooks.event(ev("session.error", { sessionID: "s19", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
+  await hooks.event(ev("session.updated", { info: { id: "s19", revert: { messageID: "m1" } } }))
+  // Core may re-emit the marker (updated title, timestamps) while the revert
+  // is staged — repeat delivery must not duplicate the notice or the marker.
+  await hooks.event(ev("session.updated", { info: { id: "s19", title: "same", revert: { messageID: "m1" } } }))
+  await sleep(500)
+  ok(state.prompts.length === 0, "S19: no auto-resume injected after a user Revert")
+  ok(state.logs.filter((t) => t.includes("Reverted by you")).length === 1, "S19: revert acknowledged exactly once (repeat marker is idempotent)")
+}
+
+// ---- S20: message removal drops an in-flight injection plan -----------------
+// Revert cleanup deletes messages via sessions.removeMessage (message.removed)
+// and removePart (message.part.removed). A plan parked inside runPlan's
+// session.status() probe when the removal lands must be dropped as stale,
+// not injected into the reverted history.
+{
+  const state = makeState()
+  let release
+  let entered
+  const insideStatus = new Promise((r) => { entered = r })
+  state.statusGate = { entered, promise: new Promise((r) => { release = r }) }
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  await hooks.event(ev("session.error", { sessionID: "s20", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
+  // waitGate (not a bare await): see S15 — the recovery timer is unref'd, so
+  // a bare await lets node exit before the timer fires.
+  ok(await waitGate(insideStatus), "S20 precondition: plan parked inside the status probe")
+  await hooks.event(ev("message.removed", { sessionID: "s20", messageID: "m9" }))
+  release()
+  await sleep(500)
+  ok(state.prompts.length === 0, "S20: no resume injected when a message removal lands mid-flight")
+  await hooks.event(ev("message.part.removed", { sessionID: "s20", messageID: "m9", partID: "p1" }))
+  await sleep(100)
+  ok(state.prompts.length === 0, "S20: part removals are also tolerated without injecting")
+}
+
+// ---- S21: a real user prompt re-arms automation after a Revert -------------
+{
+  const state = makeState()
+  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "s21", text: "step 1 done" } }))
+  await hooks.event(ev("todo.updated", { sessionID: "s21", todos: [{ title: "remaining", status: "pending" }] }))
+  await hooks.event(ev("session.updated", { info: { id: "s21", revert: { messageID: "m1" } } }))
+  await hooks.event(ev("session.idle", { sessionID: "s21" })) // unfinished todos, but reverted
+  await sleep(350)
+  ok(!state.prompts.some((p) => p.text.includes("todos unfinished")),
+    "S21: todo-drive does NOT fire after a user Revert")
+  // The user's manual reprompt starts a new workflow -> automation armed again
+  state.msgStore.u21 = "manual retry with my edits"
+  await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "s21", id: "u21" } }))
+  await hooks.event(ev("session.idle", { sessionID: "s21" }))
+  await sleep(350)
+  ok(state.prompts.some((p) => p.text.includes("todos unfinished") && p.id === "s21"),
+    "S21: manual reprompt after Revert re-enables todo-drive")
 }
 
 console.log(process.exitCode ? "STOP TESTS FAILED" : "ALL STOP TESTS PASSED")
