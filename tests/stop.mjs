@@ -30,12 +30,21 @@ const waitGate = async (gate, ms = 10000) => {
   let timer
   try {
     return await Promise.race([
-      gate.then(() => true),
+      // A rejecting gate is a broken gate, not a crash: fail the assertion loudly.
+      gate.then(() => true, () => false),
       new Promise((resolve) => { timer = setTimeout(() => resolve(false), ms) }),
     ])
   } finally {
     clearTimeout(timer)
   }
+}
+
+// ---- waitGate unit pins: fast, deterministic, no plugin involved -----------
+{
+  ok(await waitGate(Promise.resolve(), 50) === true, "waitGate: an already-open gate resolves true immediately")
+  ok(await waitGate(new Promise(() => {}), 50) === false, "waitGate: a never-opening gate times out false instead of hanging")
+  ok(await waitGate(Promise.reject(new Error("boom")), 50) === false,
+    "waitGate: a rejecting gate fails cleanly instead of crashing the suite")
 }
 
 function makeClient(state) {
