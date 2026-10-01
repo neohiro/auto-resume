@@ -1002,6 +1002,27 @@ export const createOsNotifier = ({
  *  after real failures, and S13 pins that they never escalate. */
 const SAME_KIND_WATCHED = new Set(["proceed", "drive"])
 
+/** Graceful-shutdown hooks are process-global: every plugin instantiation
+ *  registers its own cleanup, but the process.on listeners are attached
+ *  exactly once and fan out to all registered cleanups. Without this, each
+ *  instantiation adds 3 permanent listeners (node warns past 10) — a slow
+ *  leak in long-lived hosts that hot-reload the plugin. */
+const shutdownCleanups = []
+let shutdownHooksArmed = false
+const armShutdownHooks = () => {
+  if (shutdownHooksArmed) return
+  shutdownHooksArmed = true
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    try {
+      process.on(sig, () => {
+        for (const fn of [...shutdownCleanups]) {
+          try { fn() } catch { /* best effort */ }
+        }
+      })
+    } catch { /* not available in all environments */ }
+  }
+}
+
 export const AutoResumePlugin = async ({ client, $ }) => {
   const cfg = loadConfig()
 
@@ -3283,11 +3304,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       offStore.save().catch(() => {})
       pauseStore.save().catch(() => {})
     }
-    // Attach cleanup to process signals for graceful shutdown
-    const signals = ["SIGTERM", "SIGINT", "SIGHUP"]
-    for (const sig of signals) {
-      try { process.on(sig, cleanup) } catch { /* not available in all environments */ }
-    }
+    // Attach cleanup to process signals for graceful shutdown (listeners
+    // attached once per process; see armShutdownHooks).
+    shutdownCleanups.push(cleanup)
+    armShutdownHooks()
     // Also expose cleanup on the plugin for external callers
     globalThis.__autoResumeCleanup = cleanup
 

@@ -20,6 +20,23 @@ const ok = (cond, label) => {
   if (!cond) process.exitCode = 1
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+/** Wait for a plugin gate (status/message probe) with a ref'd watchdog timer.
+ *  Recovery timers are unref'd by design (they must not keep the host alive),
+ *  so awaiting a gate bare lets node exit with "unsettled top-level await"
+ *  before the timer fires. The ref'd watchdog keeps the loop alive and doubles
+ *  as a failure timeout so a never-opening gate fails loudly instead of
+ *  hanging (or vacuously passing) the suite. Resolves true when the gate won. */
+const waitGate = async (gate, ms = 10000) => {
+  let timer
+  try {
+    return await Promise.race([
+      gate.then(() => true),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(false), ms) }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 function makeClient(state) {
   return {
@@ -426,7 +443,10 @@ const ev = (type, properties) => ({ event: { type, properties } })
   // A rate-limit failure schedules a recovery injection...
   await hooks.event(ev("session.error", { sessionID: "s15", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
   // ...which is now parked inside runPlan's session.status() probe...
-  await insideStatus
+  // waitGate (not a bare await): the recovery timer is unref'd by design, so
+  // a bare await lets node exit before the timer fires; the ref'd watchdog
+  // inside waitGate keeps the loop alive and fails loudly on timeout.
+  ok(await waitGate(insideStatus), "S15 precondition: plan parked inside the status probe")
   // ...and the user hits Stop right in that window.
   await hooks.event(ev("session.error", { sessionID: "s15", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
   release()
@@ -635,7 +655,9 @@ const ev = (type, properties) => ({ event: { type, properties } })
   state.statusGate = { entered, promise: new Promise((r) => { release = r }) }
   const hooks = await AutoResumePlugin({ client: makeClient(state) })
   await hooks.event(ev("session.error", { sessionID: "s20", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
-  await insideStatus
+  // waitGate (not a bare await): see S15 — the recovery timer is unref'd, so
+  // a bare await lets node exit before the timer fires.
+  ok(await waitGate(insideStatus), "S20 precondition: plan parked inside the status probe")
   await hooks.event(ev("message.removed", { sessionID: "s20", messageID: "m9" }))
   release()
   await sleep(500)
