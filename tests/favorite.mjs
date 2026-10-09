@@ -17,6 +17,7 @@ process.env.OPENCODE_RESUME_FAVORITE_CHECK_AFTER_MS ??= "0"
 process.env.OPENCODE_RESUME_FAVORITE_MIN_TURNS ??= "2"
 process.env.OPENCODE_RESUME_STOPSTORE = join(tmpdir(), `ar-fav-stop-${process.pid}-${Date.now()}.json`)
 process.env.OPENCODE_RESUME_OFFSTORE = join(tmpdir(), `ar-fav-off-${process.pid}-${Date.now()}.json`)
+process.env.OPENCODE_RESUME_ACTIVESTORE = join(tmpdir(), `ar-fav-active-${process.pid}-${Date.now()}.json`)
 
 import { rmSync } from "node:fs"
 import { tmpdir } from "node:os"

@@ -15,6 +15,7 @@ import { collectCoverage, coverageMarker } from "../scripts/coverage.mjs"
 // next run's assertions).
 process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-smoke-stops-${process.pid}-${Date.now()}.json`)
 process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-smoke-off-${process.pid}-${Date.now()}.json`)
+process.env.OPENCODE_RESUME_ACTIVESTORE ??= join(tmpdir(), `ar-smoke-active-${process.pid}-${Date.now()}.json`)
 
 import { AutoResumePlugin } from "../auto-resume.js"
 

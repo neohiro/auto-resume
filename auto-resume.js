@@ -284,6 +284,14 @@ const NOTICE_DROP_LOCK_STALE_MS = 30_000
 const PERM_FINGERPRINT_MAX_LEN = 4096
 // Store TTL (14 days)
 const STORE_TTL_MS = 14 * 86_400_000
+// Restart recovery window (24 hours)
+const RESTART_RECOVERY_WINDOW_MS = 86_400_000
+// Failure velocity window (60 seconds)
+const FAILURE_VELOCITY_WINDOW_MS = 60_000
+// Duplicate incident dedupe window (2 seconds)
+const DUPLICATE_INCIDENT_WINDOW_MS = 2_000
+// Deprecation cooldown (1 year)
+const DEPRECATION_COOLDOWN_MS = 86_400_000 * 365
 
 const RESUME_TAG = "[auto-resume]"
 
@@ -496,10 +504,20 @@ const looksLikeContinuationLong = (text) => {
   return CONTINUATION_ANYWHERE.some((re) => re.test(t))
 }
 
+// Tier score cache with size limit to prevent unbounded growth
+const TIER_SCORE_CACHE_MAX = 500
+const tierScoreCache = new Map()
 const tierScore = (modelID) => {
+  const cached = tierScoreCache.get(modelID)
+  if (cached !== undefined) return cached
   let score = 0
   for (const [re, pts] of TIER_BONUS) if (re.test(modelID)) score += pts
   for (const [re, pts] of TIER_PENALTY) if (re.test(modelID)) score += pts
+  if (tierScoreCache.size >= TIER_SCORE_CACHE_MAX) {
+    const firstKey = tierScoreCache.keys().next().value
+    tierScoreCache.delete(firstKey)
+  }
+  tierScoreCache.set(modelID, score)
   return score
 }
 
@@ -1139,6 +1157,38 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     "user-pauses",
     str("OPENCODE_RESUME_PAUSESTORE", selfPath ? `${selfPath}.paused.json` : ""),
   )
+  const activeSessionStore = makeMapStore(
+    "active-sessions",
+    str("OPENCODE_RESUME_ACTIVESTORE", selfPath ? `${selfPath}.active.json` : ""),
+  )
+  const recordActiveSession = (sessionID) => {
+    if (!sessionID || typeof sessionID !== "string" || sessionID.length > 256) return
+    if (suppressed(sessionID)) return
+    activeSessionStore.map.set(sessionID, Date.now())
+    // Fire-and-forget save; serialize via saveChain to avoid Windows sharing violations
+    activeSessionStore.save()
+  }
+
+  const DEPRECATION_PATTERNS = [
+    "deprecated", "model is deprecated", "model has been deprecated",
+    "sunset", "sunsetted", "discontinued", "no longer supported",
+    "shut down", "shutdown", "retired", "eol",
+  ]
+  const isDeprecatedError = (error) => {
+    const data = error?.data ?? {}
+    const text = `${data.message ?? ""} ${data.responseBody ?? ""} ${error?.message ?? ""}`.toLowerCase()
+    const code = data.statusCode
+    if (code === 404 || code === 410) return true
+    return matchesAny(text, DEPRECATION_PATTERNS)
+  }
+  const modelFailureVelocities = new Map()
+  const cleanModelFailureVelocities = (nowMs) => {
+    for (const [key, failures] of modelFailureVelocities) {
+      const filtered = failures.filter((ts) => nowMs - ts < FAILURE_VELOCITY_WINDOW_MS)
+      if (filtered.length === 0) modelFailureVelocities.delete(key)
+      else modelFailureVelocities.set(key, filtered)
+    }
+  }
   const persistedStops = stopStore.map
 
   /** Stopped = flagged live this run OR remembered from a previous run. */
@@ -1476,9 +1526,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       debugArmed: false, retryEnteredAt: 0, retryNext: 0,
       userStopped: false, takeoverAt: 0, lastTurnHadText: false, taskCost: 0, costNotified: false,
       budgetNotified: false, gaveUpRearmed: false, noTodoImproveFired: false,
-      lowBudgetStreak: 0, lowBudgetSig: null, lowBudgetPending: false, userPaused: false, emptyStreak: false,
+      lowBudgetStreak: 0, lowBudgetSig: null, lowBudgetLastFired: false, lowBudgetPending: false, userPaused: false, emptyStreak: false,
       lastErrorName: null, lastErrorSig: null,
       lastNudgeCompletedCount: -1,
+      // Clear lastEvalSig so that evaluateIdle will re-process the last
+      // assistant message after a real user message (scope reset).
+      lastEvalSig: null,
     })
     if (!keepTimers) s.stallResumes = 0
   }
@@ -1748,7 +1801,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   const getCatalog = async () => {
     if (catalogCache && Date.now() - catalogFetchedAt < CATALOG_CACHE_TTL_MS) return catalogCache
     try {
-      const res = await client.config.providers()
+      const providersFn = client.config?.providers
+      if (typeof providersFn !== "function") return catalogCache ?? []
+      const res = await providersFn()
       const data = res?.data ?? res
       catalogCache = Array.isArray(data?.providers) ? data.providers : []
       catalogFetchedAt = Date.now()
@@ -1933,6 +1988,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     s.rotatedTo = null
     s.favoriteRotatedAt = 0
     s.turnsSinceRotation = 0
+    // Clear failure velocity for the restored model so it gets a fresh start
+    modelFailureVelocities.delete(modelKey(fav))
     // A fresh lease, exactly like rotateAwayFrom hands the alternate: we have
     // no evidence yet that the favorite is healthy again.
     s.chain = 0
@@ -2230,7 +2287,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     // anything recurring after a dispatched resume is a new incident.
     const sig = `${error?.name}:${error?.data?.statusCode ?? ""}:${error?.data?.message ?? ""}`
     const duplicateIncident =
-      sig === s.lastErrorSig && nowMs - s.lastErrorAt < 2_000 && s.lastResumeAt <= s.lastErrorAt
+      sig === s.lastErrorSig && nowMs - s.lastErrorAt < DUPLICATE_INCIDENT_WINDOW_MS && s.lastResumeAt <= s.lastErrorAt
     if (duplicateIncident) return
     s.lastErrorSig = sig
     s.lastErrorAt = nowMs
@@ -2243,6 +2300,52 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       sessionID, name: error?.name, statusCode: error?.data?.statusCode, message: error?.data?.message,
     })
     queueTitleRefresh(sessionID)
+
+    const currentModel = s.currentModel ?? s.lastModel
+    const curModelKey = currentModel ? modelKey(currentModel) : null
+    if (curModelKey) {
+      // Clean up stale failure velocities periodically
+      cleanModelFailureVelocities(nowMs)
+      if (isDeprecatedError(error)) {
+        modelCooldown.set(curModelKey, Date.now() + DEPRECATION_COOLDOWN_MS)
+        if (catalogCache) {
+          for (const prov of catalogCache) {
+            if (prov?.models && currentModel.modelID in prov.models) {
+              delete prov.models[currentModel.modelID]
+            }
+          }
+        }
+        log("warn", "model deprecated — removing and rotating", { sessionID, model: curModelKey })
+        notice(`${RESUME_TAG}: Model ${curModelKey} is deprecated — removed from active models and rotated.`, "error")
+        if (!cfg.disableRotation) {
+          await rotateAwayFrom(sessionID, "model deprecated", true)
+          s.chain += 1
+          if (s.chain <= cfg.maxChain) {
+            schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, curModelKey) })
+            return
+          }
+        }
+      }
+
+      let failures = modelFailureVelocities.get(curModelKey) ?? []
+      failures = failures.filter(ts => nowMs - ts < FAILURE_VELOCITY_WINDOW_MS)
+      failures.push(nowMs)
+      modelFailureVelocities.set(curModelKey, failures)
+
+      if (failures.length >= 2 && !cfg.disableRotation) {
+        log("warn", "model failed multiple times in <60s — force rotating instead of retrying", { sessionID, model: curModelKey, count: failures.length })
+        notice(`${RESUME_TAG}: Model ${curModelKey} failed repeatedly within 60s — force-rotating to avoid retry storms.`)
+        modelCooldown.set(curModelKey, Date.now() + cfg.modelCooldownMs)
+        const rotOk = await rotateAwayFrom(sessionID, "repeated rapid failures", true)
+        if (rotOk) {
+          s.chain += 1
+          if (s.chain <= cfg.maxChain) {
+            schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, curModelKey) })
+            return
+          }
+        }
+      }
+    }
 
     // An error on the improve turn: the cycle isn't "in flight" anymore
     // regardless of which kind of error fired. Clear here so the title
@@ -3083,8 +3186,15 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   // Recovery timers live in the server process, so a crash orphans any turn
   // that was mid-recovery or awaiting its first reply. On startup we scan
   // recent sessions and give those a fresh continuation.
-  const reanimate = async () => {
-    await Promise.all([stopStore.load(), offStore.load(), pauseStore.load()]) // markers known before any revival decision
+  const reanimate = async (activeSessionsSnapshot = new Map()) => {
+    await Promise.all([stopStore.load(), offStore.load(), pauseStore.load()])
+    // Use the snapshot from startup; fall back to loading if not provided (for server.connected re-scans)
+    if (activeSessionsSnapshot.size === 0) {
+      await activeSessionStore.load()
+      for (const [id, ts] of activeSessionStore.map) {
+        activeSessionsSnapshot.set(id, ts)
+      }
+    }
     if (!cfg.reanimate) return
     let list = []
     try {
@@ -3092,17 +3202,21 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       list = (res?.data ?? res) ?? []
     } catch (err) {
       log("warn", "reanimation scan failed", { err: err?.message ?? String(err) })
-      return
     }
+    // Only revive sessions that exist in the current session list.
+    // The active store is only used to extend the revival window for sessions
+    // that are currently in the session list (not to add phantom sessions from
+    // previous test runs or stale data).
     if (!Array.isArray(list)) return
     const cutoff = Date.now() - cfg.reanimateWindowMs
+    const activeCutoff = Date.now() - RESTART_RECOVERY_WINDOW_MS
     for (const sess of list) {
-      if (!sess?.id || sess.parentID) continue // subagents belong to parents
+      if (!sess?.id || sess.parentID) continue
       if (typeof sess.id !== "string" || sess.id.length > 256) continue
-      // The user stopped this session or turned auto-resume off here:
-      // never auto-start it, whatever happened.
       if (suppressed(sess.id)) continue
-      if ((sess.time?.updated ?? 0) < cutoff) continue // too old to be a crash victim
+      const activeTs = activeSessionsSnapshot.get(sess.id)
+      const isActiveStore = typeof activeTs === "number" && activeTs > activeCutoff
+      if (!isActiveStore && (sess.time?.updated ?? 0) < cutoff) continue
       const s = state(sess.id)
       if (s.reanimated) continue
       s.reanimated = true
@@ -3112,12 +3226,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         const r = await client.session.messages({ path: { id: sess.id } })
         entries = (r?.data ?? r) ?? []
       } catch { continue }
-      // The scan is detached and runs at startup, so the user can press Stop
-      // while a session's history is being fetched. Everything below this point
-      // (resetTaskScope, the resume schedules, and the "Revived a session"
-      // notice) is user-visible and none of it re-checks suppression, so a Stop
-      // landing during the await must abandon the revival.
       if (suppressed(sess.id)) continue
+      // Only revive sessions that have actual conversation history.
+      // Empty sessions (just created, no messages) should not be auto-prompted.
       if (!entries.length) continue
       const lastEntry = entries[entries.length - 1]
       const lastInfo = lastEntry?.info
@@ -3134,13 +3245,6 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         continue
       }
 
-      // Graceful shutdowns make core stamp the in-flight message with
-      // MessageAbortedError — identical to a Stop press in stored data.
-      // But genuine Stops were persisted LIVE at press time and filtered
-      // above via suppressed(); anything reaching this point is an
-      // INTERRUPTION (crash or client restart), not a user decision.
-      // A hard kill leaves no error at all — detect those via a missing
-      // completion timestamp (only trusted when time object exists).
       const incomplete =
         lastInfo.role === "assistant" &&
         !lastInfo.error &&
@@ -3148,31 +3252,29 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         lastInfo.time !== null &&
         !(lastInfo.time.completed > 0)
 
-      if (lastInfo.role === "assistant" && (lastInfo.error || incomplete)) {
+      if (lastInfo.role === "assistant" && (lastInfo.error || incomplete || isActiveStore)) {
         let kind = lastInfo.error ? classify(lastInfo.error) : "interrupted"
-        if (kind === "abort") kind = "retryable" // shutdown artifact → revive
+        if (kind === "abort") kind = "retryable"
         if (["auth", "fatal", "overflow"].includes(kind)) continue
         if (lastInfo.modelID) {
           s.lastModel = { providerID: lastInfo.providerID, modelID: lastInfo.modelID }
         }
         if (kind === "quota" || kind === "rate_limit") {
           await rotateAwayFrom(sess.id, "quota/rate limit (after restart)", true)
-          // User could have stopped the session during rotation — bail out
           if (suppressed(sess.id)) continue
         }
         if (suppressed(sess.id)) continue
-        log("info", "reanimating interrupted session", { sessionID: sess.id, kind })
+        log("info", "reanimating previously active session after restart", { sessionID: sess.id, kind })
         schedule(
           sess.id,
           TAKEOVER_RETRY_DELAY_MS,
           kind === "output_length"
             ? { kind: "continue", prompt: PROMPTS.truncated }
-            : { kind: "resume", prompt: PROMPTS.resume },
+            : { kind: "resume", prompt: `${RESUME_TAG} Client/server restarted. Re-animating previously active session. Reconstruct state from conversation + codebase and continue from exactly where you stopped.` },
         )
-        notice(`${RESUME_TAG}: Revived a session interrupted by the restart.`)
+        notice(`${RESUME_TAG}: Revived previously active session after restart.`)
       }
     }
-    // reconnect rescans double as zero-trace sweeps for opted-out sessions
     restoreOptedOutTitles()
   }
 
@@ -3303,6 +3405,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       stopStore.save().catch(() => {})
       offStore.save().catch(() => {})
       pauseStore.save().catch(() => {})
+      activeSessionStore.save().catch(() => {})
     }
     // Attach cleanup to process signals for graceful shutdown (listeners
     // attached once per process; see armShutdownHooks).
@@ -3315,8 +3418,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     detach(pauseStore.load, "pause-store-load")
     detach(stopStore.load, "stop-store-load")
     detach(offStore.load, "off-store-load")
+    detach(activeSessionStore.load, "active-session-store-load")
     detach(async () => {
-      await Promise.all([stopStore.load(), offStore.load(), pauseStore.load()])
+      await Promise.all([stopStore.load(), offStore.load(), pauseStore.load(), activeSessionStore.load()])
       restoreOptedOutTitles()
     }, "optout-title-restore")
     detach(checkForUpdates, "update-check")
@@ -3350,7 +3454,17 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         } catch { /* cosmetic only */ }
       }, "update-notice")
     }
-    detach(reanimate, "reanimate")
+    // Snapshot active sessions from PREVIOUS run BEFORE any events can modify the store.
+    // This ensures we only revive sessions that were active before the restart.
+    const activeSessionsSnapshot = new Map()
+    try {
+      await activeSessionStore.load()
+      for (const [id, ts] of activeSessionStore.map) {
+        activeSessionsSnapshot.set(id, ts)
+      }
+    } catch { /* ignore */ }
+    // Run reanimation with the snapshot
+    await reanimate(activeSessionsSnapshot)
   } else {
     console.warn(`${RESUME_TAG} disabled via OPENCODE_RESUME_ENABLED`)
   }
@@ -3366,6 +3480,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
         switch (type) {
           case "session.error": {
+            if (p.sessionID) recordActiveSession(p.sessionID)
             if (p.sessionID && p.error) detach(handleError(p.sessionID, p.error), "handleError")
             break
           }
@@ -3374,6 +3489,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
             nudgePendingNotice()
             const info = p.info
             if (!info?.sessionID) break
+            recordActiveSession(info.sessionID)
             state(info.sessionID).lastActivity = Date.now()
 
             if (info.role === "user") {
@@ -3490,6 +3606,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           case "session.status": {
             nudgePendingNotice()
             if (!p.sessionID) break
+            recordActiveSession(p.sessionID)
             const s = state(p.sessionID)
             s.status = p.status?.type ?? "unknown"
             s.lastActivity = Date.now()
@@ -3585,6 +3702,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           case "session.updated": {
             const info = p.info
             if (info?.id) {
+              recordActiveSession(info.id)
               // Revert sets a revert marker on the session (messageID [+ partID]
               // of the truncation point). The user is taking manual control to
               // edit and reprompt — cancel any queued autoprompt and stay quiet

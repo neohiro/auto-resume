@@ -161,6 +161,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_OFFSTORE` | `<plugin>/auto-resume.js.off.json` | Where per-session opt-outs (`auto-resume off`) are persisted |
 | `OPENCODE_RESUME_MAX_DIR_ASK_COUNTS` | `1000` | Maximum entries in directory ask counter before forced cleanup (`0` = unlimited) |
 | `OPENCODE_RESUME_PAUSESTORE` | `<plugin>/auto-resume.js.paused.json` | Where "user paused" markers are persisted across restarts (set to a path, or empty to keep the default) |
+| `OPENCODE_RESUME_ACTIVESTORE` | `<plugin>/auto-resume.js.active.json` | Where previously active session markers are persisted across restarts for automatic revival after client/server restart |
 | `OPENCODE_RESUME_BREAKER_THRESHOLD` | `6` | Failures inside the window before the global breaker opens |
 | `OPENCODE_RESUME_BREAKER_WINDOW_MS` | `900000` | Circuit-breaker rolling window |
 | `OPENCODE_RESUME_BREAKER_COOLDOWN_MS` | `300000` | Circuit-breaker cool-down once open |
