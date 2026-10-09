@@ -1161,6 +1161,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     "active-sessions",
     str("OPENCODE_RESUME_ACTIVESTORE", selfPath ? `${selfPath}.active.json` : ""),
   )
+  // Startup snapshot of sessions that were active before restart.
+  // Used by reanimate() on server.connected to avoid reviving current-run sessions.
+  let startupActiveSnapshot = new Map()
   const recordActiveSession = (sessionID) => {
     if (!sessionID || typeof sessionID !== "string" || sessionID.length > 256) return
     if (suppressed(sessionID)) return
@@ -1177,7 +1180,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   const isDeprecatedError = (error) => {
     const data = error?.data ?? {}
     const text = `${data.message ?? ""} ${data.responseBody ?? ""} ${error?.message ?? ""}`.toLowerCase()
-    const code = data.statusCode
+    const code = Number(data.statusCode)
     if (code === 404 || code === 410) return true
     return matchesAny(text, DEPRECATION_PATTERNS)
   }
@@ -1818,7 +1821,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   }
 
   const isModelActivated = (modelObj) => {
-    if (!modelObj || typeof modelObj !== "object") return true
+    if (!modelObj || Object.prototype.toString.call(modelObj) !== "[object Object]") return true
     // If any activation flag is explicitly false, the model is not activated.
     // Absence of flags means activated (backward compatible).
     for (const flag of ["enabled", "active", "selected", "allowed"]) {
@@ -1841,6 +1844,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   }
 
   const pickAlternateModel = async (exhausted) => {
+    const nowMs = Date.now()
+    // Periodic cleanup of failure velocities to prevent unbounded growth
+    cleanModelFailureVelocities(nowMs)
     const providers = await getCatalog()
     const all = listChatModels(providers)
     if (!all.length) return null
@@ -1917,6 +1923,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     }
     s.currentModel = { providerID: alt.providerID, modelID: alt.modelID }
     // Fresh lease on the new model — its reliability is unknown so far.
+    // Clear failure velocities for both old and new models.
+    if (exhausted) modelFailureVelocities.delete(modelKey(exhausted))
+    modelFailureVelocities.delete(modelKey(alt))
     s.chain = 0
     s.failStreak = 0
     s.rlStreak = 0
@@ -3198,9 +3207,14 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   // Recovery timers live in the server process, so a crash orphans any turn
   // that was mid-recovery or awaiting its first reply. On startup we scan
   // recent sessions and give those a fresh continuation.
-  const reanimate = async (activeSessionsSnapshot = new Map()) => {
+  const reanimate = async (activeSessionsSnapshot = null) => {
     await Promise.all([stopStore.load(), offStore.load(), pauseStore.load()])
-    // Use the snapshot from startup; fall back to loading if not provided (for server.connected re-scans)
+    // Use the startup snapshot if available; fall back to loading only at startup.
+    // On server.connected, activeSessionsSnapshot will be undefined/null and we use
+    // the captured startupActiveSnapshot (which only has pre-restart sessions).
+    if (!activeSessionsSnapshot) {
+      activeSessionsSnapshot = startupActiveSnapshot
+    }
     if (activeSessionsSnapshot.size === 0) {
       await activeSessionStore.load()
       for (const [id, ts] of activeSessionStore.map) {
@@ -3468,15 +3482,15 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     }
     // Snapshot active sessions from PREVIOUS run BEFORE any events can modify the store.
     // This ensures we only revive sessions that were active before the restart.
-    const activeSessionsSnapshot = new Map()
+    startupActiveSnapshot = new Map()
     try {
       await activeSessionStore.load()
       for (const [id, ts] of activeSessionStore.map) {
-        activeSessionsSnapshot.set(id, ts)
+        startupActiveSnapshot.set(id, ts)
       }
     } catch { /* ignore */ }
     // Run reanimation with the snapshot
-    await reanimate(activeSessionsSnapshot)
+    await reanimate(startupActiveSnapshot)
   } else {
     console.warn(`${RESUME_TAG} disabled via OPENCODE_RESUME_ENABLED`)
   }
