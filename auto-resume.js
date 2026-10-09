@@ -1817,11 +1817,23 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     return catalogCache
   }
 
+  const isModelActivated = (modelObj) => {
+    if (!modelObj || typeof modelObj !== "object") return true
+    // If any activation flag is explicitly false, the model is not activated.
+    // Absence of flags means activated (backward compatible).
+    for (const flag of ["enabled", "active", "selected", "allowed"]) {
+      if (flag in modelObj && !modelObj[flag]) return false
+    }
+    return true
+  }
+
   const listChatModels = (providers) => {
     const out = []
     for (const prov of providers) {
       for (const modelID of Object.keys(prov?.models ?? {})) {
         if (NON_CHAT_PATTERN.test(modelID)) continue
+        const modelObj = prov.models[modelID]
+        if (!isModelActivated(modelObj)) continue
         out.push({ providerID: prov.id, modelID })
       }
     }
