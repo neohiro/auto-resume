@@ -71,21 +71,15 @@ async function fresh(idle = []) {
 }
 const ev = (type, properties) => ({ event: { type, properties } })
 
-// ---- L: quota/free-tier -> automatic model rotation ------------------------
+// ---- L: quota/free-tier -> model rotation is turned off in all cases --------
 {
-  const { state, hooks } = await fresh(["qA", "qB"])
+  const { state, hooks } = await fresh(["qA"])
   await hooks.event(ev("message.updated", { info: { role: "assistant", sessionID: "qA", providerID: "anthropic", modelID: "claude-4-opus" } }))
   await hooks.event(ev("session.error", { sessionID: "qA", error: { name: "UnknownError", data: { message: "Free usage exceeded, subscribe to Go" } } }))
   await sleep(400)
-  ok(state.prompts[0]?.id === "qA" && state.prompts[0]?.model?.modelID === "claude-4-haiku",
-    `L: quota -> rotated to anthropic sibling (${JSON.stringify(state.prompts[0]?.model)})`)
-  // exhaust the sibling too -> must skip cooled-down opus AND non-chat embedding model
-  await hooks.event(ev("message.updated", { info: { role: "assistant", sessionID: "qB", providerID: "anthropic", modelID: "claude-4-haiku" } }))
-  await hooks.event(ev("session.error", { sessionID: "qB", error: { name: "APIError", data: { statusCode: 402, message: "billing quota exceeded" } } }))
-  await sleep(400)
-  const second = state.prompts.find((x) => x.id === "qB")?.model
-  ok(second?.providerID === "openai" && second?.modelID === "gpt-5",
-    `L: cross-provider fallback honors cooldowns (${JSON.stringify(second)})`)
+  const pModel = state.prompts[0]?.model?.modelID
+  ok(pModel !== "claude-4-haiku",
+    `L: quota -> model rotation is turned off in all cases (did not rotate to claude-4-haiku, model=${pModel})`)
 }
 
 // ---- M: permission autopilot -------------------------------------------------

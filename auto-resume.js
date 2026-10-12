@@ -30,9 +30,15 @@
  *     a stopped session (the plugin's own takeover restarts are exempt)
  *
  * ══════════════════════════════════════════════════════════════════
- *  SUBSYSTEM 2 — MODEL ROTATION (no user input required)
+ *  SUBSYSTEM 2 — MODEL ROTATION (opt-in, master switch OFF by default)
  * ══════════════════════════════════════════════════════════════════
- * On free-tier/quota exhaustion or repeated rate limits of a model:
+ * Rotation is NEVER triggered silently. The master switch
+ *   OPENCODE_RESUME_ROTATION_ENABLED
+ * defaults to false. When off (the default), NO model rotation occurs under
+ * any circumstance — quota exhaustion, rate limits, failures, deprecation,
+ * or post-restart recovery all stay on the same model.
+ *
+ * When the user explicitly enables rotation (env var = true):
  *   • puts the exhausted model on a cooldown (default 60 min)
  *   • picks the best available alternative automatically:
  *       1. OPENCODE_RESUME_FALLBACK_MODELS preferred chain (env)
@@ -42,10 +48,6 @@
  *     variants win whenever they exist; mini/nano/lite/flash variants lose.
  *     (non-chat models like embeddings/TTS/image are always filtered out)
  *   • continues the exact same session/conversation on the new model
- *   • ALSO rotates on persistent model-specific failures: repeated network
- *     errors / endpoint unavailability / 5xx waves on one model move the
- *     session to a different model (without cooldown-penalizing the old one,
- *     since outages are often provider-side and temporary)
  *
  * ══════════════════════════════════════════════════════════════════
  *  SUBSYSTEM 3 — PERMISSION AUTOPILOT (unattended operation)
@@ -121,11 +123,13 @@
  *  OPENCODE_RESUME_NOTICE_THROTTLE_MS    min gap between user notices
  *                                      (legacy OPENCODE_RESUME_TOAST_THROTTLE_MS
  *                                      still honored)             (3000)
- *  OPENCODE_RESUME_SWITCH_ON_QUOTA       rotate model on free-tier  (true)
- *  OPENCODE_RESUME_SWITCH_ON_RATELIMIT   rotate after N 429s        (true)
+ *  OPENCODE_RESUME_ROTATION_ENABLED     master switch for rotation  (false)
+ *  OPENCODE_RESUME_SWITCH_ON_QUOTA       rotate model on free-tier  (false)
+ *  OPENCODE_RESUME_SWITCH_ON_RATELIMIT   rotate after N 429s        (false)
  *  OPENCODE_RESUME_SWITCH_ON_FAILURES    rotate after persistent
- *                                        network/5xx failures       (true)
- *  OPENCODE_RESUME_DISABLE_ROTATION      disable ALL model rotation (false)
+ *                                        network/5xx failures       (false)
+ *  OPENCODE_RESUME_DISABLE_ROTATION      legacy alias for
+ *                                        ROTATION_ENABLED=false     (true)
  *  OPENCODE_RESUME_FAVORITE_RETURN        hand the session back to the
  *                                        user's original model once the
  *                                        alternate proves stable        (true)
@@ -211,15 +215,24 @@ const DEFAULTS = {
   noticeThrottleMs: 3_000,
   autoUpdate: true,
   maxTaskCostUsd: 10,
-  switchOnQuota: true,
-  switchOnRateLimit: true,
-  switchOnFailures: true,
-  disableRotation: false,
+  // Model rotation — ALL defaults are OFF. Rotation is NEVER triggered silently.
+  // The master switch OPENCODE_RESUME_ROTATION_ENABLED defaults to false.
+  // When off (the default), NO model rotation occurs under ANY circumstance.
+  // To enable: explicitly set OPENCODE_RESUME_ROTATION_ENABLED=true
+  rotationEnabled: false,
+  switchOnQuota: false,
+  switchOnRateLimit: false,
+  switchOnFailures: false,
+  disableRotation: true,
   rlSwitchAfter: 1,
   rotateAfterFailures: 3,
   maxRotations: 3,
   modelCooldownMs: 3_600_000,
   fallbackModels: "",
+  // Comma-separated list of model IDs to permanently avoid (deprecated/unavailable).
+  // These are filtered out during rotation and put on permanent cooldown.
+  // Example: "exo,exo-1,exo-2,old-model-name"
+  denylistModels: "",
   autonomy: true,
   permissions: true,
   permissionMode: "safe",
@@ -423,6 +436,44 @@ const MAX_TOKENS_PATTERNS = [
 /** Model ids that look like non-chat endpoints and must never receive prompts. */
 const NON_CHAT_PATTERN = /embed|whisper|tts|speech|transcri|image|imagen|dall|moderation|guard|rerank|vision-only|caption/i
 
+/** Known deprecated / permanently unavailable model IDs that should never be
+ *  selected by auto-rotation. These models are put on a permanent cooldown
+ *  and filtered out during model selection. Can be extended via
+ *  OPENCODE_RESUME_DENYLIST_MODELS (comma-separated model IDs). */
+const DEPRECATED_MODELS = new Set([
+  "exo",
+  "exo-1",
+  "exo-2",
+])
+
+/** Patterns in error messages that indicate a TEMPORARY rate limit or quota
+ *  throttling with a specific retry time (e.g., "Please retry in 40.911s",
+ *  "retry in 22.145 seconds") rather than a permanent unrecoverable quota exhaustion.
+ *  When detected, we treat it as a temporary rate limit/retryable error and
+ *  DO NOT rotate models away from the current provider/model. */
+const TEMPORARY_RATE_LIMIT_PATTERNS = [
+  /retry in \d+(\.\d+)?\s*(seconds?|secs?|s|minutes?|mins?|hours?)/i,
+  /try again in \d+(\.\d+)?\s*(seconds?|secs?|s|minutes?|mins?|hours?)/i,
+  /wait \d+(\.\d+)?\s*(seconds?|secs?|s|minutes?|mins?|hours?) before/i,
+  /rate limit.*reset in \d+/i,
+  /quota.*reset in \d+/i,
+  /available in \d+(\.\d+)?\s*(seconds?|secs?|s|minutes?|mins?|hours?)/i,
+  /exhausted for metric.*retry in/i,
+  /free_tier.*retry in/i,
+]
+
+/** Check if an error message indicates a temporary rate limit with a specific
+ *  retry time rather than permanent quota exhaustion. */
+const isTemporaryRateLimit = (error) => {
+  const msg = `${error?.data?.message ?? ""} ${error?.data?.responseBody ?? ""}`.toLowerCase()
+  return TEMPORARY_RATE_LIMIT_PATTERNS.some((re) => re.test(msg))
+}
+
+/** Model selection tracking for intelligent rotation — avoids picking the same
+ *  model repeatedly by tracking recent selections per session. */
+const modelSelectionHistory = new Map() // sessionID -> Array<{modelKey, timestamp}>
+const MAX_SELECTION_HISTORY = 5
+
 /** Router aggregators (OpenRouter, Groq, LiteLLM, etc.): the user's request
  *  hits an upstream provider they don't directly pay, so a single brief
  *  provider outage, a 429 from one upstream, or a quota exhaustion on the
@@ -598,6 +649,10 @@ function loadConfig() {
       num("OPENCODE_RESUME_TOAST_THROTTLE_MS", DEFAULTS.noticeThrottleMs)),
     autoUpdate: bool("OPENCODE_RESUME_AUTO_UPDATE", DEFAULTS.autoUpdate),
     maxTaskCostUsd: num("OPENCODE_AUTOPILOT_MAX_COST_USD", DEFAULTS.maxTaskCostUsd),
+    // Rotation master switch — OFF by default. ALL rotation flags default to OFF.
+    // Rotation is NEVER triggered silently. User must explicitly enable via
+    // OPENCODE_RESUME_ROTATION_ENABLED=true to activate ANY rotation behavior.
+    rotationEnabled: bool("OPENCODE_RESUME_ROTATION_ENABLED", DEFAULTS.rotationEnabled) && !bool("OPENCODE_RESUME_DISABLE_ROTATION", DEFAULTS.disableRotation),
     switchOnQuota: bool("OPENCODE_RESUME_SWITCH_ON_QUOTA", DEFAULTS.switchOnQuota),
     switchOnRateLimit: bool("OPENCODE_RESUME_SWITCH_ON_RATELIMIT", DEFAULTS.switchOnRateLimit),
     switchOnFailures: bool("OPENCODE_RESUME_SWITCH_ON_FAILURES", DEFAULTS.switchOnFailures),
@@ -607,6 +662,9 @@ function loadConfig() {
     maxRotations: num("OPENCODE_RESUME_MAX_ROTATIONS", DEFAULTS.maxRotations),
     modelCooldownMs: num("OPENCODE_RESUME_MODEL_COOLDOWN_MS", DEFAULTS.modelCooldownMs),
     fallbackModels: str("OPENCODE_RESUME_FALLBACK_MODELS", DEFAULTS.fallbackModels),
+    // Denylist of deprecated/unavailable models (comma-separated).
+    // These are NEVER selected during rotation and put on permanent cooldown.
+    denylistModels: str("OPENCODE_RESUME_DENYLIST_MODELS", DEFAULTS.denylistModels),
     autonomy: bool("OPENCODE_RESUME_AUTONOMY", DEFAULTS.autonomy),
     permissions: bool("OPENCODE_AUTOPILOT_PERMISSIONS", DEFAULTS.permissions),
     permissionMode: str("OPENCODE_AUTOPILOT_PERMISSION_MODE", DEFAULTS.permissionMode).toLowerCase(),
@@ -1651,6 +1709,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     if (name === "AbortError" || name === "TimeoutError") return "retryable"
     if (name === "ProviderAuthError") return "auth"
     if (name === "MessageOutputLengthError") return "output_length"
+    // If the error message specifies a temporary retry duration (e.g., Gemini's
+    // "Please retry in 40.911s"), treat it as a temporary rate limit / retryable
+    // rather than permanent quota exhaustion so we stick with the model and retry.
+    if (isTemporaryRateLimit(error)) return "rate_limit"
     if (matchesAny(text, QUOTA_PATTERNS)) return "quota"
     if (matchesAny(text, RATE_LIMIT_PATTERNS)) return "rate_limit"
     if (name === "APIError") {
@@ -1843,7 +1905,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     return out
   }
 
-  const pickAlternateModel = async (exhausted) => {
+  const pickAlternateModel = async (sessionID, exhausted) => {
     const nowMs = Date.now()
     // Periodic cleanup of failure velocities to prevent unbounded growth
     cleanModelFailureVelocities(nowMs)
@@ -1851,14 +1913,31 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const all = listChatModels(providers)
     if (!all.length) return null
 
+    // Build denylist: built-in deprecated models + user-configured denylist
+    const denylist = new Set(DEPRECATED_MODELS)
+    if (cfg.denylistModels) {
+      for (const m of cfg.denylistModels.split(",")) {
+        const trimmed = m.trim().toLowerCase()
+        if (trimmed) denylist.add(trimmed)
+      }
+    }
+
     const exhaustedKey = exhausted ? modelKey(exhausted) : null
     const eligible = all.filter((m) => {
       const k = modelKey(m)
+      const kLower = k.toLowerCase()
       if (exhaustedKey && k === exhaustedKey) return false
       if (cooling(k)) return false
+      // Filter out deprecated/denylisted models
+      if (denylist.has(kLower) || denylist.has(m.modelID.toLowerCase())) return false
       return true
     })
     if (!eligible.length) return null
+
+    // Intelligent rotation: track selection history to avoid picking the same
+    // model repeatedly. We prefer models that haven't been used recently.
+    const history = modelSelectionHistory.get(sessionID) ?? []
+    const recentKeys = new Set(history.slice(-MAX_SELECTION_HISTORY).map((h) => h.modelKey))
 
     // Budget-aware model selection.  When the user is hitting token/credit
     // caps we want a model that won't hit the same wall — prioritise entries
@@ -1888,9 +1967,25 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       const ta = tierScore(a.modelID)
       const tb = tierScore(b.modelID)
       if (ta !== tb) return tb - ta
+      // Tie-breaker: prefer models not recently used (intelligent rotation)
+      const ka = modelKey(a)
+      const kb = modelKey(b)
+      const aRecent = recentKeys.has(ka)
+      const bRecent = recentKeys.has(kb)
+      if (aRecent !== bRecent) return aRecent ? 1 : -1
       return a.modelID.localeCompare(b.modelID)
     })
-    return ordered[0] ?? null
+
+    const selected = ordered[0] ?? null
+    if (selected) {
+      // Record selection in history for this session
+      const newHistory = [...history, { modelKey: modelKey(selected), timestamp: nowMs }]
+      if (newHistory.length > MAX_SELECTION_HISTORY * 2) {
+        newHistory.splice(0, newHistory.length - MAX_SELECTION_HISTORY * 2)
+      }
+      modelSelectionHistory.set(sessionID, newHistory)
+    }
+    return selected
   }
 
   /**
@@ -1899,6 +1994,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
    *   auth/rate-limits; no for generic outages, which are usually temporary.
    */
   const rotateAwayFrom = async (sessionID, reason, penalize = true) => {
+    if (!cfg.rotationEnabled) return false
     const s = state(sessionID)
     if (s.rotations >= cfg.maxRotations) {
       log("warn", "rotation cap reached", { sessionID, rotations: s.rotations })
@@ -2338,7 +2434,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         }
         log("warn", "model deprecated — removing and rotating", { sessionID, model: curModelKey })
         notice(`${RESUME_TAG}: Model ${curModelKey} is deprecated — removed from active models and rotated.`, "error")
-        if (!cfg.disableRotation) {
+        if (cfg.rotationEnabled) {
           await rotateAwayFrom(sessionID, "model deprecated", true)
           s.chain += 1
           if (s.chain <= cfg.maxChain) {
@@ -2353,7 +2449,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       failures.push(nowMs)
       modelFailureVelocities.set(curModelKey, failures)
 
-      if (failures.length >= 2 && !cfg.disableRotation) {
+      if (failures.length >= 2 && cfg.rotationEnabled) {
         log("warn", "model failed multiple times in <60s — force rotating instead of retrying", { sessionID, model: curModelKey, count: failures.length })
         notice(`${RESUME_TAG}: Model ${curModelKey} failed repeatedly within 60s — force-rotating to avoid retry storms.`)
         modelCooldown.set(curModelKey, Date.now() + cfg.modelCooldownMs)
@@ -2384,7 +2480,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     if (kind === "auth") {
       // Auth is provider-scoped: rotate to another PROVIDER's model if possible.
       const authFrom = s.lastModel ? modelKey(s.lastModel) : null
-      if (!cfg.disableRotation && cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "authentication failed"))) {
+      if (cfg.rotationEnabled && cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "authentication failed"))) {
         s.chain += 1
         if (s.chain <= cfg.maxChain) {
           schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, authFrom) }); return
@@ -2403,7 +2499,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
       // Always rotate on quota — pick a free/unlimited model first so the
       // next attempt has a better chance of fitting in the budget.
-      if (!cfg.disableRotation && cfg.switchOnQuota) {
+      if (cfg.rotationEnabled && cfg.switchOnQuota) {
         const rotated = await rotateAwayFrom(sessionID, "quota/free tier exhausted")
         if (rotated) {
           s.chain += 1
@@ -2477,7 +2573,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     // ── repeated rate limits on the same model → rotate too ──
     const errText = `${error?.data?.message ?? ""} ${error?.data?.responseBody ?? ""}`
     const isExplicitRateLimit = matchesAny(errText, RATE_LIMIT_PATTERNS)
-    if (kind === "rate_limit" && !cfg.disableRotation &&
+    if (kind === "rate_limit" && cfg.rotationEnabled &&
         (isExplicitRateLimit || s.rlStreak + 1 >= cfg.rlSwitchAfter) &&
         cfg.switchOnRateLimit) {
       const rlFrom = s.lastModel ? modelKey(s.lastModel) : null
@@ -2521,8 +2617,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
           await summarizeWith(s.currentModel ?? s.lastModel)
           log("info", "compaction requested after overflow", { sessionID })
         } catch (err) {
-          // The summarizer model itself may be the problem (quota, outage) —
-          // fall back to the best alternate model for this one-shot job.
+          if (!cfg.rotationEnabled) {
+            log("info", "compaction failed on primary model — rotation disabled, not retrying on alternate", { sessionID })
+            notice(`${RESUME_TAG}: Compaction failed and model rotation is disabled.`, "error")
+            return
+          }
           log("warn", "compaction failed on primary model, rotating summarizer", {
             sessionID, err: err?.message ?? String(err),
           })
@@ -2561,7 +2660,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     // No cooldown penalty — provider outages are usually temporary.
     if (kind === "retryable") {
       s.failStreak += 1
-      if (!cfg.disableRotation && cfg.switchOnFailures && s.failStreak >= cfg.rotateAfterFailures) {
+      if (cfg.rotationEnabled && cfg.switchOnFailures && s.failStreak >= cfg.rotateAfterFailures) {
         const retFrom = s.lastModel ? modelKey(s.lastModel) : null
         if (await rotateAwayFrom(sessionID, "persistent failures", false)) {
           s.failStreak = 0
@@ -3209,14 +3308,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   // recent sessions and give those a fresh continuation.
   const reanimate = async (activeSessionsSnapshot = null) => {
     await Promise.all([stopStore.load(), offStore.load(), pauseStore.load()])
-    // Use the startup snapshot if available; fall back to loading only at startup.
-    // On server.connected, activeSessionsSnapshot will be undefined/null and we use
-    // the captured startupActiveSnapshot (which only has pre-restart sessions).
+    // On startup, use the snapshot captured before any events could modify the store.
+    // On server.connected (client restart), reload the store to get the latest state —
+    // the startup snapshot is stale and misses sessions that became active after startup.
     if (!activeSessionsSnapshot) {
-      activeSessionsSnapshot = startupActiveSnapshot
-    }
-    if (activeSessionsSnapshot.size === 0) {
       await activeSessionStore.load()
+      activeSessionsSnapshot = new Map()
       for (const [id, ts] of activeSessionStore.map) {
         activeSessionsSnapshot.set(id, ts)
       }
@@ -3285,7 +3382,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         if (lastInfo.modelID) {
           s.lastModel = { providerID: lastInfo.providerID, modelID: lastInfo.modelID }
         }
-        if (kind === "quota" || kind === "rate_limit") {
+        if ((kind === "quota" || kind === "rate_limit") && cfg.rotationEnabled) {
           await rotateAwayFrom(sess.id, "quota/rate limit (after restart)", true)
           if (suppressed(sess.id)) continue
         }

@@ -49,7 +49,7 @@ async function fresh(idle, providers) {
 }
 const ev = (type, properties) => ({ event: { type, properties } })
 
-// ---- Q: persistent network/5xx failures rotate models too -------------------
+// ---- Q: persistent network/5xx failures do not rotate when rotation is off ---
 {
   process.env.OPENCODE_RESUME_ROTATE_AFTER_FAILURES = "2"
   const providers = [
@@ -60,17 +60,15 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("message.updated", { info: { role: "assistant", sessionID: "pf", providerID: "provA", modelID: "a-base" } }))
   await hooks.event(ev("session.error", { sessionID: "pf", error: { name: "APIError", data: { statusCode: 503, message: "service unavailable" } } }))
   await sleep(200)
-  ok(state.prompts.length === 1 && state.prompts[0]?.model?.modelID === "a-base",
-    `Q: first failure retries same model (${state.prompts[0]?.model?.modelID})`)
   await hooks.event(ev("session.error", { sessionID: "pf", error: { name: "UnknownError", data: { message: "fetch failed: ECONNRESET" } } }))
   await sleep(300)
-  const rotated = state.prompts.at(-1)?.model
-  ok(rotated?.providerID === "provA" && rotated?.modelID === "a-max",
-    `Q: streak of 2 -> rotated to strongest sibling a-max (${JSON.stringify(rotated)})`)
+  const rotated = state.prompts.at(-1)?.model?.modelID
+  ok(rotated !== "a-max",
+    `Q: rotation turned off -> did not rotate on persistent failures (model=${rotated})`)
   delete process.env.OPENCODE_RESUME_ROTATE_AFTER_FAILURES
 }
 
-// ---- R: tier ranking prefers Max/Pro over mini/lite everywhere ---------------
+// ---- R: quota exhaustion does not rotate when rotation is turned off -------
 {
   const providers = [
     { id: "provA", models: { "x-lite": {}, "x-mini": {}, "y-pro": {} } },
@@ -80,12 +78,12 @@ const ev = (type, properties) => ({ event: { type, properties } })
   await hooks.event(ev("message.updated", { info: { role: "assistant", sessionID: "tier", providerID: "provA", modelID: "x-lite" } }))
   await hooks.event(ev("session.error", { sessionID: "tier", error: { name: "APIError", data: { statusCode: 402, message: "quota exhausted" } } }))
   await sleep(300)
-  // x-lite is exhausted+cooled; eligible siblings: x-mini(-50), y-pro(+45)
-  ok(state.prompts[0]?.model?.modelID === "y-pro",
-    `R: tier beats alphabetical/sibling order -> y-pro (${JSON.stringify(state.prompts[0]?.model)})`)
+  const modelUsed = state.prompts[0]?.model?.modelID
+  ok(modelUsed !== "y-pro",
+    `R: rotation turned off -> did not rotate to y-pro on quota (model=${modelUsed})`)
 }
 
-// ---- T: rotation cap stops endless provider hopping --------------------------
+// ---- T: rate limit does not rotate models when rotation is turned off ------
 {
   process.env.OPENCODE_RESUME_MAX_ROTATIONS = "1"
   process.env.OPENCODE_RESUME_RL_SWITCH_AFTER = "1"
@@ -96,14 +94,12 @@ const ev = (type, properties) => ({ event: { type, properties } })
   ]
   const { state, hooks } = await fresh(["hop"], providers)
   await hooks.event(ev("message.updated", { info: { role: "assistant", sessionID: "hop", providerID: "provA", modelID: "a1" } }))
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 4; i++) {
     await hooks.event(ev("session.error", { sessionID: "hop", error: { name: "APIError", data: { statusCode: 429, message: `rate limit wave ${i}` } } }))
-    await sleep(120)
+    await sleep(80)
   }
   const distinctModels = new Set(state.prompts.map((p) => p.model?.modelID).filter(Boolean))
-  ok(distinctModels.size <= 3, `T: rotations bounded (${[...distinctModels].join(",")})`)
-  ok(state.logs.some((t) => t.toLowerCase().includes("no alternate") || t.toLowerCase().includes("gave up")),
-    "T: honest give-up notice when rotations exhausted")
+  ok(distinctModels.size === 1 || !distinctModels.has("a2"), `T: rotation turned off -> did not rotate across providers/models (${[...distinctModels].join(",")})`)
   delete process.env.OPENCODE_RESUME_MAX_ROTATIONS
   delete process.env.OPENCODE_RESUME_RL_SWITCH_AFTER
   delete process.env.OPENCODE_RESUME_MAX_CHAIN

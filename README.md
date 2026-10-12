@@ -166,15 +166,17 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_BREAKER_WINDOW_MS` | `900000` | Circuit-breaker rolling window |
 | `OPENCODE_RESUME_BREAKER_COOLDOWN_MS` | `300000` | Circuit-breaker cool-down once open |
 | `OPENCODE_RESUME_COMPACT_ON_OVERFLOW` | `true` | Summarize + resume on overflow |
-| `OPENCODE_RESUME_SWITCH_ON_QUOTA` | `true` | Rotate on free-tier exhaustion |
-| `OPENCODE_RESUME_SWITCH_ON_RATELIMIT` | `true` | Rotate on repeated 429s |
-| `OPENCODE_RESUME_SWITCH_ON_FAILURES` | `true` | Rotate on persistent network/5xx failures |
-| `OPENCODE_RESUME_DISABLE_ROTATION` | `false` | Disable ALL model rotation (overrides the three above) |
+| `OPENCODE_RESUME_ROTATION_ENABLED` | `false` | Master switch for model rotation (OFF by default for all cases) |
+| `OPENCODE_RESUME_SWITCH_ON_QUOTA` | `false` | Rotate on free-tier exhaustion |
+| `OPENCODE_RESUME_SWITCH_ON_RATELIMIT` | `false` | Rotate on repeated 429s |
+| `OPENCODE_RESUME_SWITCH_ON_FAILURES` | `false` | Rotate on persistent network/5xx failures |
+| `OPENCODE_RESUME_DISABLE_ROTATION` | `true` | Disable ALL model rotation (overrides the three above) |
 | `OPENCODE_RESUME_RL_SWITCH_AFTER` | `1` | 429s before rotating |
 | `OPENCODE_RESUME_ROTATE_AFTER_FAILURES` | `3` | Failed rounds before rotating |
 | `OPENCODE_RESUME_MAX_ROTATIONS` | `3` | Model rotations per task |
 | `OPENCODE_RESUME_MODEL_COOLDOWN_MS` | `3600000` | Exhausted-model pause |
 | `OPENCODE_RESUME_FALLBACK_MODELS` | *(auto-discover)* | Preferred chain, e.g. `"anthropic/claude-opus-4-1,openai/gpt-5"` |
+| `OPENCODE_RESUME_DENYLIST_MODELS` | *(empty)* | Comma-separated list of deprecated or permanently unavailable models to avoid (e.g., `"exo,exo-1"`) |
 | `OPENCODE_RESUME_AUTONOMY` | `true` | Master switch for subsystems 3+4 |
 | `OPENCODE_AUTOPILOT_PERMISSIONS` | `true` | Auto-answer permission prompts |
 | `OPENCODE_AUTOPILOT_PERMISSION_MODE` | `safe` | `safe` \| `all` |
@@ -230,7 +232,7 @@ Reply delivery probes the SDK surface (`postSessionByIdPermissionsByPermissionId
 
 ```sh
 git clone https://github.com/neohiro/auto-resume && cd auto-resume
-npm test        # <!-- coverage -->260+ assertions across 10 suites<!-- /coverage --> (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
+npm test        # <!-- coverage -->240+ assertions across 10 suites<!-- /coverage --> (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
 ```
 
 The ten Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
