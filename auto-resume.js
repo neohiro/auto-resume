@@ -1202,6 +1202,57 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     return { map, load, save }
   }
 
+  /** Generic object store for non-timestamp values (e.g., provider health metrics). */
+  const makeObjectStore = (label, path) => {
+    const map = new Map() // key -> arbitrary object
+    let loading = null
+    let saveChain = Promise.resolve()
+    const load = () => {
+      if (!path) return Promise.resolve()
+      loading ??= (async () => {
+        try {
+          const { readFile } = await import("node:fs/promises")
+          const raw = JSON.parse(await readFile(path, "utf8"))
+          if (raw && typeof raw === "object") {
+            for (const [key, val] of Object.entries(raw)) {
+              if (val && typeof val === "object") map.set(key, val)
+            }
+          }
+          log("info", `restored persisted ${label}`, { count: map.size })
+        } catch { /* no store yet (or unreadable) — start empty */ }
+      })()
+      return loading
+    }
+    const writeOnce = async () => {
+      if (!path) return
+      const out = {}
+      for (const [key, val] of map) out[key] = val
+      const payload = JSON.stringify(out, null, 2)
+      const tmp = `${path}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
+      try {
+        await writeFile(tmp, payload, "utf8")
+        for (const delayMs of [25, 50, 100, 200, 400]) {
+          try {
+            await rename(tmp, path)
+            return
+          } catch (err) {
+            if (!["EPERM", "EACCES", "EBUSY", "EEXIST"].includes(err?.code)) throw err
+            await new Promise((r) => setTimeout(r, delayMs))
+          }
+        }
+        await writeFile(path, payload, "utf8")
+      } finally {
+        try { await unlink(tmp) } catch { /* already gone or locked */ }
+      }
+    }
+    const save = () => {
+      saveChain = saveChain.then(writeOnce).catch((err) =>
+        log("warn", `could not persist ${label}`, { err: err?.message ?? String(err) }))
+      return saveChain
+    }
+    return { map, load, save }
+  }
+
   const stopStore = makeMapStore(
     "user-stops",
     str("OPENCODE_RESUME_STOPSTORE", selfPath ? `${selfPath}.stopped.json` : ""),
@@ -1223,7 +1274,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   )
   // Provider health cache — tracks per-model success/failure rates across restarts
   // to bias rotation away from flaky models. Key: "provider/model", value: {success, failures, lastUpdated}
-  const providerHealthStore = makeMapStore(
+  const providerHealthStore = makeObjectStore(
     "provider-health",
     str("OPENCODE_RESUME_HEALTHSTORE", selfPath ? `${selfPath}.health.json` : ""),
   )
