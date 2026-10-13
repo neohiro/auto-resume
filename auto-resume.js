@@ -1798,23 +1798,40 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     providerHealthStore.save()
   }
 
-  /** Emit rotation telemetry for observability. */
-  const emitRotationTelemetry = (sessionID, fromModel, toModel, reason) => {
+  /** Emit rotation telemetry for observability (batched to reduce I/O). */
+  const telemetryQueue = []
+  const TELEMETRY_FLUSH_INTERVAL_MS = 5000
+  const TELEMETRY_MAX_BATCH = 50
+  let telemetryFlushTimer = null
+  const flushTelemetry = () => {
+    if (telemetryQueue.length === 0) return
     try {
       const { appendFile } = require("node:fs/promises")
       const path = selfPath
         ? selfPath.replace(/[\\/][^\\/]+$/, "/auto-resume-metrics.jsonl")
         : null
       if (!path) return
-      const line = JSON.stringify({
-        ts: Date.now(),
-        sessionID,
-        from: fromModel,
-        to: toModel,
-        reason,
-      }) + "\n"
-      appendFile(path, line, "utf8").catch(() => {})
+      const batch = telemetryQueue.splice(0, TELEMETRY_MAX_BATCH)
+      const payload = batch.map((e) => JSON.stringify(e)).join("\n") + "\n"
+      appendFile(path, payload, "utf8").catch(() => {})
     } catch { /* best effort */ }
+  }
+  const emitRotationTelemetry = (sessionID, fromModel, toModel, reason) => {
+    telemetryQueue.push({
+      ts: Date.now(),
+      sessionID,
+      from: fromModel,
+      to: toModel,
+      reason,
+    })
+    if (telemetryQueue.length >= TELEMETRY_MAX_BATCH) flushTelemetry()
+    if (!telemetryFlushTimer) {
+      telemetryFlushTimer = setTimeout(() => {
+        telemetryFlushTimer = null
+        flushTelemetry()
+      }, TELEMETRY_FLUSH_INTERVAL_MS)
+      telemetryFlushTimer.unref?.()
+    }
   }
 
   // ── classification ─────────────────────────────────────────────────
@@ -3376,6 +3393,16 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         log("debug", "dirAskCounts size limit exceeded, removed oldest entries", { removed })
       }
     }
+
+    // Health cache TTL cleanup: remove entries not updated in 30 days to prevent unbounded growth.
+    const HEALTH_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000
+    for (const [modelKey, entry] of providerHealthStore.map) {
+      if (nowMs - (entry.lastUpdated ?? 0) > HEALTH_CACHE_TTL_MS) {
+        providerHealthStore.map.delete(modelKey)
+      }
+    }
+    if (providerHealthStore.map.size > 0) providerHealthStore.save()
+
     // Memory hygiene: drop state for sessions that have been idle for hours.
     for (const [sessionID, s] of sessions) {
       if (s.status === "busy" || s.status === "retry") continue
@@ -3685,6 +3712,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       offStore.save().catch(() => {})
       pauseStore.save().catch(() => {})
       activeSessionStore.save().catch(() => {})
+      providerHealthStore.save().catch(() => {})
+      // Flush any pending telemetry
+      flushTelemetry()
+      if (telemetryFlushTimer) clearTimeout(telemetryFlushTimer)
     }
     // Attach cleanup to process signals for graceful shutdown (listeners
     // attached once per process; see armShutdownHooks).
