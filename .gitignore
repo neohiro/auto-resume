@@ -7,5 +7,6 @@ node_modules/
 *.off.json.*.tmp
 auto-resume.js.acked
 auto-resume.js.bak
+*.active.json
 
 .updtest/
