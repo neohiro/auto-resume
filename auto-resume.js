@@ -1621,10 +1621,21 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   const resolveTuiToast = () => {
     if (tuiToastCache !== undefined) return tuiToastCache
     const tui = client.tui ?? {}
-    const fn = typeof tui.showToast === "function" ? tui.showToast : null
-    tuiToastCache = fn
-    log("info", fn
-      ? "native TUI toast channel bound (primary notice surface)"
+    const notification = client.notification ?? {}
+    const window = client.window ?? {}
+    const app = client.app ?? {}
+    
+    const fn =
+      typeof tui.showToast === "function" ? (b) => tui.showToast(b) :
+      typeof notification.show === "function" ? (b) => notification.show(b) :
+      typeof window.showInformationMessage === "function" ? (b) => window.showInformationMessage(b?.body?.message ?? b) :
+      typeof app.notify === "function" ? (b) => app.notify(b) :
+      typeof tui.notify === "function" ? (b) => tui.notify(b) :
+      null
+
+    tuiToastCache = fn ?? false
+    log("info", tuiToastCache
+      ? "native TUI toast/notification channel bound successfully"
       : "native TUI toast channel unavailable — falling back to app log + OS")
     return tuiToastCache
   }
@@ -1634,7 +1645,26 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     try {
       const res = fn({ body: { title: "auto-resume", message, variant: TOAST_VARIANT[variant] ?? "info" } })
       return res && typeof res.then === "function" ? res.then(() => true).catch(() => false) : true
-    } catch { return false }
+    } catch {
+      try {
+        const fnFlat = resolveTuiToast()
+        if (typeof fnFlat === "function") {
+          fnFlat({ title: "auto-resume", message, type: variant })
+          return true
+        }
+      } catch { /* ignore */ }
+      return false
+    }
+  }
+
+  /** Suppress UI error popups when auto-resume is actively recovering an error. */
+  const suppressErrorPopups = async () => {
+    try {
+      const dismiss = client.tui?.dismissToast ?? client.notification?.dismiss ?? client.tui?.clearToasts
+      if (typeof dismiss === "function") {
+        await dismiss()
+      }
+    } catch { /* best effort */ }
   }
   const notice = (message, variant = "warning") => {
     const nowMs = Date.now()
@@ -1703,10 +1733,20 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const name = error?.name
     const data = error?.data ?? {}
     const text = `${data.message ?? ""} ${data.responseBody ?? ""}`
-    if (name === "MessageAbortedError") return "abort"
-    // Fetch-level timeouts/aborts carry different names than user stops
-    // (MessageAbortedError) — they are transient infrastructure, retryable.
     if (name === "AbortError" || name === "TimeoutError") return "retryable"
+    if (name === "MessageAbortedError") {
+      const msg = String(data.message ?? "").toLowerCase()
+      // If it's an SDK/transport drop, timeout, or network disconnect without explicit
+      // user initiation, treat it as a retryable infrastructure error rather than a user stop.
+      if (data.userInitiated !== true && (
+          msg.includes("network") || msg.includes("timeout") || msg.includes("stream") ||
+          msg.includes("disconnect") || msg.includes("connection") || msg.includes("socket") ||
+          msg.includes("terminated") || msg.includes("hung")
+      )) {
+        return "retryable"
+      }
+      return "abort"
+    }
     if (name === "ProviderAuthError") return "auth"
     if (name === "MessageOutputLengthError") return "output_length"
     // If the error message specifies a temporary retry duration (e.g., Gemini's
@@ -2417,6 +2457,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       sessionID, name: error?.name, statusCode: error?.data?.statusCode, message: error?.data?.message,
     })
     queueTitleRefresh(sessionID)
+    if (kind !== "abort" && kind !== "auth" && kind !== "fatal") {
+      suppressErrorPopups()
+    }
 
     const currentModel = s.currentModel ?? s.lastModel
     const curModelKey = currentModel ? modelKey(currentModel) : null
