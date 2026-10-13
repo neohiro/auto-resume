@@ -413,6 +413,7 @@ const QUOTA_PATTERNS = [
   "requires more credits", "insufficient_credit", "insufficient_quota",
   "insufficient credits", "insufficient balance", "insufficient credit",
   "credit", "afford", "out of credits", "no credits",
+  "not available for your country", "not available in your country", "geo.*restrict", "country.*not.*support",
 ]
 
 /** A second, narrower tier of phrases that mean the model asked for too many
@@ -1220,6 +1221,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     "active-sessions",
     str("OPENCODE_RESUME_ACTIVESTORE", selfPath ? `${selfPath}.active.json` : ""),
   )
+  // Provider health cache — tracks per-model success/failure rates across restarts
+  // to bias rotation away from flaky models. Key: "provider/model", value: {success, failures, lastUpdated}
+  const providerHealthStore = makeMapStore(
+    "provider-health",
+    str("OPENCODE_RESUME_HEALTHSTORE", selfPath ? `${selfPath}.health.json` : ""),
+  )
   // Startup snapshot of sessions that were active before restart.
   // Used by reanimate() on server.connected to avoid reviving current-run sessions.
   let startupActiveSnapshot = new Map()
@@ -1974,6 +1981,19 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       return true
     })
     if (!eligible.length) return null
+
+    // Load provider health data for biasing rotation away from flaky models
+    const healthData = providerHealthStore.map // key: "provider/model" -> {success, failures, lastUpdated}
+    const getHealthScore = (m) => {
+      const key = modelKey(m).toLowerCase()
+      const h = healthData.get(key)
+      if (!h || typeof h !== "object") return 0
+      const total = (h.success ?? 0) + (h.failures ?? 0)
+      if (total < 3) return 0 // not enough data
+      const failureRate = (h.failures ?? 0) / total
+      // Negative score = penalize high failure rate
+      return Math.round(-failureRate * 100)
+    }
 
     // Intelligent rotation: track selection history to avoid picking the same
     // model repeatedly. We prefer models that haven't been used recently.
@@ -3354,7 +3374,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   // that was mid-recovery or awaiting its first reply. On startup we scan
   // recent sessions and give those a fresh continuation.
   const reanimate = async (activeSessionsSnapshot = null) => {
-    await Promise.all([stopStore.load(), offStore.load(), pauseStore.load()])
+    await Promise.all([stopStore.load(), offStore.load(), pauseStore.load(), providerHealthStore.load()])
     // On startup, use the snapshot captured before any events could modify the store.
     // On server.connected (client restart), reload the store to get the latest state —
     // the startup snapshot is stale and misses sessions that became active after startup.
@@ -3591,9 +3611,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     detach(pauseStore.load, "pause-store-load")
     detach(stopStore.load, "stop-store-load")
     detach(offStore.load, "off-store-load")
+    detach(providerHealthStore.load, "provider-health-store-load")
     detach(activeSessionStore.load, "active-session-store-load")
     detach(async () => {
-      await Promise.all([stopStore.load(), offStore.load(), pauseStore.load(), activeSessionStore.load()])
+      await Promise.all([stopStore.load(), offStore.load(), pauseStore.load(), providerHealthStore.load(), activeSessionStore.load()])
       restoreOptedOutTitles()
     }, "optout-title-restore")
     detach(checkForUpdates, "update-check")

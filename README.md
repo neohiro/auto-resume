@@ -162,6 +162,7 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 | `OPENCODE_RESUME_MAX_DIR_ASK_COUNTS` | `1000` | Maximum entries in directory ask counter before forced cleanup (`0` = unlimited) |
 | `OPENCODE_RESUME_PAUSESTORE` | `<plugin>/auto-resume.js.paused.json` | Where "user paused" markers are persisted across restarts (set to a path, or empty to keep the default) |
 | `OPENCODE_RESUME_ACTIVESTORE` | `<plugin>/auto-resume.js.active.json` | Where previously active session markers are persisted across restarts for automatic revival after client/server restart |
+| `OPENCODE_RESUME_HEALTHSTORE` | `<plugin>/auto-resume.js.health.json` | Where provider health metrics (success/failure rates) are persisted across restarts to bias rotation away from flaky models |
 | `OPENCODE_RESUME_BREAKER_THRESHOLD` | `6` | Failures inside the window before the global breaker opens |
 | `OPENCODE_RESUME_BREAKER_WINDOW_MS` | `900000` | Circuit-breaker rolling window |
 | `OPENCODE_RESUME_BREAKER_COOLDOWN_MS` | `300000` | Circuit-breaker cool-down once open |
