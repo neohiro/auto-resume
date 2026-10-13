@@ -1736,6 +1736,36 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   }
   const noteSuccess = () => { breakerFailures.length = 0; breakerOpenUntil = 0; breakerNoted = false }
 
+  /** Record provider health metrics for rotation bias. */
+  const recordHealth = (modelKey, success) => {
+    const key = modelKey.toLowerCase()
+    const entry = providerHealthStore.map.get(key) ?? { success: 0, failures: 0, lastUpdated: 0 }
+    if (success) entry.success += 1
+    else entry.failures += 1
+    entry.lastUpdated = Date.now()
+    providerHealthStore.map.set(key, entry)
+    providerHealthStore.save()
+  }
+
+  /** Emit rotation telemetry for observability. */
+  const emitRotationTelemetry = (sessionID, fromModel, toModel, reason) => {
+    try {
+      const { appendFile } = require("node:fs/promises")
+      const path = selfPath
+        ? selfPath.replace(/[\\/][^\\/]+$/, "/auto-resume-metrics.jsonl")
+        : null
+      if (!path) return
+      const line = JSON.stringify({
+        ts: Date.now(),
+        sessionID,
+        from: fromModel,
+        to: toModel,
+        reason,
+      }) + "\n"
+      appendFile(path, line, "utf8").catch(() => {})
+    } catch { /* best effort */ }
+  }
+
   // ── classification ─────────────────────────────────────────────────
   const classify = (error) => {
     const name = error?.name
@@ -2103,6 +2133,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     })
     notice(`${RESUME_TAG}: ${reason} on ${exhausted ? modelKey(exhausted) : "model"} — continuing on ${modelKey(alt)}.`)
     queueTitleRefresh(sessionID)
+    if (exhausted) emitRotationTelemetry(sessionID, modelKey(exhausted), modelKey(alt), reason)
     return true
   }
 
@@ -2517,6 +2548,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       failures = failures.filter(ts => nowMs - ts < FAILURE_VELOCITY_WINDOW_MS)
       failures.push(nowMs)
       modelFailureVelocities.set(curModelKey, failures)
+      // Record failure for provider health cache (bias rotation away from flaky models)
+      recordHealth(curModelKey, false)
 
       if (failures.length >= 2 && cfg.rotationEnabled) {
         log("warn", "model failed multiple times in <60s — force rotating instead of retrying", { sessionID, model: curModelKey, count: failures.length })
@@ -3022,6 +3055,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
     if (!errored && hasContent) {
       noteSuccess()
+      const curKey = s.currentModel ?? s.lastModel
+      if (curKey) recordHealth(modelKey(curKey), true)
       // A clean turn supersedes any recovery still waiting to fire: without
       // this, error→scheduled resume + core's own successful retry produced
       // spurious "transient infrastructure error" prompts on healthy turns.
