@@ -473,6 +473,7 @@ const isTemporaryRateLimit = (error) => {
  *  model repeatedly by tracking recent selections per session. */
 const modelSelectionHistory = new Map() // sessionID -> Array<{modelKey, timestamp}>
 const MAX_SELECTION_HISTORY = 5
+const SELECTION_HISTORY_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
 
 /** Router aggregators (OpenRouter, Groq, LiteLLM, etc.): the user's request
  *  hits an upstream provider they don't directly pay, so a single brief
@@ -1976,6 +1977,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
     // Intelligent rotation: track selection history to avoid picking the same
     // model repeatedly. We prefer models that haven't been used recently.
+    // Clean up stale session histories (TTL-based) to prevent memory leaks.
+    for (const [sid, h] of modelSelectionHistory) {
+      const latest = h[h.length - 1]?.timestamp ?? 0
+      if (nowMs - latest > SELECTION_HISTORY_TTL_MS) modelSelectionHistory.delete(sid)
+    }
     const history = modelSelectionHistory.get(sessionID) ?? []
     const recentKeys = new Set(history.slice(-MAX_SELECTION_HISTORY).map((h) => h.modelKey))
 
@@ -2458,7 +2464,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     })
     queueTitleRefresh(sessionID)
     if (kind !== "abort" && kind !== "auth" && kind !== "fatal") {
-      suppressErrorPopups()
+      await suppressErrorPopups()
     }
 
     const currentModel = s.currentModel ?? s.lastModel
@@ -3035,18 +3041,16 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       // work ("Continue to finalize.") instead of finishing — keep it going.
       if (open.length === 0 && s.lastInjectKind !== "propose" && cfg.autonomy && cfg.proceedOnAsk &&
           s.proceedCount < cfg.maxProceeds && s.nudges < cfg.maxNudges && budgetLeft(s)) {
-        const text = (lastAssistant.parts ?? [])
-          .map((x) => (x?.type === "text" ? x.text : "")).join(" ")
-        if (text && text.trim()) {
-          const asked = QUESTION_PATTERNS.some((re) => re.test(text))
-          const stubbed = looksLikeContinuationStub(text) || looksLikeContinuationLong(text)
+        if (replyText && replyText.trim()) {
+          const asked = QUESTION_PATTERNS.some((re) => re.test(replyText))
+          const stubbed = looksLikeContinuationStub(replyText) || looksLikeContinuationLong(replyText)
           // "Which of these do you want me to tackle first?" / "Should I tackle
           // proposal 2?" / "Want me to do all of them?" / "draft a SPEC for X" —
           // these are proposal-list / defer-to-user questions. Different from a
           // simple yes/no proceed: the user wants unattended execution of N items,
           // so fire a stronger "do all, step-by-step" prompt instead of the
           // generic proceed nudge.
-          const proposalList = /\b(which (of these|one)|tackle (first|proposal)|do all\b|implement all\b|all of them|draft a spec|write a spec)\b/i.test(text)
+          const proposalList = /\b(which (of these|one)|tackle (first|proposal)|do all\b|implement all\b|all of them|draft a spec|write a spec)\b/i.test(replyText)
           if (asked || stubbed) {
             s.proceedCount += 1
             s.nudges += 1
@@ -3389,7 +3393,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
       let entries = []
       try {
-        const r = await client.session.messages({ path: { id: sess.id } })
+        const r = await Promise.race([
+          client.session.messages({ path: { id: sess.id } }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("messages fetch timeout")), 10_000))
+        ])
         entries = (r?.data ?? r) ?? []
       } catch { continue }
       if (suppressed(sess.id)) continue
@@ -3956,6 +3963,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
                 for (const k of keySet) dirAskCounts.delete(k)
                 dirAskCountsBySession.delete(id)
               }
+              // Clean up model selection history
+              modelSelectionHistory.delete(id)
               const tt = titleTimers.get(id)
               if (tt) clearTimeout(tt)
               titleTimers.delete(id)
