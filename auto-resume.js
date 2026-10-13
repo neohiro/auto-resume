@@ -413,7 +413,7 @@ const QUOTA_PATTERNS = [
   "requires more credits", "insufficient_credit", "insufficient_quota",
   "insufficient credits", "insufficient balance", "insufficient credit",
   "credit", "afford", "out of credits", "no credits",
-  "not available for your country", "not available in your country", "geo.*restrict", "country.*not.*support",
+  "not available for your country", "not available in your country", /geo.*restrict/i, /country.*not.*support/i,
 ]
 
 /** A second, narrower tier of phrases that mean the model asked for too many
@@ -691,9 +691,15 @@ function loadConfig() {
 }
 
 const matchesAny = (haystack, patterns) => {
-  if (!haystack) return false
+  if (!haystack || !Array.isArray(patterns) || patterns.length === 0) return false
   const lower = String(haystack).toLowerCase()
-  return patterns.some((p) => lower.includes(p))
+  return patterns.some((p) => {
+    if (p instanceof RegExp) {
+      p.lastIndex = 0
+      return p.test(lower)
+    }
+    return lower.includes(String(p).toLowerCase())
+  })
 }
 
 const isCreditsConstraint = (error) => {
@@ -1789,7 +1795,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
   /** Record provider health metrics for rotation bias. */
   const recordHealth = (modelKey, success) => {
-    const key = modelKey.toLowerCase()
+    const rawKey = typeof modelKey === "string" ? modelKey.trim() : String(modelKey ?? "").trim()
+    if (!rawKey) return
+    const key = rawKey.toLowerCase()
     const entry = providerHealthStore.map.get(key) ?? { success: 0, failures: 0, lastUpdated: 0 }
     if (success) entry.success += 1
     else entry.failures += 1
@@ -1811,9 +1819,12 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         ? selfPath.replace(/[\\/][^\\/]+$/, "/auto-resume-metrics.jsonl")
         : null
       if (!path) return
-      const batch = telemetryQueue.splice(0, TELEMETRY_MAX_BATCH)
-      const payload = batch.map((e) => JSON.stringify(e)).join("\n") + "\n"
-      appendFile(path, payload, "utf8").catch(() => {})
+      let guard = 0
+      while (telemetryQueue.length > 0 && guard++ < 1000) {
+        const batch = telemetryQueue.splice(0, TELEMETRY_MAX_BATCH)
+        const payload = batch.map((e) => JSON.stringify(e)).join("\n") + "\n"
+        appendFile(path, payload, "utf8").catch(() => {})
+      }
     } catch { /* best effort */ }
   }
   const emitRotationTelemetry = (sessionID, fromModel, toModel, reason) => {
@@ -3707,6 +3718,15 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const cleanup = () => {
       for (const t of activeIntervals) clearInterval(t)
       for (const t of activeTimeouts) clearTimeout(t)
+      // Cancel all pending scheduled work so nothing fires after shutdown.
+      for (const t of timers.values()) { try { clearTimeout(t) } catch { /* ignore */ } }
+      timers.clear()
+      for (const t of titleTimers.values()) { try { clearTimeout(t) } catch { /* ignore */ } }
+      titleTimers.clear()
+      for (const s of sessions.values()) {
+        if (s?.rearmTimer) { clearTimeout(s.rearmTimer); s.rearmTimer = null }
+        if (s?.compactionTimer) { clearTimeout(s.compactionTimer); s.compactionTimer = null }
+      }
       // Save any pending stores
       stopStore.save().catch(() => {})
       offStore.save().catch(() => {})
