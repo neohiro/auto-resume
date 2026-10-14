@@ -3527,7 +3527,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     if (!Array.isArray(list)) return
     const cutoff = Date.now() - cfg.reanimateWindowMs
     const activeCutoff = Date.now() - RESTART_RECOVERY_WINDOW_MS
-    for (const sess of list) {
+    const activeList = [...list].sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0)).slice(0, 50)
+    for (const sess of activeList) {
       if (!sess?.id || sess.parentID) continue
       if (typeof sess.id !== "string" || sess.id.length > 256) continue
       if (suppressed(sess.id)) continue
@@ -3594,6 +3595,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         )
         notice(`${RESUME_TAG}: Revived previously active session after restart.`)
       }
+      await new Promise((r) => setTimeout(r, 150))
     }
     restoreOptedOutTitles()
   }
@@ -3799,8 +3801,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     // Run reanimation with the snapshot
     await reanimate(startupActiveSnapshot)
     // Deferred reanimation: server may not have populated session list yet.
-    // Retry after a short delay to catch sessions that load asynchronously.
-    setTimeout(() => detach(reanimate, "reanimate-deferred"), 3000).unref?.()
+    // Retry after a random delay (1s-5s) to stagger requests and catch asynchronously loaded sessions.
+    const staggerMs = Math.floor(Math.random() * 4000) + 1000
+    setTimeout(() => detach(reanimate, "reanimate-deferred"), staggerMs).unref?.()
   } else {
     console.warn(`${RESUME_TAG} disabled via OPENCODE_RESUME_ENABLED`)
   }
