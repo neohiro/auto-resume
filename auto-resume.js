@@ -1122,6 +1122,8 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   let catalogCache = null
   let catalogFetchedAt = 0
   let cachedPermFns = null
+  let lastReanimateAt = 0
+  let firstSessionActivity = true
 
   // This file's own path on disk (also used by the self-updater below).
   const selfPath = (() => {
@@ -3599,7 +3601,6 @@ export const AutoResumePlugin = async ({ client, $ }) => {
 
   // -- self-updater: daily check against the official repo -------------------
   let lastUpdateCheckAt = 0
-  let lastReanimateAt = 0
   let pendingUpdateNotice = null
   let noticeDelivering = false
   let lastNoticeTryAt = 0
@@ -3797,6 +3798,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     } catch { /* ignore */ }
     // Run reanimation with the snapshot
     await reanimate(startupActiveSnapshot)
+    // Deferred reanimation: server may not have populated session list yet.
+    // Retry after a short delay to catch sessions that load asynchronously.
+    setTimeout(() => detach(reanimate, "reanimate-deferred"), 3000).unref?.()
   } else {
     console.warn(`${RESUME_TAG} disabled via OPENCODE_RESUME_ENABLED`)
   }
@@ -3879,20 +3883,21 @@ export const AutoResumePlugin = async ({ client, $ }) => {
               s0.lastTurnHadText = false // new turn begins
               break
             }
-
-            if (info.role === "assistant") {
-              if (info.modelID) {
-                const s = state(info.sessionID)
-                const seen = { providerID: info.providerID, modelID: info.modelID }
-                s.originalModel = s.originalModel ?? seen
-                s.lastModel = seen
+            // Fallback reanimation on first session activity: catches initial
+            // startup when server.connected doesn't fire or fires before sessions load.
+            if (firstSessionActivity && cfg.reanimate) {
+              firstSessionActivity = false
+              if (Date.now() - lastReanimateAt > REANIMATE_SCAN_INTERVAL_MS) {
+                lastReanimateAt = Date.now()
+                detach(reanimate, "reanimate-activity")
               }
-              if (typeof info.cost === "number") state(info.sessionID).taskCost += info.cost
-              if (info.error) detach(handleError(info.sessionID, info.error), "handleError")
-              // Cost increment may shift the title suffix ($1.20 → $1.85)
-              // and may tip the session into the "paused" state on the next
-              // statusKeyOf. Either way, the user wants to see the update.
-              queueTitleRefresh(info.sessionID)
+            }
+            // Capture model from assistant messages for resume fidelity
+            if (info.role === "assistant" && info.modelID) {
+              const s = state(info.sessionID)
+              const seen = { providerID: info.providerID, modelID: info.modelID }
+              s.originalModel = s.originalModel ?? seen
+              s.lastModel = seen
             }
             break
           }
