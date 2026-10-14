@@ -654,7 +654,7 @@ function loadConfig() {
     // Rotation master switch — OFF by default. ALL rotation flags default to OFF.
     // Rotation is NEVER triggered silently. User must explicitly enable via
     // OPENCODE_RESUME_ROTATION_ENABLED=true to activate ANY rotation behavior.
-    rotationEnabled: bool("OPENCODE_RESUME_ROTATION_ENABLED", DEFAULTS.rotationEnabled) && !bool("OPENCODE_RESUME_DISABLE_ROTATION", DEFAULTS.disableRotation),
+    rotationEnabled: bool("OPENCODE_RESUME_ROTATION_ENABLED", false),
     switchOnQuota: bool("OPENCODE_RESUME_SWITCH_ON_QUOTA", DEFAULTS.switchOnQuota),
     switchOnRateLimit: bool("OPENCODE_RESUME_SWITCH_ON_RATELIMIT", DEFAULTS.switchOnRateLimit),
     switchOnFailures: bool("OPENCODE_RESUME_SWITCH_ON_FAILURES", DEFAULTS.switchOnFailures),
@@ -2063,6 +2063,7 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   }
 
   const pickAlternateModel = async (sessionID, exhausted) => {
+    if (!cfg.rotationEnabled) return null
     const nowMs = Date.now()
     // Periodic cleanup of failure velocities to prevent unbounded growth
     cleanModelFailureVelocities(nowMs)
