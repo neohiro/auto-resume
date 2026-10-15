@@ -212,9 +212,52 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 
 ## Compatibility
 
-Works anywhere OpenCode runs — **Windows, macOS, Linux**. The plugin is a single zero-dependency file using only the OpenCode SDK client, timers, and environment variables, plus the tiny local files it manages itself: the self-update backup (`.bak`), the update-ack marker (`.acked`), the user-stop memory (`auto-resume.js.stopped.json`), the per-session opt-out memory (`auto-resume.js.off.json`), and the pause memory (`auto-resume.js.paused.json`). Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
+Works anywhere OpenCode runs — **Windows, macOS, Linux** — on **OpenCode 1.x and OpenCode 2.x** (including the desktop client). The plugin is a single zero-dependency file using only the OpenCode plugin context / SDK client, timers, and environment variables, plus the tiny local files it manages itself: the self-update backup (`.bak`), the update-ack marker (`.acked`), the user-stop memory (`auto-resume.js.stopped.json`), the per-session opt-out memory (`auto-resume.js.off.json`), and the pause memory (`auto-resume.js.paused.json`). Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
 
 Tested against OpenCode's event API: `session.error/status/idle/created/updated/deleted/compacted`, `message.updated/removed`, `message.part.updated/removed`, `todo.updated`, `permission.asked/updated/replied`, `server.connected`.
+
+### OpenCode 2 support
+
+OpenCode 2 does not run V1 plugin implementations — a V1 module fails to load with
+`Plugin must export a default definition with an id and an effect or setup function`.
+This plugin ships **both entrypoints from one file**:
+
+| Export | Runtime |
+|---|---|
+| `export default { id: "auto-resume", setup(ctx) }` | OpenCode 2.x (Promise plugin API) |
+| `export const AutoResumePlugin({ client, $ })` | OpenCode 1.x (V1 hook API) |
+
+The V2 `setup` is an adapter, not a rewrite. It maps the V2 plugin context onto the V1
+client the engine already speaks, subscribes to `ctx.event.subscribe()`, and normalizes
+each V2 event onto the `{ type, properties }` shape the engine consumes:
+
+| V1 engine call | V2 context method |
+|---|---|
+| `session.prompt({ path, body })` | `ctx.session.prompt({ sessionID, text, model })` |
+| `session.abort()` | `ctx.session.interrupt({ sessionID, continue: false })` |
+| `session.summarize()` | `ctx.session.compact({ sessionID })` |
+| `session.messages()` / `session.message()` | `ctx.session.message.list()` / `message.get()` |
+| `session.update()` / `session.get()` / `session.list()` | `ctx.session.update()` / `get()` / `list()` |
+| `session.status()` | `ctx.session.status()`, else the `session.status` event cache |
+| permission reply | `ctx.permission.reply({ sessionID, requestID, reply })` |
+| `config.providers()` | `ctx.provider.list()` |
+
+V2-specific event and payload differences that are bridged: `permission.asked` carries
+`action` + `resources` instead of `permission` + `metadata`; V2 replaced the `{ role, parts }`
+message envelope with a `type`-discriminated message plus a typed `content[]` array; and
+structured errors (`{ type, message, status }`) are mapped back to the `{ name, data }` shape
+the classifier reads. Event payloads are read under `properties`, `data`, or flattened, so
+transport-encoding drift cannot silently disable recovery.
+
+**Two behavior notes on V2** (platform changes, not plugin limitations):
+- V2 removed the `todowrite` tool and the `todo.updated` event. The TODO drive, improvement
+  loop and wrap-up therefore track the plan the model writes inline (markdown checkboxes or a
+  "next steps" list). Detection scans the most recent such plan across recent assistant
+  messages, so a plan stated a few turns ago keeps driving even when the newest reply is a
+  short acknowledgment. The autoprompts were reworded to work for both structured todos and
+  inline plans.
+- V2 removed `client.app.log`. Log lines fall back to the server console; the plugin's own
+  notice drop-file (`auto-resume-notices.jsonl`) and OS notifications are unaffected.
 
 ### Permission payload shapes
 
@@ -233,10 +276,10 @@ Reply delivery probes the SDK surface (`postSessionByIdPermissionsByPermissionId
 
 ```sh
 git clone https://github.com/neohiro/auto-resume && cd auto-resume
-npm test        # <!-- coverage -->240+ assertions across 10 suites<!-- /coverage --> (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
+npm test        # <!-- coverage -->260+ assertions across 11 suites<!-- /coverage --> (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
 ```
 
-The ten Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
+The Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/v2entry.mjs` drives the **V2 default export** against a mock V2 plugin context — the recovery path across all three event-stream encodings, permission autopilot, message normalization, and the cross-message plan fallback that replaces the removed `todowrite` tool. `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
 
 ### Windows unattended notes (UAC / SmartScreen)
 

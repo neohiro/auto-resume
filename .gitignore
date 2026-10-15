@@ -5,6 +5,10 @@ node_modules/
 *.stopped.json.*.tmp
 *.off.json
 *.off.json.*.tmp
+*.paused.json
+*.paused.json.*.tmp
+*.health.json
+*.health.json.*.tmp
 auto-resume.js.acked
 auto-resume.js.bak
 *.active.json

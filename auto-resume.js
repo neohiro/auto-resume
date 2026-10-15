@@ -5,6 +5,32 @@
  *  load and double-fire every hook.)
  *
  * ══════════════════════════════════════════════════════════════════
+ *  RUNTIME SUPPORT — OpenCode 1.x AND OpenCode 2.x
+ * ══════════════════════════════════════════════════════════════════
+ *  OpenCode 2 does not run V1 plugins: its loader imports the module and
+ *  requires the DEFAULT export to be a plugin definition carrying an `id` plus
+ *  `setup(ctx)`. This file therefore exposes BOTH entrypoints from one module:
+ *
+ *    • `export default { id, setup(ctx) }`  — OpenCode 2.x (Promise plugin)
+ *    • `export const AutoResumePlugin`      — OpenCode 1.x (V1 hooks)
+ *
+ *  The V2 `setup` does not reimplement the engine. It builds a small adapter
+ *  that maps the V2 plugin context onto the V1 SDK client the engine already
+ *  speaks (`ctx.session.prompt({ sessionID, text })`,
+ *  `ctx.session.interrupt(...)`, `ctx.permission.reply(...)`, ...), subscribes
+ *  to `ctx.event.subscribe()`, normalizes each V2 event onto the V1
+ *  `{ type, properties }` shape, and feeds that engine. See the
+ *  "OPENCODE V2 ENTRYPOINT" section at the bottom of this file.
+ *
+ *  Two V2 platform changes are worth knowing about:
+ *    • V2 has no `todowrite` tool and no `todo.updated` event. The TODO drive,
+ *      improvement loop and wrap-up key off the plan the model writes inline
+ *      (markdown checkboxes / a "next steps" list) instead of a structured todo
+ *      tool. Detection scans the most recent such plan, so a plan stated a few
+ *      turns ago keeps driving even when the newest reply is a short ack.
+ *    • V2 removed `client.app.log`; log lines fall back to the server console.
+ *
+ * ══════════════════════════════════════════════════════════════════
  *  SUBSYSTEM 1 — RECOVERY (always on while plugin enabled)
  * ══════════════════════════════════════════════════════════════════
  * Keeps a turn alive whenever OpenCode's own internal retry gives up:
@@ -68,7 +94,9 @@
  * ══════════════════════════════════════════════════════════════════
  * Lets you hand a big task to OpenCode and leave:
  *   • TODO DRIVE: session goes idle with unfinished todos → nudges it to
- *     continue (spin-detection stops it if nothing progresses)
+ *     continue (spin-detection stops it if nothing progresses). Tracks both
+ *     structured todos (OpenCode 1 cores) and inline markdown plans, which is
+ *     the only task-tracking available on OpenCode 2.
  *   • DEBUG NUDGE: 3 consecutive failed tool calls → tells the model to stop
  *     repeating the failing approach and diagnose the root cause first
  *   • AUTONOMY DIRECTIVE: every injected prompt instructs the model to make
@@ -173,7 +201,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.15.0"
+const AUTO_RESUME_VERSION = "1.16.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -263,6 +291,49 @@ const TITLE_REFRESH_DEBOUNCE_MS = 250
 const CONTINUATION_STUB_MAX_LEN = 250
 // Minimum text length for no-todo improvement pass
 const NO_TODO_IMPROVE_MIN_CHARS = 80
+
+/** Markdown checklist / plan markers the model writes for itself.
+ *  OpenCode 2 removed the first-class `todowrite` tool and the `todo.updated`
+ *  event, so a V2 model has no structured task tracker — it tracks remaining
+ *  work either with markdown checkboxes (`- [ ]` / `- [x]`) or, when the core
+ *  still exposes tool todos (V1 cores), via the todo list itself. */
+const CHECKBOX_RE = /[-*+]\s+\[([ xX~+-])\]/g
+const PLAN_HEADING_RE = /^\s*(?:#{1,6}\s*)?(?:todo|to-do|task|plan|next steps?|remaining|checklist|outstanding)\b/im
+const textOfParts = (parts) =>
+  (parts ?? []).map((x) => (x?.type === "text" ? (x.text ?? "") : "")).join("\n")
+
+/** Count the checkboxes in a block of assistant text. */
+const checkboxCounts = (text) => {
+  const boxes = [...String(text ?? "").matchAll(CHECKBOX_RE)]
+  const open = boxes.filter((m) => m[1] !== "x" && m[1] !== "X").length
+  return { open, done: boxes.length - open, total: boxes.length }
+}
+
+/** Resolve the most recent self-authored plan from a session's messages.
+ *
+ *  Used only when no tool-backed todo list exists — i.e. on OpenCode 2, where
+ *  `todowrite`/`todo.updated` are gone. Scans assistant messages from newest to
+ *  oldest and returns the first message that actually contains a checklist (or
+ *  a plan heading), so a plan the model stated several turns ago keeps driving
+ *  continuation even when the newest reply is just a short confirmation.
+ *
+ *  Returns `{ open, done, total, text }` or null when the session has no plan. */
+const latestPlanFromMessages = (entries, maxScan = 12) => {
+  const assistants = []
+  for (let i = entries.length - 1; i >= 0 && assistants.length < maxScan; i -= 1) {
+    if (entries[i]?.info?.role === "assistant") assistants.push(entries[i])
+  }
+  for (const msg of assistants) {
+    const text = textOfParts(msg?.parts)
+    if (!text) continue
+    const counts = checkboxCounts(text)
+    if (counts.total > 0) return { ...counts, text }
+    // A heading-only plan ("## Next steps" with prose underneath) still marks
+    // outstanding work even without checkboxes.
+    if (PLAN_HEADING_RE.test(text)) return { open: 1, done: 0, total: 1, text }
+  }
+  return null
+}
 // Improved title display window (3 minutes)
 const IMPROVED_TITLE_WINDOW_MS = 180_000
 // Compaction watchdog timeout (3 minutes)
@@ -356,7 +427,7 @@ const PROMPTS = {
   empty: (auto) =>
     `${RESUME_TAG} Previous reply came back empty (likely a transient provider hiccup). Answer the original request now: concise, precise, production-grade.`,
   todos: () =>
-    `${RESUME_TAG} Session idle, todos unfinished. Work them autonomously, one by one: implement end-to-end (code + tests + docs where they matter), verify (build/test/lint), then mark complete. Hold the bar above industry standards — edges, errors, clean integration — until the list is flawless.`,
+    `${RESUME_TAG} Session idle, todos unfinished. Pick up the remaining items autonomously, one by one: work the list you set yourself (tool-tracked todos where the client provides them, otherwise the checklist you wrote inline), implement each end-to-end (code + tests + docs where they matter), verify (build/test/lint), then mark or tick each item complete. Hold the bar above industry standards — edges, errors, clean integration — until the list is flawless. If everything is already done, say so in one line and stop.`,
   proceed: () =>
     `${RESUME_TAG} Proceed autonomously with what you just proposed/asked — answer is yes. Decide and continue.` +
     ` Execute end-to-end at senior level: full impl + tests + error handling + doc touches, verified against the real toolchain. Aim to exceed expectations.` +
@@ -377,7 +448,7 @@ const PROMPTS = {
     ` Hunt concrete gains: correctness, perf, security, robustness, readability — unhandled edges, missing input validation, races, leaks, stale docs/comments, thin test coverage on critical paths, inefficient hot spots, style inconsistencies.` +
     ` Implement what you're confident about and validate (build/test/lint/typecheck). Skip ambiguous/risky items; one-line note why. No new features — raise existing work above industry standards, beyond what the user asked for.`,
   propose: () =>
-    `${RESUME_TAG} Todos complete, flawless execution. Do NOT implement more. Don't summarize the work. Wrap-up = NEW info only:` +
+    `${RESUME_TAG} Todos/plan complete, flawless execution. Do NOT implement more. Don't summarize the work. Wrap-up = NEW info only:` +
     ` (1) Verification status — what you ran (build/test/lint/typecheck) and results; flag anything unverified.` +
     ` (2) Known limitations, risks, assumptions a reviewer should know.` +
     ` (3) Up to 3 follow-up improvement proposals, each with expected payoff — aim above user expectations.`,
@@ -3170,9 +3241,25 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       // count as a todo list even when the todo tool was never used.
       const replyText = (lastAssistant.parts ?? [])
         .map((x) => (x?.type === "text" ? x.text : "")).join(" ")
-      const boxes = [...replyText.matchAll(/[-*+]\s+\[([ xX])\]/g)]
-      const cbOpen = boxes.filter((m) => m[1] === " ").length
-      const cbDone = boxes.length - cbOpen
+      let boxes = [...replyText.matchAll(CHECKBOX_RE)]
+      let cbOpen = boxes.filter((m) => m[1] !== "x" && m[1] !== "X").length
+      let cbDone = boxes.length - cbOpen
+
+      // OpenCode 2 dropped the todo tool and the todo.updated event, so a V2
+      // model has no structured task list. When the newest reply carries no
+      // checklist, fall back to the most recent plan the model wrote earlier in
+      // the conversation — otherwise a plan stated a few turns ago silently
+      // stops driving continuation the moment the next reply is a short
+      // confirmation. Tool-backed todos (V1 cores) always take precedence, so
+      // existing behaviour is unchanged where the structured list exists.
+      if (todos.length === 0 && boxes.length === 0) {
+        const plan = latestPlanFromMessages(entries)
+        if (plan && plan.open > 0) {
+          cbOpen = plan.open
+          cbDone = plan.done
+          boxes = new Array(plan.total).fill("[ ]")
+        }
+      }
 
       // The agent ended its turn by asking a question or announcing more
       // work ("Continue to finalize.") instead of finishing — keep it going.
@@ -4147,5 +4234,441 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       }
     },
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  OPENCODE V2 ENTRYPOINT
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * OpenCode 2.x does NOT run V1 plugins. Its loader imports the module and
+ * requires the DEFAULT export to be a plugin definition — an object with a
+ * stable `id` and a `setup(ctx)` (Promise plugins) or `effect(host)` (Effect
+ * plugins). A V1 module (named export returning hooks) fails at load with:
+ *
+ *   Plugin must export a default definition with an id and an effect or
+ *   setup function.  (cause: SchemaError(Missing key at ["default"]))
+ *
+ * `Plugin.define()` is an identity function (`(p) => p`), so the definition
+ * can be exported as a plain object literal. That matters here: this plugin
+ * is installed as a bare `file://` module with no node_modules next to it,
+ * so it must not `import { Plugin } from "@opencode/plugin"` — the specifier
+ * would not resolve outside a package context.
+ *
+ * Everything above is the V1 engine and is left untouched. Below, a thin
+ * adapter reconciles two very different surfaces:
+ *
+ *   • the V1 SDK client (`client.session.prompt({ path, body })`,
+ *     `client.session.status()`, `client.config.providers()`, ...) → the V2
+ *     plugin context (`ctx.session.prompt({ sessionID, text })`,
+ *     `ctx.session.interrupt(...)`, `ctx.provider.list()`, ...)
+ *   • the V1 `event` hook (`{ event: { type, properties } }`) → the V2
+ *     `ctx.event.subscribe()` async iterable
+ *
+ * The adapter is deliberately defensive: every call is feature-detected and
+ * every event payload is normalized across all three encodings the stream
+ * may use (`properties`, `data`, or flattened). A capability that is absent
+ * on a given build degrades to a no-op instead of throwing, because a throw
+ * inside the event loop would silently disable every recovery path.
+ */
+
+/** Best-effort read of an event payload under any of the encodings the V2
+ *  stream has used. Newer cores nest under `properties`, some under `data`,
+ *  and the event-sourced union flattens the schema onto the event itself. */
+const v2EventPayload = (ev) => {
+  if (!ev || typeof ev !== "object") return null
+  if (ev.properties && typeof ev.properties === "object") return ev.properties
+  if (ev.data && typeof ev.data === "object" && !Array.isArray(ev.data)) return ev.data
+  return ev
+}
+
+/** V2 `Session.StructuredError` ({ type, message, status }) → the V1 error
+ *  envelope ({ name, data:{ statusCode, message } }) the classifier reads.
+ *  Already-V1 errors pass through untouched. */
+const v2ErrorToV1 = (err) => {
+  if (!err || typeof err !== "object") return err
+  if (err.name || err.data) return err
+  const message = err.message ?? ""
+  return {
+    name: err.type ?? err.name ?? "UnknownError",
+    message,
+    data: {
+      message,
+      statusCode: err.status ?? err.statusCode ?? err.data?.statusCode,
+      responseBody: err.response?.body ?? err.data?.responseBody,
+    },
+  }
+}
+
+/** Map a V2 message onto the V1 `{ info, parts }` envelope the engine reads.
+ *
+ *  V2 replaced V1's `role` + separate `parts` with a single discriminated union:
+ *  the message carries `type` ("user" | "assistant" | "synthetic" | "system" |
+ *  "compaction" | "skill" | "shell") and — for assistant turns — a typed
+ *  `content[]` array holding text / reasoning / tool blocks. The engine keys
+ *  almost everything off `info.role`, so the discriminator has to be translated
+ *  back, and V2 "synthetic"/"skill" turns must still read as user-role input
+ *  because that is exactly what the plugin itself injects. */
+const v2MessageInfo = (msg, sessionID) => {
+  if (!msg || typeof msg !== "object") return null
+  if (msg.info) return msg // already in the { info, parts } shape
+  const model = msg.model ?? null
+  const kind = msg.type ?? msg.role ?? ""
+  const role =
+    kind === "assistant" ? "assistant"
+      : kind === "user" || kind === "synthetic" || kind === "skill" ? "user"
+        : kind || undefined
+  const info = {
+    id: msg.id,
+    sessionID: msg.sessionID ?? sessionID,
+    role,
+    providerID: model?.providerID ?? msg.providerID,
+    modelID: model?.id ?? model?.modelID ?? msg.modelID,
+    model,
+    agent: msg.agent,
+    error: v2ErrorToV1(msg.error),
+    finish: msg.finish ?? msg.rawFinish,
+    cost: msg.cost,
+    tokens: msg.tokens,
+    time: msg.time,
+  }
+  let parts = []
+  if (Array.isArray(msg.parts)) {
+    parts = msg.parts
+  } else if (Array.isArray(msg.content)) {
+    // V2 folded parts into a typed `content` array on the message.
+    parts = msg.content.map((c) => {
+      if (c?.type === "tool") {
+        const st = c.state ?? {}
+        return {
+          type: "tool",
+          callID: c.id,
+          tool: c.name,
+          state: {
+            // V2 renamed the streaming state; the engine only knows the V1
+            // running/completed/error triple.
+            status: st.status === "streaming" ? "running" : st.status,
+            input: st.input,
+            output: st.output,
+            error: v2ErrorToV1(st.error),
+            title: st.title ?? c.name,
+          },
+        }
+      }
+      if (c?.type === "text") return { type: "text", text: c.text ?? "" }
+      if (c?.type === "reasoning") return { type: "reasoning", text: c.text ?? "" }
+      return c
+    })
+  }
+  if (parts.length === 0) {
+    // V2 stores user/synthetic/system text directly on the message: `text` is
+    // a string on synthetic and a { text, files, agents, skills } object on user
+    // turns. The engine reads prompt text off the parts, and uses it to spot
+    // its OWN "[auto-resume]" injections so they don't look like a new task.
+    const raw = msg.text
+    const text = typeof raw === "string" ? raw : raw?.text
+    if (typeof text === "string" && text.length > 0) parts = [{ type: "text", text }]
+  }
+  return { info, parts }
+}
+
+/** V2 `Permission.Request` uses `action` + `resources`; the engine's autopilot
+ *  reads a `permission`/`type` name plus `title`/`metadata`. Bridge the two so
+ *  the existing decision logic (and its deny-list fingerprint) keeps working. */
+const v2PermissionToV1 = (payload) => {
+  const p = v2EventPayload(payload) ?? {}
+  const resources = Array.isArray(p.resources) ? p.resources : []
+  const action = String(p.action ?? p.permission ?? p.type ?? "").toLowerCase()
+  const meta = {
+    ...(p.metadata && typeof p.metadata === "object" ? p.metadata : {}),
+    resources,
+    // The deny-list fingerprint and the dangerous-pattern scan both read the
+    // command/path out of metadata, so surface each resource under the field
+    // names the V1 engine already looks for.
+    command: p.metadata?.command ?? resources[0],
+    pattern: p.metadata?.pattern ?? resources[0],
+    patterns: p.metadata?.patterns ?? resources,
+    path: p.metadata?.path ?? resources[0],
+  }
+  return {
+    ...p,
+    id: p.id,
+    sessionID: p.sessionID,
+    permission: action,
+    type: action,
+    title: p.title ?? p.message ?? [action, ...resources].filter(Boolean).join(" "),
+    metadata: meta,
+  }
+}
+
+/** Build the V1-shaped `client` the engine expects out of a V2 plugin context.
+ *
+ *  Method mapping (V1 → V2):
+ *    session.list()          → ctx.session.list()
+ *    session.get()           → ctx.session.get({ sessionID })
+ *    session.update()        → ctx.session.update({ sessionID, title })
+ *    session.status()        → ctx.session.status() ?? session.status event cache
+ *    session.messages()      → ctx.session.message.list() / ctx.session.context()
+ *    session.message()       → ctx.session.message.get() / context lookup
+ *    session.prompt()        → ctx.session.prompt({ sessionID, text })
+ *    session.abort()         → ctx.session.interrupt({ sessionID, continue:false })
+ *    session.summarize()     → ctx.session.compact({ sessionID })
+ *    permission reply        → ctx.permission.reply() / ctx.session.permission.reply()
+ *    config.providers()      → ctx.provider.list()
+ *    app.log()               → ctx.app.log() ?? console
+ *
+ *  `session.status()` has no direct V2 equivalent in the plugin context, so it
+ *  is served from a cache fed by the `session.status` / `session.idle` /
+ *  `session.busy` events. That is the same information the V1 endpoint
+ *  returned, and it keeps the engine's "don't inject into a live turn" guard
+ *  working. */
+const buildV2Client = (ctx, hooks) => {
+  const sid = (v) => (typeof v === "string" ? v : v?.id ?? v?.sessionID ?? v?.path?.id)
+  const unwrap = (res) => (res && typeof res === "object" && "data" in res ? res.data : res)
+
+  // Statuses observed on the event stream, newest write wins.
+  const statusBySession = new Map()
+  const setStatus = (sessionID, type) => {
+    if (sessionID && type) statusBySession.set(sessionID, type)
+  }
+
+  // Track assistant-message state so `session.message()` can answer for a
+  // single message without a dedicated round trip.
+  const messageCache = new Map() // "sessionID|messageID" -> { info, parts }
+
+  const remember = (msg, sessionID) => {
+    const shaped = v2MessageInfo(msg, sessionID)
+    if (shaped?.info?.id) {
+      messageCache.set(`${shaped.info.sessionID}|${shaped.info.id}`, shaped)
+    }
+    return shaped
+  }
+
+  const fetchMessages = async (sessionID) => {
+    const list = ctx.session?.message?.list ?? ctx.session?.messages ?? ctx.session?.context
+    if (typeof list !== "function") return []
+    let res
+    try {
+      res = await list.call(ctx.session, { sessionID, limit: 200 })
+    } catch {
+      try {
+        res = await list.call(ctx.session, { sessionID })
+      } catch {
+        return []
+      }
+    }
+    const data = unwrap(res)
+    const arr = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.messages)
+        ? data.messages
+        : Array.isArray(data?.data)
+          ? data.data
+          : []
+    return arr.map((m) => remember(m, sessionID)).filter(Boolean)
+  }
+
+  const facade = {
+    app: {
+      // V2 has no app.log endpoint on the plugin context; fall back to the
+      // server console so notices/logs are still observable.
+      log: async ({ body } = {}) => {
+        const line = `[${body?.service ?? "auto-resume"}] ${body?.level ?? "info"}: ${body?.message ?? ""}`
+        const extra = body?.extra
+        try {
+          if (typeof ctx.app?.log === "function") {
+            await ctx.app.log({ body: { service: body?.service ?? "auto-resume", level: body?.level ?? "info", message: body?.message ?? "", extra } })
+            return true
+          }
+        } catch { /* fall through to console */ }
+        if (extra === undefined) console.log(line)
+        else console.log(line, extra)
+        return true
+      },
+    },
+    session: {
+      list: async () => unwrap(await ctx.session.list()),
+      get: async (input) => unwrap(await ctx.session.get({ sessionID: sid(input) })),
+      update: async (input) => {
+        const title = input?.body?.title
+        if (title == null) return true
+        await ctx.session.update({ sessionID: sid(input), title })
+        return true
+      },
+      status: async () => {
+        // Prefer a live call if this build exposes one; otherwise fall back to
+        // the event-derived cache.
+        if (typeof ctx.session.status === "function") {
+          try {
+            return unwrap(await ctx.session.status())
+          } catch { /* fall through */ }
+        }
+        const out = {}
+        for (const [id, type] of statusBySession) out[id] = { type }
+        return out
+      },
+      messages: async (input) => fetchMessages(sid(input)),
+      message: async (input) => {
+        const sessionID = input?.path?.id ?? input?.sessionID
+        const messageID = input?.path?.messageID ?? input?.messageID
+        const get = ctx.session?.message?.get
+        if (typeof get === "function" && messageID) {
+          try {
+            const res = unwrap(await get.call(ctx.session.message, { sessionID, messageID }))
+            if (res) return { data: res }
+          } catch { /* fall through to cache */ }
+        }
+        const cached = messageCache.get(`${sessionID}|${messageID}`)
+        if (cached) return { data: cached }
+        const all = await fetchMessages(sessionID)
+        const hit = all.find((m) => m?.info?.id === messageID)
+        return { data: hit ?? { parts: [] } }
+      },
+      prompt: async (input) => {
+        const sessionID = sid(input)
+        const parts = input?.body?.parts ?? []
+        const text = parts.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("\n").trim()
+        if (!text) return { data: {} }
+        const model = input?.body?.model
+        const payload = { sessionID, text }
+        if (model?.providerID && (model?.modelID ?? model?.id)) {
+          payload.model = { providerID: model.providerID, id: model.modelID ?? model.id }
+        }
+        // V2 prompt admission is asynchronous: it returns the admitted inbox
+        // item instead of blocking until the reply completes.
+        return unwrap(await ctx.session.prompt(payload))
+      },
+      abort: async (input) => {
+        await ctx.session.interrupt({ sessionID: sid(input), continue: false })
+        return true
+      },
+      summarize: async (input) => {
+        const sessionID = sid(input)
+        const body = input?.body
+        const model = body?.providerID ? { providerID: body.providerID, id: body.modelID ?? body.modelID } : undefined
+        await ctx.session.compact(model ? { sessionID, model } : { sessionID })
+        return true
+      },
+      // Exposed under a /permission/i key so the engine's candidate scan finds
+      // it; it calls with the V1 `{ path, body }` envelope.
+      respondToPermission: async (input) => {
+        const sessionID = input?.path?.id ?? input?.sessionID
+        const requestID = input?.path?.permissionID ?? input?.permissionID
+        const reply = input?.body?.response ?? input?.reply ?? input?.decision
+        if (!sessionID || !requestID || !reply) return false
+        const arg = { sessionID, requestID, reply }
+        if (typeof ctx.permission?.reply === "function") {
+          return unwrap(await ctx.permission.reply(arg))
+        }
+        if (typeof ctx.session?.permission?.reply === "function") {
+          return unwrap(await ctx.session.permission.reply(arg))
+        }
+        return false
+      },
+    },
+    config: {
+      providers: async () => {
+        const list = ctx.provider?.list
+        if (typeof list !== "function") return { providers: [] }
+        const data = unwrap(await list.call(ctx.provider))
+        const arr = Array.isArray(data) ? data : Array.isArray(data?.providers) ? data.providers : []
+        return {
+          providers: arr.map((p) => ({
+            id: p?.id ?? p?.providerID,
+            models: p?.models ?? {},
+          })),
+        }
+      },
+    },
+  }
+  // Expose the same reply helper at the client root (the engine probes both).
+  facade.postSessionIdPermissionsPermissionId = facade.session.respondToPermission
+
+  return { client: facade, setStatus, remember, messageCache, statusBySession }
+}
+
+export default {
+  id: "auto-resume",
+  setup: async (ctx) => {
+    const hooksForClient = {}
+    const { client, setStatus, remember } = buildV2Client(ctx, hooksForClient)
+
+    // Instantiate the V1 engine against the bridged client.
+    const engine = await AutoResumePlugin({ client })
+    const handle = engine?.event
+    if (typeof handle !== "function") {
+      throw new Error("auto-resume: engine did not return an event handler")
+    }
+
+    const controller = new AbortController()
+    // Serialize event delivery: the engine mutates shared per-session state and
+    // awaits async client calls, so events must be processed in order — but
+    // never block the stream reader (the V2 event stream fails on a slow
+    // consumer). Chain instead of awaiting in the loop.
+    let chain = Promise.resolve()
+
+    const dispatch = (ev) => {
+      const type = ev?.type
+      if (typeof type !== "string") return
+      const payload = v2EventPayload(ev) ?? {}
+      let properties = payload
+
+      // Feed the status cache before normalizing.
+      if (type === "session.status" && payload.sessionID) {
+        setStatus(payload.sessionID, payload.status?.type ?? "unknown")
+      } else if (type === "session.idle" && payload.sessionID) {
+        setStatus(payload.sessionID, "idle")
+      } else if (type === "message.updated" && payload.sessionID && payload.info) {
+        const shaped = remember(payload.info, payload.sessionID)
+        if (payload.info?.role === "assistant") setStatus(payload.sessionID, "busy")
+        else if (payload.info?.role === "user") setStatus(payload.sessionID, "busy")
+        if (shaped) properties = { ...payload, info: shaped.info, parts: shaped.parts }
+      } else if (type === "message.part.updated" && payload.part) {
+        // V2 parts travel on the event payload; the session id lives beside the
+        // part rather than inside it. The engine reads `part.sessionID`, so
+        // re-attach it. Do NOT round-trip through the message adapter here — a
+        // bare part is not a message and would be mangled.
+        const part = { ...payload.part, sessionID: payload.part.sessionID ?? payload.sessionID }
+        properties = { ...payload, part }
+      }
+
+      if (type === "session.error") {
+        properties = { ...payload, error: v2ErrorToV1(payload.error) }
+      } else if (type === "permission.asked" || type === "permission.updated") {
+        properties = v2PermissionToV1(payload)
+      }
+
+      chain = chain.then(() => handle({ event: { type, properties } })).catch((err) => {
+        console.error(`${RESUME_TAG} event handler error:`, err?.message ?? err)
+      })
+    }
+
+    const pump = (async () => {
+      try {
+        for await (const ev of ctx.event.subscribe({ signal: controller.signal })) {
+          dispatch(ev)
+        }
+      } catch (err) {
+        if (!controller.signal.aborted) {
+          console.error(`${RESUME_TAG} event stream error:`, err?.message ?? err)
+        }
+      }
+    })()
+
+    // Kick off crash reanimation immediately (mirrors the V1 boot behavior).
+    void (async () => {
+      try {
+        await ctx.app?.version
+      } catch { /* version is best-effort */ }
+      await new Promise((r) => setTimeout(r, 0))
+      // Fire a synthetic server.connected so the engine performs its startup
+      // reanimation exactly as it did under V1.
+      dispatch({ type: "server.connected", properties: {} })
+    })()
+
+    return () => {
+      controller.abort()
+      void pump
+    }
+  },
 }
 
