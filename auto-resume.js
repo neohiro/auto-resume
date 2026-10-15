@@ -201,9 +201,23 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.16.0"
+const AUTO_RESUME_VERSION = "1.16.1"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
+
+/** This module's own path on disk, resolved at import time.
+ *
+ *  The engine computes the same value locally (each plugin instance owns its
+ *  sidecars), but the V2 adapter needs it before the engine exists: it has to
+ *  find <plugin>.active.json to know which sessions were alive when the last
+ *  server died, because OpenCode 2 exposes no session-list endpoint to plugins.
+ *  Resolving it here keeps the adapter independent of engine internals. */
+const MODULE_SELF_PATH = (() => {
+  try {
+    if (!import.meta.url.startsWith("file:")) return null
+    return decodeURIComponent(new URL(import.meta.url).pathname).replace(/^\/([A-Za-z]:)/, "$1")
+  } catch { return null }
+})()
 
 /** One-word aggression preset → (maxChain, maxStallTakeovers). Numeric
  *  env vars (OPENCODE_RESUME_MAX_CHAIN, OPENCODE_RESUME_MAX_STALL_TAKEOVERS)
@@ -4443,15 +4457,77 @@ const buildV2Client = (ctx, hooks) => {
     return shaped
   }
 
+  /** Session ids this plugin recorded as active, newest first.
+   *
+   *  OpenCode 2's plugin context exposes no session-list endpoint (its session
+   *  domain is create/get/remove/switchAgent/switchModel/prompt/generate/
+   *  command/compact/synthetic/interrupt/update/move/wait/context). Restart
+   *  reanimation therefore cannot enumerate sessions the way V1's
+   *  `session.list()` allowed.
+   *
+   *  It does not need to: reanimation only revives sessions that were alive
+   *  when the last server died, and the plugin already persists exactly that
+   *  set to <plugin>.active.json on every observed event. Reading it back gives
+   *  a candidate list that is strictly *narrower* than the old full listing,
+   *  and the engine still cross-checks each candidate's current state (title,
+   *  last message, suppressed markers) before reviving. Candidates are confirmed
+   *  to still exist with `session.get()`, so stale ids from an older install are
+   *  dropped rather than revived as phantoms. */
+  const persistedActiveSessionIDs = async (limit = 50) => {
+    const path = process.env.OPENCODE_RESUME_ACTIVESTORE ||
+      (MODULE_SELF_PATH ? `${MODULE_SELF_PATH}.active.json` : "")
+    if (!path) return []
+    try {
+      const { readFile } = await import("node:fs/promises")
+      const raw = JSON.parse(await readFile(path, "utf8"))
+      if (!raw || typeof raw !== "object") return []
+      return Object.entries(raw)
+        .filter(([id, ts]) => typeof id === "string" && id.length <= 256 && typeof ts === "number")
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, limit)
+        .map(([id]) => id)
+    } catch {
+      return []
+    }
+  }
+
+  /** Session list for the engine's reanimation scan.
+   *  Prefers a real listing when the build provides one, otherwise reconstructs
+   *  it from the persisted active-session store (see above). */
+  const listSessions = async () => {
+    if (typeof ctx.session?.list === "function") {
+      try {
+        const res = unwrap(await ctx.session.list({}))
+        if (Array.isArray(res)) return res
+      } catch { /* fall back to the persisted candidate set */ }
+    }
+    const ids = await persistedActiveSessionIDs()
+    const out = []
+    for (const id of ids) {
+      if (typeof ctx.session?.get !== "function") break
+      try {
+        const info = unwrap(await ctx.session.get({ sessionID: id }))
+        // V2 wraps the payload as { data }; unwrap already peeled that, but a
+        // build that returns the envelope directly still resolves here.
+        const session = info?.data && typeof info.data === "object" ? info.data : info
+        if (session && typeof session === "object") out.push(session)
+      } catch { /* the session is gone (deleted/expired) — skip it */ }
+    }
+    return out
+  }
+
   const fetchMessages = async (sessionID) => {
     const list = ctx.session?.message?.list ?? ctx.session?.messages ?? ctx.session?.context
     if (typeof list !== "function") return []
+    // ctx.session.context is a plain GET keyed only by sessionID; passing extra
+    // keys is harmless on some builds and rejected on others, so try the
+    // documented shape first and only then the richer paginated one.
     let res
     try {
-      res = await list.call(ctx.session, { sessionID, limit: 200 })
+      res = await list.call(ctx.session, { sessionID })
     } catch {
       try {
-        res = await list.call(ctx.session, { sessionID })
+        res = await list.call(ctx.session, { sessionID, limit: 200 })
       } catch {
         return []
       }
@@ -4486,7 +4562,7 @@ const buildV2Client = (ctx, hooks) => {
       },
     },
     session: {
-      list: async () => unwrap(await ctx.session.list()),
+      list: async () => listSessions(),
       get: async (input) => unwrap(await ctx.session.get({ sessionID: sid(input) })),
       update: async (input) => {
         const title = input?.body?.title
@@ -4538,7 +4614,11 @@ const buildV2Client = (ctx, hooks) => {
         return unwrap(await ctx.session.prompt(payload))
       },
       abort: async (input) => {
-        await ctx.session.interrupt({ sessionID: sid(input), continue: false })
+        // The V2 route is queried as `?resume=`; the published docs spell the
+        // flag `continue`, so send both and let each build read the one it
+        // knows. resume:false means "stop the current turn", which is what a
+        // stall takeover wants before it schedules its own continuation.
+        await ctx.session.interrupt({ sessionID: sid(input), resume: false, continue: false })
         return true
       },
       summarize: async (input) => {

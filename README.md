@@ -234,13 +234,23 @@ each V2 event onto the `{ type, properties }` shape the engine consumes:
 | V1 engine call | V2 context method |
 |---|---|
 | `session.prompt({ path, body })` | `ctx.session.prompt({ sessionID, text, model })` |
-| `session.abort()` | `ctx.session.interrupt({ sessionID, continue: false })` |
+| `session.abort()` | `ctx.session.interrupt({ sessionID, resume: false })` |
 | `session.summarize()` | `ctx.session.compact({ sessionID })` |
-| `session.messages()` / `session.message()` | `ctx.session.message.list()` / `message.get()` |
-| `session.update()` / `session.get()` / `session.list()` | `ctx.session.update()` / `get()` / `list()` |
+| `session.messages()` / `session.message()` | `ctx.session.context()` / `message.get()` |
+| `session.update()` / `session.get()` | `ctx.session.update()` / `get()` |
+| `session.list()` | **no equivalent — reconstructed (see below)** |
 | `session.status()` | `ctx.session.status()`, else the `session.status` event cache |
 | permission reply | `ctx.permission.reply({ sessionID, requestID, reply })` |
 | `config.providers()` | `ctx.provider.list()` |
+
+**`session.list()` has no V2 equivalent**, and this one matters: restart reanimation enumerates
+sessions to find ones interrupted by a crash, so with no listing available it silently found
+nothing and every restart came back "green" with nothing revived. The adapter reconstructs the
+candidate set from the plugin's own `<plugin>.active.json` — the session ids it persists on
+every observed event — and confirms each one still exists with `ctx.session.get()`. That set is
+strictly narrower than V1's full listing (only sessions that were actually active when the last
+server died), and the engine still re-checks each candidate's current state before reviving, so
+stale ids from an older install are dropped rather than revived as phantoms.
 
 V2-specific event and payload differences that are bridged: `permission.asked` carries
 `action` + `resources` instead of `permission` + `metadata`; V2 replaced the `{ role, parts }`
@@ -276,10 +286,10 @@ Reply delivery probes the SDK surface (`postSessionByIdPermissionsByPermissionId
 
 ```sh
 git clone https://github.com/neohiro/auto-resume && cd auto-resume
-npm test        # <!-- coverage -->260+ assertions across 11 suites<!-- /coverage --> (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
+npm test        # <!-- coverage -->260+ assertions across 12 suites<!-- /coverage --> (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
 ```
 
-The Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/v2entry.mjs` drives the **V2 default export** against a mock V2 plugin context — the recovery path across all three event-stream encodings, permission autopilot, message normalization, and the cross-message plan fallback that replaces the removed `todowrite` tool. `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
+The Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/v2entry.mjs` drives the **V2 default export** against a mock V2 plugin context — the recovery path across all three event-stream encodings, permission autopilot, message normalization, and the cross-message plan fallback that replaces the removed `todowrite` tool. `tests/reanimate.mjs` covers **restart auto-resume** specifically: that an interrupted session is revived on V1, on V2 without any `session.list()`, on the first boot after a self-update, and that sessions the user stopped or that are empty are left alone. `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
 
 ### Windows unattended notes (UAC / SmartScreen)
 
