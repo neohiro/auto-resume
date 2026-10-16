@@ -201,7 +201,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.19.0"
+const AUTO_RESUME_VERSION = "1.19.1"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -4243,10 +4243,16 @@ export const AutoResumePlugin = async ({ client, $ }) => {
                * a healthy task. */
               const cost = Number(info.cost)
               if (Number.isFinite(cost) && cost > 0) {
-                if (!s.countedCostMessageIds) s.countedCostMessageIds = new Set()
+                // Bounded: one id per assistant message would grow for the
+                // life of the process. Re-delivery is always of the same
+                // (most recent) message, so a short window is sufficient.
+                if (!s.countedCostMessageIds) s.countedCostMessageIds = []
                 const costMsgID = info.id
-                if (!costMsgID || !s.countedCostMessageIds.has(costMsgID)) {
-                  if (costMsgID) s.countedCostMessageIds.add(costMsgID)
+                if (!costMsgID || !s.countedCostMessageIds.includes(costMsgID)) {
+                  if (costMsgID) {
+                    s.countedCostMessageIds.push(costMsgID)
+                    if (s.countedCostMessageIds.length > 16) s.countedCostMessageIds.shift()
+                  }
                   s.taskCost = (s.taskCost ?? 0) + cost
                 }
               }
@@ -4696,9 +4702,24 @@ const buildV2Client = (ctx, hooks) => {
   const unwrap = (res) => (res && typeof res === "object" && "data" in res ? res.data : res)
 
   // Statuses observed on the event stream, newest write wins.
+  //
+  // Bounded: keyed by session, never pruned otherwise, so a long-lived server
+  // would keep one entry per session it had ever seen. Re-inserting before the
+  // size check keeps Map's insertion order in recency order, so evicting the
+  // first key drops the least recently seen session rather than an arbitrary
+  // one. The sweep reads the newest few, so evicted entries are idle sessions
+  // that no longer matter.
   const statusBySession = new Map()
+  const STATUS_MAX = 64
   const setStatus = (sessionID, type) => {
-    if (sessionID && type) statusBySession.set(sessionID, type)
+    if (!sessionID || !type) return
+    statusBySession.delete(sessionID)
+    statusBySession.set(sessionID, type)
+    while (statusBySession.size > STATUS_MAX) {
+      const oldest = statusBySession.keys().next().value
+      if (oldest === undefined) break
+      statusBySession.delete(oldest)
+    }
   }
 
   /* OpenCode 2 publishes a far richer "why is this session still going" signal
@@ -4714,9 +4735,20 @@ const buildV2Client = (ctx, hooks) => {
    * engine classifies, so the prompt builder can quote it. V1 cores have no
    * equivalent, so this is a no-op there. */
   const retryStatusBySession = new Map()
+  // Bounded: one entry per session that ever entered a provider retry, for the
+  // life of the process. A long-running server would accumulate these without
+  // limit. Evict the oldest once over capacity — the hint is only read moments
+  // after the error it accompanies, so evicting stale entries is harmless.
+  const RETRY_STATUS_MAX = 64
   const rememberRetryStatus = (sessionID, status) => {
     if (!sessionID || !status || status.type !== "retry") return
+    retryStatusBySession.delete(sessionID)
     retryStatusBySession.set(sessionID, status)
+    while (retryStatusBySession.size > RETRY_STATUS_MAX) {
+      const oldest = retryStatusBySession.keys().next().value
+      if (oldest === undefined) break
+      retryStatusBySession.delete(oldest)
+    }
   }
   const retryHint = (sessionID) => {
     const st = retryStatusBySession.get(sessionID)
@@ -4955,11 +4987,23 @@ const buildV2Client = (ctx, hooks) => {
   return { client: facade, setStatus, remember, rememberRetryStatus, retryHint, messageCache, statusBySession }
 }
 
+/** Event families the engine has no handling for. A prefix list, so new
+ *  members of an existing family are covered automatically. Anything not
+ *  listed still reaches the engine, so a future event is never silently
+ *  dropped. */
+const V2_NOISE_EVENTS = [
+  "skill.", "plugin.", "provider.", "model.", "integration.", "mcp.",
+  "reference.", "command.", "agent.", "worktree.", "websearch.",
+  "project.", "lsp.", "pty.", "shell.", "rpc.", "session.usage.",
+  "session.instructions.", "session.inbox.", "session.tool.input.",
+  "server.info", "server.pair",
+]
+
 export default {
   id: "auto-resume",
   setup: async (ctx) => {
     const hooksForClient = {}
-    const { client, setStatus, remember, rememberRetryStatus, retryHint } = buildV2Client(ctx, hooksForClient)
+    const { client, setStatus, remember, rememberRetryStatus, retryHint, statusBySession } = buildV2Client(ctx, hooksForClient)
 
     // Instantiate the V1 engine against the bridged client.
     const engine = await AutoResumePlugin({ client })
@@ -4974,6 +5018,21 @@ export default {
     // never block the stream reader (the V2 event stream fails on a slow
     // consumer). Chain instead of awaiting in the loop.
     let chain = Promise.resolve()
+
+    /* Whether the native V2 permission hook is the live decision point.
+     *
+     * `permission.asked` does not appear on the V2 stream, so today only one of
+     * the two routes can ever answer a request. But if a future core emits it
+     * again, both would run and the request would be answered twice. Once the
+     * hook has actually registered it owns permissions outright and the event
+     * route is skipped. Deliberately flipped only on success: if registration
+     * fails, the event route stays live so the autopilot still works. Declared
+     * here (not beside the hook) because the event pump starts before the hook
+     * is registered, and reading it must not hit the temporal dead zone. */
+    let permissionHookBound = false
+
+    // The hook's teardown handle, once registration resolves.
+    let hookDisposer = null
 
     /* ── V2 event vocabulary → the engine's legacy event vocabulary ──────────
      *
@@ -5035,10 +5094,21 @@ export default {
     const dispatch = (ev) => {
       const type = ev?.type
       if (typeof type !== "string") return
+      /* Drop event families the engine cannot act on before doing any work.
+       *
+       * A live 2.0.30 server emitted 2064 skill.updated events in a ~30s
+       * window against 418 events of everything else combined. Each was
+       * being normalised and pushed onto the serialised handler chain only
+       * for the engine switch to ignore it, making this the hottest path in
+       * the plugin for no benefit.
+       *
+       * Denylist rather than allowlist on purpose: an event family the
+       * engine learns to handle later still reaches it. */
+      if (V2_NOISE_EVENTS.some((p) => type === p || type.startsWith(p))) return
       const payload = v2EventPayload(ev) ?? {}
       let properties = payload
       const sessionID = payload.sessionID ?? payload.durable?.aggregateID ?? null
-      if (sessionID) lastSeenBySession.set(sessionID, Date.now())
+      if (sessionID) rememberLastSeen(sessionID, Date.now())
 
       /* ── native V2 vocabulary ─────────────────────────────────────────── */
       // session.step.failed carries the provider error and is handled in the
@@ -5293,6 +5363,9 @@ export default {
         }
         properties = { ...payload, error: normalized }
       } else if (type === "permission.asked" || type === "permission.updated") {
+        // Once the native hook is live it owns this decision; answering again
+        // here would reply to the same request twice.
+        if (permissionHookBound) return
         properties = v2PermissionToV1(payload)
       }
 
@@ -5354,7 +5427,12 @@ export default {
         } catch (err) {
           console.error(`${RESUME_TAG} permission evaluate failed:`, err?.message ?? err)
         }
+      }).then((disposeHook) => {
+        permissionHookBound = true
+        hookDisposer = typeof disposeHook === "function" ? disposeHook : null
       }).catch((err) => {
+        // Registration failed: leave permissionHookBound false so the event
+        // route stays live and the autopilot still works.
         console.error(`${RESUME_TAG} permission hook registration failed:`, err?.message ?? err)
       })
     }
@@ -5363,21 +5441,53 @@ export default {
      *
      * `session.retry.scheduled` is V2's only push-based failure signal and it
      * does not fire for every failure mode (a turn that simply dies produces
-     * no retry). So a slow sweep also inspects engaged sessions directly: if
-     * the newest assistant turn carries an error, or was interrupted before
-     * completing, replay it to the engine as a session.error.
+     * no retry), and a transport hiccup can drop an event outright. So a slow
+     * sweep also inspects engaged sessions directly and replays any error the
+     * newest assistant turn carries back to the engine as a session.error.
+     *
+     * It deliberately does NOT act on a turn that is merely incomplete. A
+     * missing `completed` timestamp is the same shape as a session that is
+     * still thinking — a slow model, a long-running tool — so reacting to it
+     * injects a resume into a live turn and duplicates its work. The think-stall
+     * watchdog owns that case, with proper timing and a running-tool grace
+     * window; this sweep only catches errors the event stream missed.
      *
      * Bounded on purpose — it only inspects sessions that look engaged (busy,
      * retrying, or quiet-but-not-idle), never more than a handful at a time,
      * and remembers the last message it acted on so the same dead turn is
      * never reported twice. */
     const sweepState = new Map() // sessionID -> last assistant message id handled
+    const SWEEP_STATE_MAX = 64
     const SWEEP_MS = 15_000
     const SWEEP_MAX = 4
     const SWEEP_WINDOW_MS = 10 * 60_000
     // Last time we observed ANY event for a session, so the sweep can revisit
     // sessions that have since gone idle.
+    //
+    // Bounded: keyed by session, and the sweep only ever reads entries inside
+    // SWEEP_WINDOW_MS, so an entry past that age is dead weight. Left unpruned it
+    // would keep one entry per session touched since boot, for the life of the
+    // process. Map preserves insertion order, so size alone is not a recency
+    // signal here — prune on timestamp instead.
     const lastSeenBySession = new Map()
+    const LAST_SEEN_MAX = 256
+    const rememberLastSeen = (sessionID, at) => {
+      lastSeenBySession.set(sessionID, at)
+      if (lastSeenBySession.size <= LAST_SEEN_MAX) return
+      const cutoff = at - SWEEP_WINDOW_MS
+      for (const [id, seen] of lastSeenBySession) {
+        if (lastSeenBySession.size <= LAST_SEEN_MAX) break
+        if (seen <= cutoff) lastSeenBySession.delete(id)
+      }
+      // Everything is recent and we are still over cap: drop oldest-inserted
+      // rather than grow without bound. Re-insert keeps recency ordering honest
+      // for the next pass.
+      while (lastSeenBySession.size > LAST_SEEN_MAX) {
+        const oldest = lastSeenBySession.keys().next().value
+        if (oldest === undefined) break
+        lastSeenBySession.delete(oldest)
+      }
+    }
     const sweep = async () => {
       if (typeof client?.session?.context !== "function" && typeof ctx.session?.context !== "function") return
       const candidates = [...new Set([...statusBySession.keys(), ...lastSeenBySession.keys()])]
@@ -5396,19 +5506,26 @@ export default {
           if (!info || info.role !== "assistant") continue
           const msgID = info.id ?? ""
           if (!msgID || sweepState.get(sessionID) === msgID) continue
+          sweepState.delete(sessionID)
           sweepState.set(sessionID, msgID)
+          while (sweepState.size > SWEEP_STATE_MAX) {
+            const oldest = sweepState.keys().next().value
+            if (oldest === undefined) break
+            sweepState.delete(oldest)
+          }
 
+          // Real errors only.
+          //
+          // This sweep used to ALSO fire on any assistant turn with no
+          // `completed` timestamp. That shape is identical to a session that
+          // is simply still thinking — a slow model, a long tool — so it
+          // injected resumes into live turns and duplicated work. The
+          // think-stall watchdog already owns "incomplete turn", with proper
+          // timing and a running-tool grace window. Since session.step.failed
+          // is mapped, this sweep only needs to catch errors the stream
+          // missed.
           if (info.error) {
             synth("session.error", { sessionID, error: v2ErrorToV1(info.error) })
-            continue
-          }
-          // Interrupted: the turn ended with no completion timestamp.
-          const completed = info.time && typeof info.time === "object" ? info.time.completed : undefined
-          if (!(completed > 0)) {
-            synth("session.error", {
-              sessionID,
-              error: { name: "MessageAbortedError", data: { message: "turn ended without completing", userInitiated: false } },
-            })
           }
         } catch { /* session gone or unreadable */ }
       }
@@ -5422,6 +5539,14 @@ export default {
       for (const t of idleArmed.values()) clearTimeout(t)
       idleArmed.clear()
       toolState.clear()
+      // Release the native permission hook. Without this it stays registered on
+      // the context after teardown, so a re-initialised plugin would answer
+      // permissions twice — once per live hook.
+      if (hookDisposer) {
+        try { void hookDisposer() } catch { /* teardown is best-effort */ }
+        hookDisposer = null
+      }
+      permissionHookBound = false
       void pump
     }
   },

@@ -254,6 +254,14 @@ each V2 event onto the `{ type, properties }` shape the engine consumes:
 | `session.list()` | **no equivalent — reconstructed (see below)** |
 | `session.status()` | `ctx.session.status()`, else the `session.status` event cache |
 | permission reply | `ctx.permission.reply({ sessionID, requestID, reply })` |
+
+The permission autopilot runs from `ctx.permission.hook("evaluate")`, which fires *after* your
+configured rules resolve and *before* the action runs — so there is no window in which you are shown
+a prompt the autopilot is about to answer. V2 never emits `permission.asked`, but a core that did
+would otherwise be answered twice, so once the hook registers it takes exclusive ownership of
+permission decisions and the legacy event route stands down. If the hook fails to register, the
+event route stays active rather than silently disabling the autopilot, and the hook is disposed on
+teardown so a re-initialised plugin never answers through a stale registration.
 | `config.providers()` | `ctx.provider.list()` |
 
 **`session.list()` has no V2 equivalent**, and this one matters: restart reanimation enumerates
@@ -271,6 +279,24 @@ message envelope with a `type`-discriminated message plus a typed `content[]` ar
 structured errors (`{ type, message, status }`) are mapped back to the `{ name, data }` shape
 the classifier reads. Event payloads are read under `properties`, `data`, or flattened, so
 transport-encoding drift cannot silently disable recovery.
+
+V2 also renamed the session lifecycle vocabulary wholesale — `session.step.started/ended/failed`,
+`session.text.delta`, `session.tool.*`, `session.retry.scheduled`, `session.execution.*` — and the
+adapter maps that native stream rather than reconstructing it from heartbeats. Two consequences
+worth knowing:
+
+- A provider error is now seen at `session.step.failed` rather than inferred from a turn that
+  stopped producing output, so a 403 or a 5xx is classified (and messaged) as what it is instead of
+  reading as a stall.
+- A turn that is simply still streaming is never treated as a failure. A bounded sweep re-reads
+  recently active sessions as a backstop for errors the stream missed, but it reports only real
+  errors — "no completion timestamp" is the same shape as a slow model mid-thought, and reacting
+  to it would inject a resume into a live turn and duplicate the work.
+
+Because that stream is high-volume (a live 2.0.30 server emitted 2064 `skill.updated` events in a
+~30s window against 418 events of everything else combined), event families the engine has no
+handling for are dropped before any work is done, keeping the hot path free. It is a denylist, not
+an allowlist: an event family the engine learns to handle later still reaches it.
 
 **Two behavior notes on V2** (platform changes, not plugin limitations):
 - V2 removed the `todowrite` tool and the `todo.updated` event. The TODO drive, improvement
@@ -330,10 +356,10 @@ Reply delivery probes the SDK surface (`postSessionByIdPermissionsByPermissionId
 
 ```sh
 git clone https://github.com/neohiro/auto-resume && cd auto-resume
-npm test        # <!-- coverage -->300+ assertions across 15 suites<!-- /coverage --> (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
+npm test        # <!-- coverage -->310+ assertions across 16 suites<!-- /coverage --> (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
 ```
 
-The Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/v2entry.mjs` drives the **V2 default export** against a mock V2 plugin context — the recovery path across all three event-stream encodings, permission autopilot, message normalization, and the cross-message plan fallback that replaces the removed `todowrite` tool. `tests/reanimate.mjs` covers **restart auto-resume** specifically: that an interrupted session is revived on V1, on V2 without any `session.list()`, on the first boot after a self-update, and that sessions the user stopped or that are empty are left alone. `tests/prompts.mjs` pins **message routing**: that each failure shape reaches its own message, that the V2 retry window and provider name reach the rate-limit prompt, that a content-filtered turn is reframed rather than repeated, and that an unattributable failure is not blindly retried. `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
+The Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/v2entry.mjs` drives the **V2 default export** against a mock V2 plugin context — the recovery path across all three event-stream encodings, permission autopilot, message normalization, and the cross-message plan fallback that replaces the removed `todowrite` tool. `tests/reanimate.mjs` covers **restart auto-resume** specifically: that an interrupted session is revived on V1, on V2 without any `session.list()`, on the first boot after a self-update, and that sessions the user stopped or that are empty are left alone. `tests/prompts.mjs` pins **message routing**: that each failure shape reaches its own message, that the V2 retry window and provider name reach the rate-limit prompt, that a content-filtered turn is reframed rather than repeated, and that an unattributable failure is not blindly retried. `tests/v2review.mjs` pins the adapter's hot-path invariants: that high-volume noise events (`skill.updated` and friends) cost nothing before reaching the engine, that real `session.*` events still get through that filter, that a turn which is merely still streaming is never misreported as a failure, and that a genuinely errored turn still is. `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
 
 ### Windows unattended notes (UAC / SmartScreen)
 
