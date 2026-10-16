@@ -202,7 +202,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "2.0.0"
+const AUTO_RESUME_VERSION = "2.0.1"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -2938,7 +2938,7 @@ export const createEngine = async ({ client }) => {
     if (kind === "auth") {
       // Auth is provider-scoped: rotate to another PROVIDER's model if possible.
       const authFrom = s.lastModel ? modelKey(s.lastModel) : null
-      if (cfg.rotationEnabled && cfg.switchOnQuota && (await rotateAwayFrom(sessionID, "authentication failed"))) {
+      if (cfg.rotationEnabled && (await rotateAwayFrom(sessionID, "authentication failed"))) {
         s.chain += 1
         if (s.chain <= cfg.maxChain) {
           schedule(sessionID, cfg.baseDelayMs, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, true, authFrom) }); return
