@@ -202,7 +202,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "2.0.1"
+const AUTO_RESUME_VERSION = "2.0.2"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -665,6 +665,42 @@ const TEMPORARY_RATE_LIMIT_PATTERNS = [
 const isTemporaryRateLimit = (error) => {
   const msg = `${error?.data?.message ?? ""} ${error?.data?.responseBody ?? ""}`.toLowerCase()
   return TEMPORARY_RATE_LIMIT_PATTERNS.some((re) => re.test(msg))
+}
+
+/** Extract the retry delay a provider asked for, from the error BODY.
+ *
+ *  isTemporaryRateLimit() detects that a provider gave a concrete wait time;
+ *  this reads what that time actually is. Without it the delay is unknown and
+ *  the caller falls back to exponential backoff — which either retries too
+ *  early (guaranteeing another 429) or waits far longer than the provider asked.
+ *
+ *  Both phrasings are anchored on a capture group, which is what makes
+ *  extraction possible where the detection patterns alone cannot. Gemini is the
+ *  common case: "Please retry in 28.462826513s" alongside a free-tier token
+ *  bucket that genuinely refills in that window.
+ *
+ *  Returns milliseconds, capped, or null when the body carries no explicit
+ *  wait. */
+const RETRY_IN_BODY_RE = [
+  /(?:please\s+)?retry in\s+(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|hours?|hrs?|h)\b/i,
+  /try again in\s+(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|hours?|hrs?|h)\b/i,
+  /available in\s+(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|hours?|hrs?|h)\b/i,
+]
+const RETRY_UNIT_MS = { s: 1000, sec: 1000, secs: 1000, second: 1000, seconds: 1000, m: 60000, min: 60000, mins: 60000, minute: 60000, minutes: 60000, h: 3600000, hr: 3600000, hrs: 3600000, hour: 3600000, hours: 3600000 }
+
+const retryAfterMsFromBody = (error, capMs = 600_000) => {
+  const text = `${error?.data?.message ?? ""} ${error?.data?.responseBody ?? ""} ${error?.message ?? ""}`
+  for (const re of RETRY_IN_BODY_RE) {
+    const m = text.match(re)
+    if (!m) continue
+    const value = Number(m[1])
+    if (!Number.isFinite(value) || value < 0) continue
+    const unit = RETRY_UNIT_MS[String(m[2]).toLowerCase()]
+    if (!unit) continue
+    // A provider asking for a sub-second retry is noise; don't busy-loop on it.
+    return Math.min(Math.max(Math.ceil(value * unit), 1000), capMs)
+  }
+  return null
 }
 
 /** Model selection tracking for intelligent rotation — avoids picking the same
@@ -2181,15 +2217,21 @@ export const createEngine = async ({ client }) => {
 
   const retryAfterMs = (error) => {
     const headers = error?.data?.responseHeaders
-    if (!headers) return null
-    const raw = headers["retry-after"] ??
-      Object.entries(headers).find(([k]) => k.toLowerCase() === "retry-after")?.[1]
-    if (!raw) return null
-    const secs = Number(raw)
-    if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1_000, 600_000)
-    const date = Date.parse(raw)
-    if (!Number.isNaN(date)) return Math.min(Math.max(date - Date.now(), 0), 600_000)
-    return null
+    if (headers) {
+      const raw = headers["retry-after"] ??
+        Object.entries(headers).find(([k]) => k.toLowerCase() === "retry-after")?.[1]
+      if (raw !== undefined && raw !== null) {
+        const secs = Number(raw)
+        if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1_000, 600_000)
+        const date = Date.parse(raw)
+        if (!Number.isNaN(date)) return Math.min(Math.max(date - Date.now(), 0), 600_000)
+      }
+    }
+    // No usable Retry-After header. Many providers state the wait in the body
+    // instead ("Please retry in 28.462826513s"); honour it rather than falling
+    // back to exponential backoff, which retries either too early or far later
+    // than the provider asked.
+    return retryAfterMsFromBody(error)
   }
 
   const backoff = (attempt, base) =>

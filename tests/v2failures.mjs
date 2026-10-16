@@ -119,6 +119,36 @@ const baseState = () => ({ prompts: [], logs: [] })
   dispose()
 }
 
+// ---- F1d: a body-stated retry delay is honoured, not replaced by backoff ----
+// Gemini reports the wait in the body ("Please retry in 28.462826513s") and
+// often no Retry-After header reaches us. retryAfterMs used to read only the
+// header, so the delay fell through to exponential backoff - which retries
+// either before the token bucket refills or far later than asked.
+// The observable effect is the wait itself, so assert that directly.
+{
+  const state = baseState()
+  const ctx = makeCtx(state, [
+    stepStarted(),
+    stepFailed({
+      type: "APIError",
+      message: "Quota exceeded for metric: generate_content_free_tier_input_token_count. Please retry in 28.462826513s.",
+      status: 429,
+    }),
+  ], [])
+  const dispose = await plugin.setup(ctx)
+  const t0 = Date.now()
+  await sleep(2000)
+  ok(state.prompts.length === 0,
+    `F1d: no resume fires before the provider-stated window elapses (${state.prompts.length})`)
+  const deadline = Date.now() + 45_000
+  while (state.prompts.length === 0 && Date.now() < deadline) await sleep(500)
+  const waited = Date.now() - t0
+  ok(state.prompts.length === 1, `F1d: the resume eventually fires (${state.prompts.length})`)
+  ok(waited >= 25_000,
+    `F1d: it waited for the provider window, not for backoff (${Math.round(waited)}ms >= 25000ms)`)
+  dispose()
+}
+
 // ---- F2: a retryable 5xx IS recovered with a resume prompt ----------------
 {
   const state = baseState()
