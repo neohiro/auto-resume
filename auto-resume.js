@@ -202,7 +202,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "2.0.3"
+const AUTO_RESUME_VERSION = "2.0.4"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -2895,13 +2895,16 @@ export const createEngine = async ({ client }) => {
     } catch (err) {
       const ns = client.session ?? {}
       const mode = typeof (ns.promptAsync ?? ns.postSessionByIdPromptAsync) === "function" ? "async" : "sync"
-      log("error", `resume prompt rejected (${mode})`, { sessionID, err: err?.message ?? String(err) })
+      log("error", `resume prompt rejected (${mode})`, {
+        sessionID, err: redactSecrets(err?.message ?? String(err)),
+      })
       noteResumeFailure()
       if (plan.kind === "resume" && s.chain < cfg.maxChain) {
         s.chain += 1
         schedule(sessionID, backoff(s.chain, cfg.baseDelayMs), plan)
       } else {
-        notice(`${RESUME_TAG}: Could not resume (${err?.message ?? "error"}).`, "error")
+        // A rejection can echo upstream detail; this reaches an OS toast.
+        notice(`${RESUME_TAG}: Could not resume (${redactSecrets(err?.message ?? "error")}).`, "error")
       }
     }
   }

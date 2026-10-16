@@ -194,6 +194,19 @@ const baseState = () => ({ prompts: [], logs: [] })
   ok(probe.logs.some((l) => /invalid API key/i.test(l)),
     "F1e: the prose explaining the failure is preserved through redaction")
   dispose2()
+
+  // A rejected resume prompt is a second path that carries upstream text, and it
+  // reaches both a persisted log and an OS toast.
+  const rej = baseState()
+  const ctx3 = makeCtx(rej, [stepStarted(), stepFailed({ type: "APIError", message: "upstream down", status: 503 })], [])
+  ctx3.session.prompt = async () => { throw new Error("rejected: api_key=sk-leak-ABCDEFGHIJKLMNOP") }
+  const dispose3 = await plugin.setup(ctx3)
+  await sleep(2500)
+  const rejHaystack = [...rej.logs, ...rej.prompts.map((p) => p.text)].join("\n")
+  ok(!rejHaystack.includes("sk-leak-ABCDEFGHIJKLMNOP"),
+    "F1e: a rejected resume does not echo the credential back through log or notice")
+  ok(/rejected/i.test(rejHaystack), "F1e: the rejection itself is still reported")
+  dispose3()
 }
 
 // ---- F2: a retryable 5xx IS recovered with a resume prompt ----------------

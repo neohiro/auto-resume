@@ -1,6 +1,6 @@
 {
   "name": "opencode-auto-resume",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "description": "Self-healing OpenCode sessions: automatic retries, model rotation on quota/outages, permission autopilot, and walk-away task autonomy.",
   "type": "module",
   "main": "auto-resume.js",
