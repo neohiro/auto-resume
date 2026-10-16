@@ -201,7 +201,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.17.0"
+const AUTO_RESUME_VERSION = "1.18.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -4111,6 +4111,30 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   }
 
   return {
+    /* Bridge for the V2 adapter. Not a V1 hook name — V1 core only reads the
+     * keys it knows (event, tool, chat.*, permission.ask, ...), so an extra
+     * property is inert there. It exists so ctx.permission.hook("evaluate")
+     * can reuse the exact same decision logic (safe-mode rules, cross-OS
+     * deny-list, escalation counters) instead of duplicating it on the V2
+     * side. Returns null when the autopilot should not decide (disabled,
+     * opted out, safe-mode unlisted type), meaning "leave this to the human". */
+    __evaluatePermission: (sessionID, request) => {
+      const perm = v2PermissionToV1({
+        ...request,
+        action: request?.action,
+        resources: Array.isArray(request?.resources) ? request.resources : [],
+        metadata: request?.metadata,
+        sessionID,
+      })
+      if (suppressed(sessionID)) return null
+      const decision = decidePermission(sessionID, perm)
+      if (!decision) return null
+      return {
+        effect: decision === "reject" ? "deny" : "allow",
+        reply: decision,
+        type: permTypeOf(perm),
+      }
+    },
     event: async (input) => {
       if (!cfg.enabled) return
       const event = input && typeof input === "object" ? input.event : null
@@ -4928,13 +4952,205 @@ export default {
     // consumer). Chain instead of awaiting in the loop.
     let chain = Promise.resolve()
 
+    /* ── V2 event vocabulary → the engine's legacy event vocabulary ──────────
+     *
+     * This is the single most important part of the V2 port. OpenCode 2 does
+     * NOT emit the V1 event names. Instrumenting a live 2.0.30 desktop server
+     * and capturing its full stream shows a completely different vocabulary:
+     *
+     *   session.step.started / .streamed / .ended      (per model step)
+     *   session.text.started / .delta / .ended
+     *   session.reasoning.started / .delta / .ended
+     *   session.tool.input.started / .ended, .called / .progress / .success
+     *   session.retry.scheduled
+     *   session.permissions        (a RULESET update, not a request)
+     *   session.usage.updated, session.instructions.updated
+     *   shell.created / .exited / .deleted
+     *   skill.updated, plugin.updated, provider.updated, model.updated, ...
+     *   server.connected
+     *
+     * and NOT ONE of session.error / session.idle / session.status /
+     * message.updated / message.part.updated / permission.asked / todo.updated.
+     *
+     * Each native event is therefore translated into the legacy event the
+     * engine already understands, so none of the recovery logic below has to
+     * change. Envelope: { id, created, type, durable, location, data }.
+     */
+    const synth = (type, properties) => {
+      chain = chain.then(() => handle({ event: { type, properties } })).catch((err) => {
+        console.error(`${RESUME_TAG} event handler error:`, err?.message ?? err)
+      })
+    }
+
+    // Turn-end confirmation. A step ending with finish "tool-calls" means the
+    // agent is about to run another step, not that the turn is over. When the
+    // finish reason is anything else the turn is effectively done — but we
+    // still confirm: if a new step starts inside the grace window the queued
+    // idle is cancelled, so an evaluateIdle never fires mid-turn.
+    const IDLE_CONFIRM_MS = 1_200
+    const idleArmed = new Map() // sessionID -> timer
+    const armIdle = (sessionID) => {
+      if (!sessionID) return
+      if (idleArmed.has(sessionID)) clearTimeout(idleArmed.get(sessionID))
+      const t = setTimeout(() => {
+        idleArmed.delete(sessionID)
+        setStatus(sessionID, "idle")
+        synth("session.idle", { sessionID })
+      }, IDLE_CONFIRM_MS)
+      t.unref?.()
+      idleArmed.set(sessionID, t)
+    }
+    const cancelIdle = (sessionID) => {
+      const t = idleArmed.get(sessionID)
+      if (t) { clearTimeout(t); idleArmed.delete(sessionID) }
+    }
+
+    // Tool-failure tracking, so the engine's debug nudge still works. V2 splits
+    // a tool call across several events; only the terminal ones matter here.
+    const toolState = new Map() // `${sessionID}|${callID}` -> status
+
     const dispatch = (ev) => {
       const type = ev?.type
       if (typeof type !== "string") return
       const payload = v2EventPayload(ev) ?? {}
       let properties = payload
+      const sessionID = payload.sessionID ?? payload.durable?.aggregateID ?? null
 
-      // Feed the status cache before normalizing.
+      /* ── native V2 vocabulary ─────────────────────────────────────────── */
+      if (type.startsWith("session.step.")) {
+        if (!sessionID) return
+        cancelIdle(sessionID)
+        if (type === "session.step.started") {
+          setStatus(sessionID, "busy")
+          // A new step opens a new turn: mirrors the legacy `session.status`
+          // busy transition the engine uses to reset per-turn flags.
+          synth("session.status", { sessionID, status: { type: "busy" } })
+        } else if (type === "session.step.streamed") {
+          synth("session.status", { sessionID, status: { type: "busy" } })
+        } else if (type === "session.step.ended") {
+          // Deliberately NOT a busy transition. The engine clears the
+          // "this turn delivered content" flag on busy, so marking a *finished*
+          // step busy would erase the text/reasoning/tool output that just
+          // arrived and make the turn look empty -- which silently skips idle
+          // evaluation, and with it every recovery, todo-drive and improvement
+          // path. An ended step is the opposite of busy.
+          const finish = payload.finish ?? payload.rawFinish
+          // "tool-calls" => another step follows, so NOT a turn end.
+          if (finish !== "tool-calls") armIdle(sessionID)
+        }
+        return
+      }
+
+      if (type.startsWith("session.text.")) {
+        if (!sessionID) return
+        cancelIdle(sessionID)
+        if (type !== "session.text.started") {
+          // Text is content: this is what makes a turn count as "delivered".
+          synth("message.part.updated", {
+            part: { type: "text", sessionID, text: payload.text ?? payload.delta ?? "" },
+          })
+        }
+        return
+      }
+
+      if (type.startsWith("session.reasoning.")) {
+        if (!sessionID) return
+        cancelIdle(sessionID)
+        synth("message.part.updated", {
+          part: { type: "reasoning", sessionID, text: payload.text ?? payload.delta ?? "" },
+        })
+        return
+      }
+
+      if (type.startsWith("session.tool.")) {
+        if (!sessionID) return
+        cancelIdle(sessionID)
+        const callID = payload.id ?? payload.callID ?? ""
+        const key = `${sessionID}|${callID}`
+        const metaStatus = payload.metadata?.status ?? payload.state?.status
+        let status = null
+        if (type === "session.tool.input.started" || type === "session.tool.input.ended") {
+          status = "running"
+        } else if (type === "session.tool.called") {
+          status = "running"
+        } else if (type === "session.tool.progress") {
+          status = "running"
+        } else if (type === "session.tool.success") {
+          status = metaStatus === "error" ? "error" : "completed"
+        } else if (type === "session.tool.error" || type === "session.tool.failure") {
+          status = "error"
+        }
+        if (!status) return
+        toolState.set(key, status)
+        // The engine counts tool errors off part updates; replay them through the
+        // legacy part shape so the debug-nudge heuristic keeps working.
+        synth("message.part.updated", {
+          part: {
+            type: "tool",
+            sessionID,
+            tool: payload.name ?? payload.tool ?? "",
+            callID,
+            state: {
+              status,
+              input: payload.input ?? payload.text,
+              error: status === "error" ? (payload.error ?? { name: "UnknownError", data: { message: payload.metadata?.status ?? "tool failed" } }) : undefined,
+            },
+          },
+        })
+        return
+      }
+
+      if (type === "session.retry.scheduled") {
+        // V2's only failure-ish signal: the core is about to retry the request.
+        if (!sessionID) return
+        const attempt = payload.attempt ?? payload.count ?? 1
+        const next = payload.next ?? payload.at ?? payload.at ?? undefined
+        const reason = payload.reason ?? payload.message ?? payload.detail
+        const provider = payload.provider ?? payload.providerID
+        rememberRetryStatus(sessionID, {
+          type: "retry",
+          attempt,
+          next,
+          message: reason,
+          action: { reason, provider, title: payload.title, message: payload.detail, link: payload.link },
+        })
+        setStatus(sessionID, "retry")
+        synth("session.status", {
+          sessionID,
+          status: { type: "retry", attempt, next, message: reason, action: { reason, provider, title: payload.title } },
+        })
+        // Surface a genuine provider error if the payload carries one, so the
+        // engine's classifier can act on it rather than only seeing "retrying".
+        const rawErr = payload.error ?? (reason && typeof reason === "object" ? reason : null)
+        if (rawErr && typeof rawErr === "object") {
+          const normalized = v2ErrorToV1(rawErr)
+          const hint = retryHint(sessionID)
+          if (normalized && typeof normalized === "object") {
+            normalized.data = {
+              ...(normalized.data ?? {}),
+              retryAttempt: attempt,
+              retryNext: next,
+              retryReason: reason?.reason ?? reason?.title ?? payload.title,
+              retryProvider: provider ?? hint?.provider,
+            }
+          }
+          synth("session.error", { sessionID, error: normalized })
+        }
+        return
+      }
+
+      if (type === "session.permissions") {
+        // A ruleset update (action/resource/effect), NOT a pending request.
+        // The autopilot binds to ctx.permission.hook("evaluate") instead, which
+        // is race-free and needs no event at all.
+        return
+      }
+
+      if (type === "session.usage.updated" || type === "session.instructions.updated") {
+        return
+      }
+
+      /* ── legacy vocabulary (still emitted by some builds; keep working) ── */
       if (type === "session.status" && payload.sessionID) {
         setStatus(payload.sessionID, payload.status?.type ?? "unknown")
         rememberRetryStatus(payload.sessionID, payload.status)
@@ -4942,8 +5158,9 @@ export default {
         setStatus(payload.sessionID, "idle")
       } else if (type === "message.updated" && payload.sessionID && payload.info) {
         const shaped = remember(payload.info, payload.sessionID)
-        if (payload.info?.role === "assistant") setStatus(payload.sessionID, "busy")
-        else if (payload.info?.role === "user") setStatus(payload.sessionID, "busy")
+        if (payload.info?.role === "assistant" || payload.info?.role === "user") {
+          setStatus(payload.sessionID, "busy")
+        }
         if (shaped) properties = { ...payload, info: shaped.info, parts: shaped.parts }
       } else if (type === "message.part.updated" && payload.part) {
         // V2 parts travel on the event payload; the session id lives beside the
@@ -4974,9 +5191,7 @@ export default {
         properties = v2PermissionToV1(payload)
       }
 
-      chain = chain.then(() => handle({ event: { type, properties } })).catch((err) => {
-        console.error(`${RESUME_TAG} event handler error:`, err?.message ?? err)
-      })
+      synth(type, properties)
     }
 
     const pump = (async () => {
@@ -5002,8 +5217,98 @@ export default {
       dispatch({ type: "server.connected", properties: {} })
     })()
 
+    /* ── Permission autopilot via the native V2 hook ──────────────────────
+     *
+     * The event route is gone: `permission.asked` never appears on the V2
+     * stream, so the old "watch for an ask, then reply" loop had nothing to
+     * bind to. V2 exposes the decision point directly instead —
+     * ctx.permission.hook("evaluate") runs after the configured rules resolve
+     * and BEFORE the action executes or a prompt is published. Setting
+     * `effect` there is race-free: no window exists in which the user sees a
+     * prompt that the autopilot is about to answer, which was the old design's
+     * main weakness.
+     *
+     * The decision logic itself is the engine's, reused verbatim via the
+     * bridge it exposes, so safe-mode rules and the deny-list stay in one
+     * place. V2 effects are allow | ask | deny; the engine answers with
+     * once | always | reject, which maps as reject→deny and everything
+     * approved→allow. */
+    const evalPermission = engine.__evaluatePermission
+    if (typeof evalPermission === "function" && typeof ctx.permission?.hook === "function") {
+      ctx.permission.hook("evaluate", (event) => {
+        try {
+          const verdict = evalPermission(event.sessionID, {
+            action: event.action,
+            resources: event.resources,
+            metadata: event.metadata,
+            source: event.source,
+          })
+          if (!verdict) return // leave the human's rules untouched
+          event.effect = verdict.effect
+          if (verdict.message) event.message = verdict.message
+        } catch (err) {
+          console.error(`${RESUME_TAG} permission evaluate failed:`, err?.message ?? err)
+        }
+      }).catch((err) => {
+        console.error(`${RESUME_TAG} permission hook registration failed:`, err?.message ?? err)
+      })
+    }
+
+    /* ── Fallback failure detection ───────────────────────────────────────
+     *
+     * `session.retry.scheduled` is V2's only push-based failure signal and it
+     * does not fire for every failure mode (a turn that simply dies produces
+     * no retry). So a slow sweep also inspects engaged sessions directly: if
+     * the newest assistant turn carries an error, or was interrupted before
+     * completing, replay it to the engine as a session.error.
+     *
+     * Bounded on purpose — it only inspects sessions that look engaged (busy,
+     * retrying, or quiet-but-not-idle), never more than a handful at a time,
+     * and remembers the last message it acted on so the same dead turn is
+     * never reported twice. */
+    const sweepState = new Map() // sessionID -> last assistant message id handled
+    const SWEEP_MS = 15_000
+    const SWEEP_MAX = 4
+    const sweep = async () => {
+      if (typeof client?.session?.context !== "function" && typeof ctx.session?.context !== "function") return
+      const candidates = [...statusBySession.entries()]
+        .filter(([, st]) => st === "busy" || st === "retry" || st === "unknown")
+        .slice(0, SWEEP_MAX)
+      for (const [sessionID] of candidates) {
+        try {
+          const entries = await client.session.messages({ path: { id: sessionID } })
+          const list = (entries?.data ?? entries) ?? []
+          const last = list[list.length - 1]
+          const info = last?.info
+          if (!info || info.role !== "assistant") continue
+          const msgID = info.id ?? ""
+          if (!msgID || sweepState.get(sessionID) === msgID) continue
+          sweepState.set(sessionID, msgID)
+
+          if (info.error) {
+            synth("session.error", { sessionID, error: v2ErrorToV1(info.error) })
+            continue
+          }
+          // Interrupted: the turn ended with no completion timestamp.
+          const completed = info.time && typeof info.time === "object" ? info.time.completed : undefined
+          if (!(completed > 0)) {
+            synth("session.error", {
+              sessionID,
+              error: { name: "MessageAbortedError", data: { message: "turn ended without completing", userInitiated: false } },
+            })
+          }
+        } catch { /* session gone or unreadable */ }
+      }
+    }
+    const sweepTimer = setInterval(() => { void sweep() }, SWEEP_MS)
+    sweepTimer.unref?.()
+
     return () => {
       controller.abort()
+      clearInterval(sweepTimer)
+      for (const t of idleArmed.values()) clearTimeout(t)
+      idleArmed.clear()
+      toolState.clear()
       void pump
     }
   },
