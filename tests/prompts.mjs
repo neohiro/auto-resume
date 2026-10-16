@@ -20,7 +20,7 @@ let seq = 0
 process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-pr-stops-${process.pid}.json`)
 process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-pr-off-${process.pid}.json`)
 
-import { AutoResumePlugin } from "../auto-resume.js"
+import { createEngine } from "../auto-resume.js"
 
 const ok = (cond, label) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}`)
@@ -53,7 +53,7 @@ function makeClient(state) {
  *  reusing one id would silently consume the budget other blocks depend on. */
 async function promptFor(error, sessionID) {
   const state = { prompts: [], logs: [], msgStore: {}, aborts: 0, messages: [] }
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event({ event: { type: "message.updated", properties: { info: { role: "user", sessionID, id: "u1" } } } })
   state.msgStore.u1 = "do the task"
   await hooks.event({ event: { type: "session.error", properties: { sessionID, error } } })
@@ -79,7 +79,7 @@ async function promptFor(error, sessionID) {
 // ---- P3: rate limit names the wait window (V2 retry status) -----------------
 {
   const state = { prompts: [], logs: [], msgStore: {}, aborts: 0, messages: [] }
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event({ event: { type: "message.updated", properties: { info: { role: "user", sessionID: "rl", id: "u1" } } } })
   state.msgStore.u1 = "go"
   await hooks.event({ event: { type: "session.status", properties: { sessionID: "rl", status: { type: "retry", attempt: 2, message: "rate limited", action: { reason: "Rate limit reached", provider: "openrouter", title: "429" } } } } })
@@ -107,7 +107,7 @@ async function promptFor(error, sessionID) {
 // fallback prompt.
 {
   const state = { prompts: [], logs: [], msgStore: {}, aborts: 0, messages: [] }
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event({ event: { type: "message.updated", properties: { info: { role: "user", sessionID: "p5fat", id: "u1" } } } })
   state.msgStore.u1 = "go"
   await hooks.event({ event: { type: "session.error", properties: { sessionID: "p5fat", error: { name: "SomeUnknownError", data: { message: "something odd happened" } } } } })
@@ -128,7 +128,7 @@ async function promptFor(error, sessionID) {
   state.messages = [
     { info: { id: "a1", role: "assistant", error: null, finish: "content-filter", time: { completed: Date.now() } }, parts: [{ type: "text", text: "partial" }] },
   ]
-  const hooks = await AutoResumePlugin({ client })
+  const hooks = await createEngine({ client })
   await hooks.event({ event: { type: "message.part.updated", properties: { part: { type: "text", sessionID: "cf", text: "partial" } } } })
   await hooks.event({ event: { type: "session.idle", properties: { sessionID: "cf" } } })
   await sleep(500)
@@ -146,7 +146,7 @@ async function promptFor(error, sessionID) {
     { info: { id: "a1", role: "assistant", error: null, finish: "stop", time: { completed: Date.now() } },
       parts: [{ type: "text", text: "A perfectly ordinary reply with plenty of characters to satisfy the improvement-pass threshold cleanly." }] },
   ]
-  const hooks = await AutoResumePlugin({ client })
+  const hooks = await createEngine({ client })
   await hooks.event({ event: { type: "message.part.updated", properties: { part: { type: "text", sessionID: "ok", text: "ordinary reply" } } } })
   await hooks.event({ event: { type: "session.idle", properties: { sessionID: "ok" } } })
   await sleep(500)

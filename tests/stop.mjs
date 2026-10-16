@@ -13,7 +13,7 @@ process.env.OPENCODE_RESUME_STOPSTORE ??= defaultStops0
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { AutoResumePlugin } from "../auto-resume.js"
+import { createEngine } from "../auto-resume.js"
 
 const ok = (cond, label) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}`)
@@ -101,7 +101,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
 // ---- S1: Stop button (session.error abort) silences everything ---------------
 {
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "s1", text: "working..." } }))
   await hooks.event(ev("session.error", { sessionID: "s1", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
   await hooks.event(ev("session.idle", { sessionID: "s1" }))
@@ -113,7 +113,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
 // ---- S2: an already-scheduled retry is cancelled by the Stop -----------------
 {
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   // rate-limit error schedules a resume ~40ms out...
   await hooks.event(ev("session.error", { sessionID: "s2", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
   // ...user hits Stop before it fires
@@ -126,7 +126,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
 // ---- S3: idle evaluation stays silent after Stop, next real prompt re-arms ---
 {
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "s3", text: "step 1 done" } }))
   await hooks.event(ev("todo.updated", { sessionID: "s3", todos: [{ title: "remaining", status: "pending" }] }))
   await hooks.event(ev("session.error", { sessionID: "s3", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
@@ -150,7 +150,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: { name: "MessageAbortedError", data: { message: "aborted" } } },
     parts: [{ type: "text", text: "partial progress..." }],
   }]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "s4", text: "partial progress..." } }))
   await hooks.event(ev("session.idle", { sessionID: "s4" })) // no session.error event at all
   await sleep(350)
@@ -164,7 +164,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
 // ---- S5: duplicate abort events produce exactly one notice -------------------
 {
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   const abort = ev("session.error", { sessionID: "s5", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } })
   await hooks.event(abort)
   await hooks.event(abort)
@@ -178,7 +178,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   process.env.OPENCODE_RESUME_STALL_TIMEOUT_MS = "100"
   process.env.OPENCODE_RESUME_WATCHDOG_MS = "40"
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("session.status", { sessionID: "s6", status: { type: "busy" } }))
   await hooks.event(ev("session.error", { sessionID: "s6", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
   await sleep(400) // well past the 100ms stall timeout
@@ -193,7 +193,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   const client = makeClient(state)
   client.session.postSessionByIdPermissionsByPermissionId =
     async ({ path, body }) => { state.permResponses.push({ id: path.permissionID, response: body.response }); return true }
-  const hooks = await AutoResumePlugin({ client })
+  const hooks = await createEngine({ client })
   await hooks.event(ev("session.error", { sessionID: "s7", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
   await hooks.event(ev("permission.updated", { sessionID: "s7", id: "perm-1", type: "bash", title: "ls" }))
   await sleep(200)
@@ -203,7 +203,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
 // ---- S8: a new user prompt re-arms full recovery ------------------------------
 {
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("session.error", { sessionID: "s8", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
   await sleep(200)
   ok(state.prompts.length === 0, "S8 precondition: quiet after Stop")
@@ -221,7 +221,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   process.env.OPENCODE_RESUME_STALL_TIMEOUT_MS = "100"
   process.env.OPENCODE_RESUME_WATCHDOG_MS = "40"
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("session.status", { sessionID: "s9", status: { type: "busy" } }))
   await sleep(300) // watchdog detects the stall -> takeover aborts + schedules resume
   ok(state.aborts.includes("s9"), "S9: takeover aborts a stalled stream")
@@ -240,7 +240,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
 // (limited case: an injection dispatched just before the Stop lands after it)
 {
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("todo.updated", { sessionID: "s10", todos: [{ title: "t", status: "pending" }] }))
   await hooks.event(ev("session.error", { sessionID: "s10", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
   // the handler fetches the message text DURING dispatch — register it first
@@ -257,7 +257,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   const dir = await mkdtemp(join(tmpdir(), "ar-stop-"))
   process.env.OPENCODE_RESUME_STOPSTORE = join(dir, "stops.json")
   // run #1: the user stops the task
-  const hooksA = await AutoResumePlugin({ client: makeClient(makeState()) })
+  const hooksA = await createEngine({ client: makeClient(makeState()) })
   await hooksA.event(ev("session.error", { sessionID: "p1", error: { name: "MessageAbortedError", data: { message: "aborted by user" } } }))
   await sleep(150) // let the store flush to disk
   const savedRaw = JSON.parse(await readFile(process.env.OPENCODE_RESUME_STOPSTORE, "utf8"))
@@ -266,7 +266,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   const stateB = makeState()
   stateB.sessionList = [{ id: "p1", time: { updated: Date.now() - 1_000 } }]
   stateB.messagesBySession.p1 = [{ info: { role: "user", sessionID: "p1" }, parts: [] }] // unanswered-prompt bait
-  const hooksB = await AutoResumePlugin({ client: makeClient(stateB) })
+  const hooksB = await createEngine({ client: makeClient(stateB) })
   await sleep(2200)
   ok(!stateB.prompts.some((p) => p.id === "p1"),
     "S11: restarted run does not auto-start a stopped session")
@@ -313,7 +313,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null, time: { created: now - 9_000, completed: now - 8_000 } },
     parts: [{ type: "text", text: "All done." }],
   }]
-  await AutoResumePlugin({ client: makeClient(state) })
+  await createEngine({ client: makeClient(state) })
   await sleep(2200)
   ok(state.prompts.some((p) => p.id === "sd"), "S12: shutdown-abort revived as an interruption")
   ok(!state.logs.some((t) => t.includes("Stopped by you")), "S12: shutdown-abort NOT misread as a stop")
@@ -327,7 +327,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   process.env.OPENCODE_RESUME_THINK_STALL_MS = "150"
   process.env.OPENCODE_RESUME_WATCHDOG_MS = "40"
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("session.status", { sessionID: "think", status: { type: "busy" } }))
   await sleep(300) // past the 150ms think-stall window
   ok(state.aborts.includes("think"), "S13: silent thinking aborted at the fast threshold")
@@ -393,7 +393,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   let entered
   const insideFetch = new Promise((r) => { entered = r })
   state.messageGate = { id: "s14", entered, promise: new Promise((r) => { release = r }) }
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
 
   // Arm the session: a real assistant turn with text, then a resume so
   // lastResumeAt is set and the empty-nudge branch becomes reachable.
@@ -447,7 +447,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   let entered
   const insideStatus = new Promise((r) => { entered = r })
   state.statusGate = { entered, promise: new Promise((r) => { release = r }) }
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
 
   // A rate-limit failure schedules a recovery injection...
   await hooks.event(ev("session.error", { sessionID: "s15", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
@@ -483,7 +483,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   state.messagesBySession.s16 = [
     { info: { role: "assistant", error: null }, parts: [{ type: "text", text: "some output" }] },
   ]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("session.error", { sessionID: "s16", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
   await sleep(500)
   // Now the session is past a resume; feed genuinely empty assistant turns.
@@ -543,7 +543,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   process.env.OPENCODE_AUTOPILOT_MAX_PROCEEDS = "8"
   process.env.OPENCODE_AUTOPILOT_MAX_NUDGES = "20"
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   const askTurn = (n) => {
     state.idleIds.add("s17")
     state.messagesBySession.s17 = [
@@ -613,7 +613,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
       },
     },
   }
-  const hooks = await AutoResumePlugin({ client })
+  const hooks = await createEngine({ client })
   await hooks.event(ev("session.error", { sessionID: "s18", error: { name: "ProviderAuthError", data: { message: "auth failed" } } }))
   await sleep(300)
   ok(!catalogCalled, "S18: rotation is turned off in all cases — model catalog is never queried for rotation")
@@ -626,7 +626,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
 // never fire into the reverted session.
 {
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("session.error", { sessionID: "s19", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
   await hooks.event(ev("session.updated", { info: { id: "s19", revert: { messageID: "m1" } } }))
   // Core may re-emit the marker (updated title, timestamps) while the revert
@@ -648,7 +648,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   let entered
   const insideStatus = new Promise((r) => { entered = r })
   state.statusGate = { entered, promise: new Promise((r) => { release = r }) }
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("session.error", { sessionID: "s20", error: { name: "APIError", data: { statusCode: 429, message: "slow down" } } }))
   // waitGate (not a bare await): see S15 — the recovery timer is unref'd, so
   // a bare await lets node exit before the timer fires.
@@ -665,7 +665,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
 // ---- S21: a real user prompt re-arms automation after a Revert -------------
 {
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "s21", text: "step 1 done" } }))
   await hooks.event(ev("todo.updated", { sessionID: "s21", todos: [{ title: "remaining", status: "pending" }] }))
   await hooks.event(ev("session.updated", { info: { id: "s21", revert: { messageID: "m1" } } }))

@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs"
 process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-v2-stops-${process.pid}-${Date.now()}.json`)
 process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-v2-off-${process.pid}-${Date.now()}.json`)
 
-import { AutoResumePlugin } from "../auto-resume.js"
+import { createEngine } from "../auto-resume.js"
 
 const ok = (cond, label) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}`)
@@ -66,7 +66,7 @@ async function fresh(idle = []) {
     prompts: [], aborts: [], summarizes: [], logs: [], permResponses: [],
     idleIds: new Set(idle), msgStore: {}, msgN: 0,
   }
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   return { state, hooks }
 }
 const ev = (type, properties) => ({ event: { type, properties } })
@@ -172,7 +172,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
       state.permResponses.push({ permissionID: path.permissionID, response: body.response })
       return true
     }
-  const hooks = await AutoResumePlugin({ client })
+  const hooks = await createEngine({ client })
   await hooks.event(ev("permission.updated", {
     id: "fb1", sessionID: "permFb",
     permission: "external_directory", metadata: { patterns: ["E:\\data\\*"] },
@@ -195,7 +195,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     return true
   }
   client.session.prompt = async () => { syncCalls += 1; return true }
-  const hooks = await AutoResumePlugin({ client })
+  const hooks = await createEngine({ client })
   await hooks.event(ev("session.error", { sessionID: "asyn", error: { name: "APIError", data: { statusCode: 503, message: "down" } } }))
   await sleep(400)
   ok(asyncCalls === 1 && syncCalls === 0, "P2: fire-and-forget async dispatch preferred")
@@ -368,7 +368,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
       }),
     },
   }
-  const hooks = await AutoResumePlugin({ client: testClient })
+  const hooks = await createEngine({ client: testClient })
   await hooks.event(ev("permission.updated", {
     id: "root1", sessionID: "rtest", type: "bash", title: "ls",
     metadata: { command: "npm install" },

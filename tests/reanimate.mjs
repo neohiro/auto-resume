@@ -25,7 +25,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { mkdtempSync, writeFileSync } from "node:fs"
 
-import plugin, { AutoResumePlugin } from "../auto-resume.js"
+import plugin, { createEngine } from "../auto-resume.js"
 
 const ok = (cond, label) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}`)
@@ -77,7 +77,7 @@ const interruptedTurn = (id) => ({
       message: async () => ({ data: { parts: [] } }),
     },
   }
-  await AutoResumePlugin({ client })
+  await createEngine({ client })
   await sleep(2600)
   ok(prompts.includes("v1sess"), `R1: V1 reanimation revives an interrupted session (${prompts.length} prompt)`)
 }

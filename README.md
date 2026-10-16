@@ -212,39 +212,44 @@ Everything is env vars with sensible defaults. Set them globally or per shell.
 
 ## Compatibility
 
-Works anywhere OpenCode runs — **Windows, macOS, Linux** — on **OpenCode 1.x and OpenCode 2.x** (including the desktop client). The plugin is a single zero-dependency file using only the OpenCode plugin context / SDK client, timers, and environment variables, plus the tiny local files it manages itself: the self-update backup (`.bak`), the update-ack marker (`.acked`), the user-stop memory (`auto-resume.js.stopped.json`), the per-session opt-out memory (`auto-resume.js.off.json`), and the pause memory (`auto-resume.js.paused.json`). Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
+Works anywhere OpenCode runs — **Windows, macOS, Linux** — on **OpenCode 2.x** (including the desktop client). The plugin is a single zero-dependency file using only the OpenCode plugin context, timers, and environment variables, plus the tiny local files it manages itself: the self-update backup (`.bak`), the update-ack marker (`.acked`), the user-stop memory (`auto-resume.js.stopped.json`), the per-session opt-out memory (`auto-resume.js.off.json`), and the pause memory (`auto-resume.js.paused.json`). Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
 
-Tested against OpenCode's event API: `session.error/status/idle/created/updated/deleted/compacted`, `message.updated/removed`, `message.part.updated/removed`, `todo.updated`, `permission.asked/updated/replied`, `server.connected`.
+Tested against OpenCode 2's event API: `server.connected`, `session.step.started/ended/failed`,
+`session.text.*`, `session.reasoning.*`, `session.tool.*`, `session.retry.scheduled`,
+`session.execution.*`, `session.compaction.failed`, `session.deleted`, and the V2 permission
+`evaluate` hook.
 
-### OpenCode 1.x (legacy)
+### OpenCode 1.x is no longer supported
 
-Development now targets OpenCode 2 exclusively. **v1.16.1 is the final release that supports
-OpenCode 1.x** — it still exports the V1 `AutoResumePlugin` hook, so it keeps working on the old
-client. If you're on OpenCode 1, pin to that tag rather than tracking `main`:
+Development targeted OpenCode 2 exclusively from v1.17 onward, and **v2.0.0 completes the
+migration**: the V1 `AutoResumePlugin` hook entrypoint has been removed, and `main` no longer
+exports it. OpenCode 2 does not run V1 plugin implementations at all — a V1 module fails to load
+with `Plugin must export a default definition with an id and an effect or setup function` — so
+keeping that export only preserved a path that no supported client could load.
+
+If you are still on OpenCode 1, pin to the last release that exports the V1 hook:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/neohiro/auto-resume/v1.16.1/auto-resume.js \
   -o ~/.config/opencode/plugins/auto-resume.js
 ```
 
-Later releases are not guaranteed to keep the V1 export. On OpenCode 2, always use `main`.
-
 ### OpenCode 2 support
 
-OpenCode 2 does not run V1 plugin implementations — a V1 module fails to load with
-`Plugin must export a default definition with an id and an effect or setup function`.
-This plugin ships **both entrypoints from one file**:
+This plugin exports a single entrypoint:
 
 | Export | Runtime |
 |---|---|
 | `export default { id: "auto-resume", setup(ctx) }` | OpenCode 2.x (Promise plugin API) |
-| `export const AutoResumePlugin({ client, $ })` | OpenCode 1.x (V1 hook API) |
 
-The V2 `setup` is an adapter, not a rewrite. It maps the V2 plugin context onto the V1
-client the engine already speaks, subscribes to `ctx.event.subscribe()`, and normalizes
+`createEngine` is also exported, but only so the engine suites can drive it directly against a
+bridged client — it is not a runtime entrypoint.
+
+The V2 `setup` is an adapter, not a rewrite. It maps the V2 plugin context onto the client
+interface the engine already speaks, subscribes to `ctx.event.subscribe()`, and normalizes
 each V2 event onto the `{ type, properties }` shape the engine consumes:
 
-| V1 engine call | V2 context method |
+| Engine call | V2 context method |
 |---|---|
 | `session.prompt({ path, body })` | `ctx.session.prompt({ sessionID, text, model })` |
 | `session.abort()` | `ctx.session.interrupt({ sessionID, resume: false })` |
@@ -326,7 +331,7 @@ shape therefore gets its own message:
 | Truncated output (`finish: "length"`) | Resume at the cut point; don't re-emit finished code; split the work if it won't fit |
 
 OpenCode 2 is what makes several of these possible. It exposes the provider's own account of a
-failure that V1 only hinted at through error strings:
+failure as structured data rather than only an error string:
 
 - `Session.Message.Assistant.finish` — a first-class reason (`stop` / `length` / `tool-calls` /
   `content-filter` / `error` / `unknown`). The content-filter case is only detectable this way.
@@ -359,7 +364,7 @@ git clone https://github.com/neohiro/auto-resume && cd auto-resume
 npm test        # <!-- coverage -->320+ assertions across 16 suites<!-- /coverage --> (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
 ```
 
-The Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/v2entry.mjs` drives the **V2 default export** against a mock V2 plugin context — the recovery path across all three event-stream encodings, permission autopilot, message normalization, and the cross-message plan fallback that replaces the removed `todowrite` tool. `tests/reanimate.mjs` covers **restart auto-resume** specifically: that an interrupted session is revived on V1, on V2 without any `session.list()`, on the first boot after a self-update, and that sessions the user stopped or that are empty are left alone. `tests/prompts.mjs` pins **message routing**: that each failure shape reaches its own message, that the V2 retry window and provider name reach the rate-limit prompt, that a content-filtered turn is reframed rather than repeated, and that an unattributable failure is not blindly retried. `tests/v2review.mjs` pins the adapter's hot-path invariants: that high-volume noise events (`skill.updated` and friends) cost nothing before reaching the engine, that real `session.*` events still get through that filter, that a turn which is merely still streaming is never misreported as a failure, and that a genuinely errored turn still is. `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
+The Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/v2entry.mjs` drives the **V2 default export** against a mock V2 plugin context — the recovery path across all three event-stream encodings, permission autopilot, message normalization, and the cross-message plan fallback that replaces the removed `todowrite` tool. `tests/reanimate.mjs` covers **restart auto-resume** specifically: that an interrupted session is revived through the V2 default export with no `session.list()` available at all, on the first boot after a self-update, and that sessions the user stopped or that are empty are left alone. `tests/prompts.mjs` pins **message routing**: that each failure shape reaches its own message, that the V2 retry window and provider name reach the rate-limit prompt, that a content-filtered turn is reframed rather than repeated, and that an unattributable failure is not blindly retried. `tests/v2review.mjs` pins the adapter's hot-path invariants: that high-volume noise events (`skill.updated` and friends) cost nothing before reaching the engine, that real `session.*` events still get through that filter, that a turn which is merely still streaming is never misreported as a failure, and that a genuinely errored turn still is. `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
 
 ### Windows unattended notes (UAC / SmartScreen)
 

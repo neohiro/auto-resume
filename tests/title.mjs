@@ -15,7 +15,7 @@ process.env.OPENCODE_RESUME_OFFSTORE = titleOff0
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { AutoResumePlugin } from "../auto-resume.js"
+import { createEngine } from "../auto-resume.js"
 
 const ok = (cond, label) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}`)
@@ -76,7 +76,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "Plan:\n- [x] scaffold\n- [ ] implement" }],
   }]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t1", text: "Plan:" } }))
   await hooks.event(ev("session.idle", { sessionID: "t1" })) // open checkbox -> drive
   await sleep(600)
@@ -88,7 +88,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
 {
   const state = makeState()
   state.baseTitles.t2 = "Migrate database"
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.updated", { info: { role: "user", sessionID: "t2", id: "u2" } }))
   state.msgStore.u2 = "start the migration"
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t2", text: "working..." } }))
@@ -107,7 +107,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "Plan:\n- [ ] work" }],
   }]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t3", text: "Plan:" } }))
   await hooks.event(ev("session.idle", { sessionID: "t3" })) // attaches 🟢 + drives
   await sleep(500)
@@ -136,7 +136,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   process.env.OPENCODE_RESUME_OFFSTORE = join(dir, "off.json")
   // run #1: opt the session out
   const stateA = makeState()
-  const hooksA = await AutoResumePlugin({ client: makeClient(stateA) })
+  const hooksA = await createEngine({ client: makeClient(stateA) })
   stateA.msgStore.o1 = "/auto-resume off"
   await hooksA.event(ev("message.updated", { info: { role: "user", sessionID: "p9", id: "o1" } }))
   await sleep(500)
@@ -148,7 +148,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   stateB.messagesBySession.p9 = [
     { info: { role: "user", sessionID: "p9" }, parts: [] }, // unanswered-prompt bait must NOT revive it
   ]
-  const hooksB = await AutoResumePlugin({ client: makeClient(stateB) })
+  const hooksB = await createEngine({ client: makeClient(stateB) })
   await sleep(2200)
   ok(stateB.prompts.length === 0 && stateB.titles.p9 === undefined,
     "T4: restarted run keeps the session opted out and never touches it")
@@ -181,7 +181,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "working" }],
   }]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t5", text: "working" } }))
   await hooks.event(ev("session.idle", { sessionID: "t5" }))
   await sleep(500)
@@ -204,7 +204,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   state.baseTitles.t6 = "Old task [auto-resume: 🟢 armed]" // stale tag baked in
   state.sessionList = [{ id: "t6", time: { updated: Date.now() - 1_000 } }]
   state.messagesBySession.t6 = [{ info: { role: "user", sessionID: "t6" }, parts: [] }]
-  await AutoResumePlugin({ client: makeClient(state) })
+  await createEngine({ client: makeClient(state) })
   await sleep(2200) // init load + zero-trace sweep
   ok(state.titles.t6 === "Old task", "T6: stale tag stripped on startup for opted-out session")
   ok(state.prompts.length === 0, "T6: sweep never revives the session")
@@ -217,7 +217,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   process.env.OPENCODE_RESUME_OFFSTORE = titleOff0
   const state = makeState()
   state.baseTitles.t7 = "Workflow fixes"
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "t7", text: "working" } }))
   await hooks.event(ev("session.idle", { sessionID: "t7" }))
   await sleep(450)
@@ -245,7 +245,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   process.env.OPENCODE_RESUME_OFFSTORE = titleOff0
   const state = makeState()
   state.baseTitles.t8 = "Long build"
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   const t8 = (status) => hooks.event(ev("session.status", { sessionID: "t8", status: { type: status } }))
   // a transient error -> auto-resume fires -> turn completes cleanly
   await hooks.event(ev("session.error", { sessionID: "t8", error: { name: "APIError", data: { statusCode: 502, message: "blip" } } }))
@@ -274,7 +274,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "Should I proceed with the migration?" }],
   }]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", {
     part: { type: "text", sessionID: "qna", text: "Should I proceed with the migration?" },
   }))
@@ -307,7 +307,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "Continue to finalize." }],
   }]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", {
     part: { type: "text", sessionID: "stub", text: "Continue to finalize." },
   }))
@@ -333,7 +333,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "Should I proceed with v2 of the API?" }],
   }]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", {
     part: { type: "text", sessionID: "q2", text: "Should I proceed with v2 of the API?" },
   }))

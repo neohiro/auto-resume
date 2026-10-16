@@ -12,7 +12,8 @@
  *  `setup(ctx)`. This file therefore exposes BOTH entrypoints from one module:
  *
  *    • `export default { id, setup(ctx) }`  — OpenCode 2.x (Promise plugin)
- *    • `export const AutoResumePlugin`      — OpenCode 1.x (V1 hooks)
+ *    • `export const createEngine`           — the engine itself, driven
+ *      directly by the test suites against a bridged client
  *
  *  The V2 `setup` does not reimplement the engine. It builds a small adapter
  *  that maps the V2 plugin context onto the V1 SDK client the engine already
@@ -201,7 +202,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.19.4"
+const AUTO_RESUME_VERSION = "2.0.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1303,7 +1304,7 @@ const armShutdownHooks = () => {
   }
 }
 
-export const AutoResumePlugin = async ({ client, $ }) => {
+export const createEngine = async ({ client }) => {
   const cfg = loadConfig()
 
   const sessions = new Map() // sessionID -> state
@@ -1944,14 +1945,17 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   }
 
   // ── OS notifications + milestones ──────────────────────────────────────
-  // Drop-file fallback lives next to the plugin so the TUI / launcher can
+  // Drop-file fallback lives next to the plugin so the desktop client can
   // surface notices to the user even on hosts where the OS channel (WinRT
-  // toast / osascript / libnotify) is blocked or $ is missing.  The file
+  // toast / osascript / libnotify) is blocked. The file
   // is one JSON line per event; tail-friendly and cheap to ignore.
   const noticeDropFile = selfPath
     ? selfPath.replace(/[\\/][^\\/]+$/, "/auto-resume-notices.jsonl")
     : null
-  const osNotify = createOsNotifier({ $, dropFile: noticeDropFile })
+  // No `$` here: OpenCode 2's plugin context has no shell-runner helper, so
+  // createOsNotifier falls back to spawning the notifier directly. It still
+  // accepts one for tests and for Bun hosts that supply a shell runner.
+  const osNotify = createOsNotifier({ dropFile: noticeDropFile })
 
   /** Milestone events (update applied, …): pushed through the native TUI
    *  toast first, with the OS notifier as a backup for hosts where the TUI
@@ -2075,6 +2079,14 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       if (code === 429) return "rate_limit"
       if (code === 402) return "quota"   // HTTP 402 Payment Required → quota/credits
       if (code === 408 || code === 409) return "retryable"
+      // HTTP 403 is overloaded across providers: rejected credentials, quota or
+      // billing exhaustion, model-access denial and org restrictions all surface
+      // as 403, and the client usually reports only the bare status. Treating it
+      // as fatal meant a quota wall killed the session with no recovery and no
+      // notice. Retry the same model instead — the circuit breaker bounds how
+      // long that can go on, and opens with a user-facing notice if it persists.
+      // HTTP 401 stays fatal: that one really is bad credentials.
+      if (code === 403) return "retryable"
       if (typeof code === "number" && code >= 500) return "retryable"
       if (data.isRetryable === true) return "retryable"
       if (matchesAny(text, OVERFLOW_PATTERNS)) return "overflow"
@@ -2216,7 +2228,11 @@ export const AutoResumePlugin = async ({ client, $ }) => {
       if (code === 402) return "quota"
       if (code === 408) return "timeout"
       if (code >= 500) return "provider"
-      if (code === 401 || code === 403) return "auth"
+      if (code === 401) return "auth"
+      // 403 is classified retryable (see classify); on the prompt side it is a
+      // provider-side refusal, so the model should wait and retry unchanged
+      // rather than assume its credentials or its output were at fault.
+      if (code === 403) return "provider"
       if (code >= 400) return "fatal"
     }
     const text = `${error?.data?.message ?? ""} ${error?.data?.responseBody ?? ""} ${error?.message ?? ""}`
@@ -2234,8 +2250,9 @@ export const AutoResumePlugin = async ({ client, $ }) => {
   }
 
   /** Build the provider-facing hint block the V2 adapter attaches (rate-limit
-   *  window, provider name, the provider's own reason). V1 cores attach
-   *  nothing, so this is simply an empty hint there. */
+   *  window, provider name, the provider's own reason). The OpenCode 2 event
+   *  stream carries this detail; a context without it simply gets an empty
+   *  hint. */
   const v2Hint = (error) => {
     const d = error?.data ?? {}
     const retryNext = d.retryNext
@@ -5021,7 +5038,7 @@ export default {
     const { client, setStatus, remember, rememberRetryStatus, retryHint, statusBySession } = buildV2Client(ctx, hooksForClient)
 
     // Instantiate the V1 engine against the bridged client.
-    const engine = await AutoResumePlugin({ client })
+    const engine = await createEngine({ client })
     const handle = engine?.event
     if (typeof handle !== "function") {
       throw new Error("auto-resume: engine did not return an event handler")

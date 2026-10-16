@@ -14,7 +14,7 @@ import { join } from "node:path"
 process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-v4-stops-${process.pid}-${Date.now()}.json`)
 process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-v4-off-${process.pid}-${Date.now()}.json`)
 
-import { AutoResumePlugin } from "../auto-resume.js"
+import { createEngine } from "../auto-resume.js"
 
 const ok = (cond, label) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}`)
@@ -64,7 +64,7 @@ function makeState(idle = []) {
     idleIds: new Set(idle), msgStore: {}, msgN: 0, sessionList: [], messagesBySession: {},
   }
 }
-const fresh = (idle) => AutoResumePlugin({ client: makeClient(makeState(idle)) }).then((hooks) => hooks)
+const fresh = (idle) => createEngine({ client: makeClient(makeState(idle)) }).then((hooks) => hooks)
 const ev = (type, properties) => ({ event: { type, properties } })
 
 // ---- W: stuck internal-retry loop gets taken over ---------------------------
@@ -72,7 +72,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   process.env.OPENCODE_RESUME_RETRY_FUTURE_CAP_MS = "150"
   process.env.OPENCODE_RESUME_WATCHDOG_MS = "50"
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   const farFuture = Date.now() + 20 * 60 * 1000
   await hooks.event(ev("session.status", { sessionID: "stuck", status: { type: "retry", attempt: 1, message: "overloaded", next: farFuture } }))
   await sleep(600)
@@ -102,7 +102,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   state.messagesBySession["child-session"] = [
     { info: { role: "user", sessionID: "child-session" }, parts: [] },
   ]
-  await AutoResumePlugin({ client: makeClient(state) }) // init runs the scan
+  await createEngine({ client: makeClient(state) }) // init runs the scan
   await sleep(2200)
   ok(state.prompts.some((p) => p.id === "recent-crash" && p.model?.modelID === "b-pro"),
     "X: recently crashed session revived with its model")
@@ -112,7 +112,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   const st2 = makeState()
   st2.sessionList = [{ id: "unanswered", time: { updated: now - 3_000 } }]
   st2.messagesBySession.unanswered = [{ info: { role: "user", sessionID: "unanswered" }, parts: [] }]
-  await AutoResumePlugin({ client: makeClient(st2) })
+  await createEngine({ client: makeClient(st2) })
   await sleep(2200)
   ok(st2.prompts.some((p) => p.id === "unanswered"), "X2: prompt that never got a reply is re-sent")
 }
@@ -134,7 +134,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   let entered
   const insideFetch = new Promise((r) => { entered = r })
   state.messageGate = { id: "stopped-mid-scan", entered, promise: new Promise((r) => { release = r }) }
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   // Wait until the scan is genuinely suspended inside the messages() fetch —
   // firing the Stop any earlier would be caught by the pre-fetch check and
   // would not exercise the post-await window at all.
@@ -156,7 +156,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "I found two approaches. Should I proceed with the database migration?" }],
   }]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   // simulate the turn that produced the question
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "ask", text: "Should I proceed with the migration?" } }))
   await hooks.event(ev("session.idle", { sessionID: "ask" }))
@@ -173,7 +173,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "All done. The build passes and tests are green." }],
   }]
-  const hooks2 = await AutoResumePlugin({ client: makeClient(state2) })
+  const hooks2 = await createEngine({ client: makeClient(state2) })
   await hooks2.event(ev("message.part.updated", { part: { type: "text", sessionID: "stmt", text: "All done." } }))
   await hooks2.event(ev("session.idle", { sessionID: "stmt" }))
   await sleep(300)
@@ -187,7 +187,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   process.env.OPENCODE_RESUME_RUNNING_TOOL_FACTOR = "4"
   process.env.OPENCODE_RESUME_WATCHDOG_MS = "40"
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("session.status", { sessionID: "build", status: { type: "busy" } }))
   await hooks.event(ev("message.part.updated", { part: { type: "tool", sessionID: "build", state: { status: "running" }, tool: "bash" } }))
   await sleep(260) // past base 120ms silence, inside 480ms grace window
@@ -201,7 +201,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
 // ---- AA: subagent errors are never injected into ------------------------------
 {
   const state = makeState()
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("session.created", { info: { id: "kid", parentID: "root-1" } }))
   await hooks.event(ev("session.error", { sessionID: "kid", error: { name: "APIError", data: { statusCode: 503, message: "down" } } }))
   await sleep(300)
@@ -215,7 +215,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "Continue to finalize." }],
   }]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "fin", text: "Continue to finalize." } }))
   await hooks.event(ev("session.idle", { sessionID: "fin" }))
   await sleep(350)
@@ -227,7 +227,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "Continuing..." }],
   }]
-  const hooks2 = await AutoResumePlugin({ client: makeClient(state2) })
+  const hooks2 = await createEngine({ client: makeClient(state2) })
   await hooks2.event(ev("message.part.updated", { part: { type: "text", sessionID: "ell", text: "Continuing..." } }))
   await hooks2.event(ev("session.idle", { sessionID: "ell" }))
   await sleep(350)
@@ -241,7 +241,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: longSummary }],
   }]
-  const hooks3 = await AutoResumePlugin({ client: makeClient(state3) })
+  const hooks3 = await createEngine({ client: makeClient(state3) })
   await hooks3.event(ev("message.part.updated", { part: { type: "text", sessionID: "done", text: longSummary } }))
   await hooks3.event(ev("session.idle", { sessionID: "done" }))
   await sleep(350)
@@ -257,7 +257,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "Remaining things to do:\n- [ ] fix the parser\n- [ ] update docs" }],
   }]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "rem", text: "Remaining things to do:" } }))
   await hooks.event(ev("session.idle", { sessionID: "rem" }))
   await sleep(350)
@@ -272,7 +272,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "Plan:\n- [x] scaffold\n- [ ] implement\n- [ ] test" }],
   }]
-  const hooks2 = await AutoResumePlugin({ client: makeClient(state2) })
+  const hooks2 = await createEngine({ client: makeClient(state2) })
   await hooks2.event(ev("message.part.updated", { part: { type: "text", sessionID: "cb", text: "Plan:\n- [x] scaffold\n- [ ] implement\n- [ ] test" } }))
   await hooks2.event(ev("session.idle", { sessionID: "cb" })) // 2 unchecked -> drive
   await sleep(350)
@@ -297,7 +297,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "Wrap-up: done. Next steps you could consider: 1. caching 2. retries" }],
   }]
-  const hooks4 = await AutoResumePlugin({ client: makeClient(state4) })
+  const hooks4 = await createEngine({ client: makeClient(state4) })
   // simulate that this turn answered OUR propose injection
   const s4 = hooks4 && null
   void s4
@@ -316,7 +316,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
     info: { role: "assistant", error: null },
     parts: [{ type: "text", text: "Plan:\n- [ ] work" }],
   }]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   // first turn costs $6 -> under cap
   await hooks.event(ev("message.updated", { info: { role: "assistant", sessionID: "cost", cost: 6 } }))
   await hooks.event(ev("message.part.updated", { part: { type: "text", sessionID: "cost", text: "Plan:" } }))
@@ -338,7 +338,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
   const now = Date.now()
   const state = makeState()
   // init scan finds nothing (list empty at boot)
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   // ...then a crashed session appears (e.g. machine woke from sleep)
   state.sessionList = [{ id: "woke", time: { updated: now - 1_000 } }]
   state.messagesBySession.woke = [
@@ -367,7 +367,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
       parts: [],
     },
   ]
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   // surface the error so handleError schedules a lowBudget plan
   await hooks.event(ev("message.updated", { info: { role: "assistant", sessionID: "ff", providerID: "provA", modelID: "a-mini" } }))
   await hooks.event(ev("session.error", {

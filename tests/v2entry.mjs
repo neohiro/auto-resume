@@ -22,7 +22,7 @@ import { join } from "node:path"
 process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-v2e-stops-${process.pid}-${Date.now()}.json`)
 process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-v2e-off-${process.pid}-${Date.now()}.json`)
 
-import plugin, { AutoResumePlugin } from "../auto-resume.js"
+import plugin, { createEngine } from "../auto-resume.js"
 
 const ok = (cond, label) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}`)
@@ -95,7 +95,7 @@ const baseState = () => ({ calls: [], prompts: [], permResponses: [], logs: [] }
   ok(plugin?.id === "auto-resume", `L1: default export carries a stable id (${plugin?.id})`)
   ok(typeof plugin?.setup === "function", "L1: default export provides setup(ctx)")
   // V1 entrypoint must survive for V1 runtimes and the direct-engine suites.
-  ok(typeof AutoResumePlugin === "function", "L1: V1 AutoResumePlugin export retained")
+  ok(typeof createEngine === "function", "L1: the engine factory is exported for direct test driving")
 }
 
 // ---- L2: setup wires the engine and returns a cleanup ----------------------

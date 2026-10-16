@@ -17,7 +17,7 @@ process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-smoke-stops-${proce
 process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-smoke-off-${process.pid}-${Date.now()}.json`)
 process.env.OPENCODE_RESUME_ACTIVESTORE ??= join(tmpdir(), `ar-smoke-active-${process.pid}-${Date.now()}.json`)
 
-import { AutoResumePlugin } from "../auto-resume.js"
+import { createEngine } from "../auto-resume.js"
 
 const ok = (cond, label) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}`)
@@ -48,7 +48,7 @@ function makeClient(state) {
 
 async function freshState(idleIds = []) {
   const state = { prompts: [], aborts: [], summarizes: [], logs: [], idleIds: new Set(idleIds) }
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   return { state, hooks }
 }
 

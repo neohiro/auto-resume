@@ -8,7 +8,7 @@ process.env.OPENCODE_RESUME_ACTIVESTORE = join(tmpdir(), `ar-fav-active-${proces
 import { rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { AutoResumePlugin } from "../auto-resume.js"
+import { createEngine } from "../auto-resume.js"
 
 const ok = (cond, label) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}`)
@@ -80,7 +80,7 @@ const cleanTurn = (state, id, model) => {
 {
   const state = makeState(["t1"])
   const client = makeClient(state)
-  const hooks = await AutoResumePlugin({ client })
+  const hooks = await createEngine({ client })
   state.sessionList = ["t1"]
   cleanTurn(state, "t1", FAV)
   await hooks.event(ev("session.error", {

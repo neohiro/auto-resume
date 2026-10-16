@@ -14,7 +14,7 @@ import { join } from "node:path"
 process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-extended-stops-${process.pid}-${Date.now()}.json`)
 process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-extended-off-${process.pid}-${Date.now()}.json`)
 
-import { AutoResumePlugin } from "../auto-resume.js"
+import { createEngine } from "../auto-resume.js"
 
 const ok = (cond, label) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}`)
@@ -40,7 +40,7 @@ function makeClient(state) {
 
 async function fresh(idle = []) {
   const state = { prompts: [], aborts: [], summarizes: [], logs: [], idleIds: new Set(idle) }
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   return { state, hooks }
 }
 const ev = (type, properties) => ({ event: { type, properties } })

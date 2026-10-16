@@ -84,6 +84,41 @@ const baseState = () => ({ prompts: [], logs: [] })
   dispose()
 }
 
+// ---- F1b: a 403 now recovers instead of silently killing the session -------
+// 403 is overloaded across providers (credentials, quota/billing, model-access
+// denial, org restrictions) and the client reports only the bare status, so
+// classifying it as fatal stranded sessions with no recovery and no notice.
+// It is retried on the same model; the circuit breaker bounds the retries.
+{
+  const state = baseState()
+  const ctx = makeCtx(state, [
+    stepStarted(),
+    stepFailed({ type: "APIError", message: "Provider request failed with HTTP 403", status: 403 }),
+  ], [])
+  const dispose = await plugin.setup(ctx)
+  await sleep(2200)
+  ok(state.prompts.length > 0,
+    `F1b: a 403 produces a resume prompt rather than dying silently (${state.prompts.length} prompts)`)
+  const p = state.prompts.at(-1)?.text ?? ""
+  ok(!/credential|api key|sign in|authenticat/i.test(p),
+    `F1b: the prompt does not blame the model's credentials (${p.slice(0, 90)}...)`)
+  dispose()
+}
+
+// ---- F1c: HTTP 401 stays fatal — that one really is bad credentials -------
+{
+  const state = baseState()
+  const ctx = makeCtx(state, [
+    stepStarted(),
+    stepFailed({ type: "APIError", message: "invalid api key", status: 401 }),
+  ], [])
+  const dispose = await plugin.setup(ctx)
+  await sleep(2200)
+  ok(state.prompts.length === 0,
+    `F1c: a 401 is still fatal and is not retried (${state.prompts.length} prompts)`)
+  dispose()
+}
+
 // ---- F2: a retryable 5xx IS recovered with a resume prompt ----------------
 {
   const state = baseState()

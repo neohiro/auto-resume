@@ -14,7 +14,7 @@ import { join } from "node:path"
 process.env.OPENCODE_RESUME_STOPSTORE ??= join(tmpdir(), `ar-v3-stops-${process.pid}-${Date.now()}.json`)
 process.env.OPENCODE_RESUME_OFFSTORE ??= join(tmpdir(), `ar-v3-off-${process.pid}-${Date.now()}.json`)
 
-import { AutoResumePlugin } from "../auto-resume.js"
+import { createEngine } from "../auto-resume.js"
 
 const ok = (cond, label) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}`)
@@ -44,7 +44,7 @@ function makeClient(state, providers) {
 
 async function fresh(idle, providers) {
   const state = { prompts: [], aborts: [], summarizes: [], logs: [], permResponses: [], idleIds: new Set(idle), msgStore: {}, msgN: 0 }
-  const hooks = await AutoResumePlugin({ client: makeClient(state, providers) })
+  const hooks = await createEngine({ client: makeClient(state, providers) })
   return { state, hooks }
 }
 const ev = (type, properties) => ({ event: { type, properties } })
@@ -158,7 +158,7 @@ const ev = (type, properties) => ({ event: { type, properties } })
       message: async ({ path }) => ({ data: { parts: [{ type: "text", text: state.msgStore[path.messageID] ?? "" }] } }),
     },
   }
-  const hooks = await AutoResumePlugin({ client })
+  const hooks = await createEngine({ client })
   // Step 1: assistant message starts the turn and records the model
   await hooks.event(ev("message.updated", { info: { role: "assistant", sessionID: "fmr", providerID: "openrouter", modelID: "free-models-router" } }))
   // Step 2: text arrives — signals the turn had content (lastTurnHadText = true)

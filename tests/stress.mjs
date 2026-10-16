@@ -6,7 +6,7 @@ process.env.OPENCODE_RESUME_NUDGE_DELAY_MS ??= "15"
 process.env.OPENCODE_RESUME_TOAST_THROTTLE_MS ??= "0"
 process.env.OPENCODE_RESUME_AUTO_UPDATE ??= "0"
 
-import { AutoResumePlugin } from "../auto-resume.js"
+import { createEngine } from "../auto-resume.js"
 
 const ok = (cond, label) => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${label}`)
@@ -44,7 +44,7 @@ function makeClient(state) {
 
 async function fresh() {
   const state = { prompts: [], aborts: [], toasts: [], idleIds: new Set(), msgStore: {}, sessionList: [], msgN: 0 }
-  const hooks = await AutoResumePlugin({ client: makeClient(state) })
+  const hooks = await createEngine({ client: makeClient(state) })
   return { state, hooks }
 }
 const ev = (type, properties) => ({ event: { type, properties } })

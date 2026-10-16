@@ -36,7 +36,7 @@ const real$ = (...args) => {
 // works when the checkout lives under a path containing spaces.
 const SOURCE = fileURLToPath(new URL("../auto-resume.js", import.meta.url))
 const SOURCE_VERSION = (await readFile(SOURCE, "utf8")).match(/AUTO_RESUME_VERSION = "([^"]+)"/)?.[1]
-const { createOsNotifier, AutoResumePlugin } = await import(pathToFileURL(SOURCE).href)
+const { createOsNotifier, createEngine } = await import(pathToFileURL(SOURCE).href)
 
 const logs = []
 const mockClient = () => ({
@@ -84,8 +84,8 @@ const mockClient = () => ({
   // Boot the COPY, not the repo original: the plugin derives its .acked path
   // from its own module URL, so delivery must land next to this copy for the
   // assertions below to observe it.
-  const { AutoResumePlugin: CopyPlugin } = await import(pathToFileURL(file).href)
-  const hooks = await CopyPlugin({ client: mockClient(), $: real$ })
+  const { createEngine: CopyEngine } = await import(pathToFileURL(file).href)
+  const hooks = await createEngine({ client: mockClient(), $: real$ })
   void hooks // arming happens during init; nothing else to drive
 
   // Delivery fires ~800ms after arming; poll up to 40s — headless runners can
