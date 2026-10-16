@@ -202,7 +202,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "2.0.2"
+const AUTO_RESUME_VERSION = "2.0.3"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -2137,13 +2137,34 @@ export const createEngine = async ({ client }) => {
     return "fatal"
   }
 
+  /** Redact credential-shaped substrings from provider error text.
+   *
+   *  Error text reaches surfaces that escape the session entirely: the
+   *  plaintext notice drop-file, and OS toast notifications. On Windows those
+   *  render on the lock screen and are mirrored to the cloud, so a key echoed
+   *  by a provider would be readable by anyone at the machine and persisted
+   *  off-box. describeErrForPrompt also strips URLs, which covers the common
+   *  `?key=…` shape, but inline secrets survive that: "invalid key sk-…",
+   *  "Authorization: Bearer …".
+   *
+   *  Patterns are anchored to credential *syntax* rather than length alone, so
+   *  the surrounding prose the model and user need — "invalid API key",
+   *  "unauthorized" — is preserved intact. */
+  const redactSecrets = (text) => String(text ?? "")
+    // Prefixed vendor keys: sk-…, sk-ant-…, rk-…, pk-…, gsk_…
+    .replace(/\b(?:sk|rk|pk|gsk|xai)[-_][A-Za-z0-9_-]{8,}/gi, "[redacted-key]")
+    // "Authorization: Bearer eyJ…" / "authorization=bearer …"
+    .replace(/\b(authorization\s*[:=]\s*bearer\s+)\S+/gi, "$1[redacted-token]")
+    // Labelled secrets: api_key=…, token: …, "password": "…"
+    .replace(/\b(api[-_]?key|apikey|access[-_]?token|refresh[-_]?token|secret|password|passwd)(\s*[:=]\s*)["']?\S+/gi, "$1$2[redacted]")
+
   /** Short human-readable cause for injected prompts/log lines: e.g.
    *  "APIError HTTP 502 — bad gateway" or "UnknownError — upstream request failed". */
   const describeErr = (error) => {
     if (!error) return ""
     const name = error.name ?? "Error"
     const code = error.data?.statusCode
-    const msg = String(error.data?.message ?? error.message ?? "").replace(/\s+/g, " ").trim().slice(0, 120)
+    const msg = redactSecrets(String(error.data?.message ?? error.message ?? "").replace(/\s+/g, " ").trim()).slice(0, 120)
     const parts = [name, typeof code === "number" ? `HTTP ${code}` : "", msg].filter(Boolean)
     return parts.join(" — ")
   }
@@ -2202,6 +2223,9 @@ export const createEngine = async ({ client }) => {
     // a shorter reply.
     const m = msg.match(/requested\s+(?:up\s+to\s+)?(\d+)\s*tokens?[,\s]+(?:but\s+)?(?:can\s+(?:only\s+)?afford|only)\s+(\d+)/i)
     if (m) msg = `requested ${m[1]} tokens, can afford ${m[2]}`
+    // Strip credentials before the cap: redaction must not be defeated by the
+    // truncation below, and the cap would otherwise preserve a partial key.
+    msg = redactSecrets(msg).trim()
     // Hard cap: keep the injected cause small even after stripping.
     if (msg.length > 90) msg = msg.slice(0, 87) + "…"
     const parts = [name, typeof code === "number" ? `HTTP ${code}` : "", msg].filter(Boolean)
@@ -2909,7 +2933,10 @@ export const createEngine = async ({ client }) => {
     const kind = classify(error)
     const detail = describeErr(error)
     log("warn", `session error (${kind})`, {
-      sessionID, name: error?.name, statusCode: error?.data?.statusCode, message: error?.data?.message,
+      sessionID, name: error?.name, statusCode: error?.data?.statusCode,
+      // Raw provider text can echo the credential that failed. The log is
+      // persisted on disk and mirrored to the server console, so redact.
+      message: redactSecrets(error?.data?.message ?? error?.message ?? ""),
     })
     queueTitleRefresh(sessionID)
     if (kind !== "abort" && kind !== "auth" && kind !== "fatal") {

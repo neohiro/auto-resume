@@ -149,6 +149,53 @@ const baseState = () => ({ prompts: [], logs: [] })
   dispose()
 }
 
+// ---- F1e: provider error text never leaks credentials ----------------------
+// Error text escapes the session: into the plaintext notice drop-file and into
+// OS toast notifications, which render on the lock screen and are mirrored to
+// the cloud on Windows. A key echoed by a provider ("invalid key sk-…") would
+// otherwise be readable by anyone at the machine. describeErrForPrompt strips
+// URLs, which covers "?key=…", but inline secrets survived that.
+{
+  const SECRET_TAIL = {
+    "invalid api key sk-ant-api03-AbCdEf0123456789XyZ": "sk-ant-api03-AbCdEf0123456789XyZ",
+    "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9payloadsig": "eyJhbGciOiJIUzI1NiJ9payloadsig",
+    "api_key=abc123DEF456ghi789": "abc123DEF456ghi789",
+    "gsk_ABCDEFGHIJKLMNOPQRST": "gsk_ABCDEFGHIJKLMNOPQRST",
+    "password: hunter2secret": "hunter2secret",
+  }
+  const state = baseState()
+  const ctx = makeCtx(state, [
+    stepStarted(),
+    ...Object.keys(SECRET_TAIL).map((message) =>
+      stepFailed({ type: "APIError", message, status: 401 })),
+  ], [])
+  const dispose = await plugin.setup(ctx)
+  await sleep(2500)
+
+  const haystack = [
+    ...state.logs,
+    ...state.prompts.map((p) => p.text),
+  ].join("\n")
+  const leaked = Object.values(SECRET_TAIL).filter((token) => haystack.includes(token))
+  ok(leaked.length === 0,
+    `F1e: no credential-shaped value reaches logs or prompts (${leaked.length} leaked)`)
+  ok(!/sk-ant|eyJhbGci|gsk_ABC|hunter2secret/i.test(haystack),
+    "F1e: no recognizable credential prefix survives anywhere in the transcript")
+  dispose()
+
+  // Redaction must not blunt the diagnosis: the prose is what the user reads.
+  const probe = baseState()
+  const ctx2 = makeCtx(probe, [
+    stepStarted(),
+    stepFailed({ type: "APIError", message: "invalid API key", status: 401 }),
+  ], [])
+  const dispose2 = await plugin.setup(ctx2)
+  await sleep(1500)
+  ok(probe.logs.some((l) => /invalid API key/i.test(l)),
+    "F1e: the prose explaining the failure is preserved through redaction")
+  dispose2()
+}
+
 // ---- F2: a retryable 5xx IS recovered with a resume prompt ----------------
 {
   const state = baseState()
