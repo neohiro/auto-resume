@@ -216,6 +216,19 @@ Works anywhere OpenCode runs — **Windows, macOS, Linux** — on **OpenCode 1.x
 
 Tested against OpenCode's event API: `session.error/status/idle/created/updated/deleted/compacted`, `message.updated/removed`, `message.part.updated/removed`, `todo.updated`, `permission.asked/updated/replied`, `server.connected`.
 
+### OpenCode 1.x (legacy)
+
+Development now targets OpenCode 2 exclusively. **v1.16.1 is the final release that supports
+OpenCode 1.x** — it still exports the V1 `AutoResumePlugin` hook, so it keeps working on the old
+client. If you're on OpenCode 1, pin to that tag rather than tracking `main`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/neohiro/auto-resume/v1.16.1/auto-resume.js \
+  -o ~/.config/opencode/plugins/auto-resume.js
+```
+
+Later releases are not guaranteed to keep the V1 export. On OpenCode 2, always use `main`.
+
 ### OpenCode 2 support
 
 OpenCode 2 does not run V1 plugin implementations — a V1 module fails to load with
@@ -269,6 +282,37 @@ transport-encoding drift cannot silently disable recovery.
 - V2 removed `client.app.log`. Log lines fall back to the server console; the plugin's own
   notice drop-file (`auto-resume-notices.jsonl`) and OS notifications are unaffected.
 
+### Why each recovery message is different
+
+A single generic "a provider turn failed, continue" prompt is wrong for most failures — the
+remedy differs, and giving the wrong remedy makes the model do the wrong thing. Each failure
+shape therefore gets its own message:
+
+| Failure | What the model is told |
+|---|---|
+| Transport drop (`ECONNRESET`, DNS, TLS, socket hang) | Resume mid-token; your reasoning wasn't rejected and your output is still in the transcript |
+| Provider 5xx / 529 / gateway | Same request, same plan — the provider is unhealthy, not your request |
+| Rate limited (429) | The actual retry window and provider name, plus: land a complete verified increment so a second throttle can't lose everything |
+| Quota / credits exhausted, no alternate model | Spend what's left finishing work in flight; start nothing new; keep replies tight |
+| Safety filter (V2 reports the finish reason directly) | Repeating verbatim will be blocked again — reframe, or complete everything else and state what you skipped |
+| Context overflow → compaction | Compaction is expected, nothing was lost, do **not** restart the task |
+| Stall while a tool was still running | Check whether the tool already landed before re-running it — a repeated migration or deploy is the expensive mistake |
+| Truncated output (`finish: "length"`) | Resume at the cut point; don't re-emit finished code; split the work if it won't fit |
+
+OpenCode 2 is what makes several of these possible. It exposes the provider's own account of a
+failure that V1 only hinted at through error strings:
+
+- `Session.Message.Assistant.finish` — a first-class reason (`stop` / `length` / `tool-calls` /
+  `content-filter` / `error` / `unknown`). The content-filter case is only detectable this way.
+- `session.status` → `{ type: "retry", attempt, message, action: { reason, provider, title, link }, next }` —
+  the provider's own reason, its name, and the moment it will try again. The rate-limit prompt
+  quotes these directly instead of guessing.
+- `Session.Message.Assistant.retry` — how many times the core already retried before giving up.
+- `Session.StructuredError` — `{ type, message, status }` instead of a message-string blob.
+
+A failure the plugin genuinely cannot attribute is **not** retried; it's surfaced. Hammering a
+request the provider refused for a reason we can't name wastes quota and hides the problem.
+
 ### Permission payload shapes
 
 The autopilot tolerates every known shape; the source of truth lives in [`tests/fixtures/permission-shapes.json`](tests/fixtures/permission-shapes.json) and every entry is asserted on each test run:
@@ -286,10 +330,10 @@ Reply delivery probes the SDK surface (`postSessionByIdPermissionsByPermissionId
 
 ```sh
 git clone https://github.com/neohiro/auto-resume && cd auto-resume
-npm test        # <!-- coverage -->260+ assertions across 12 suites<!-- /coverage --> (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
+npm test        # <!-- coverage -->280+ assertions across 13 suites<!-- /coverage --> (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
 ```
 
-The Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/v2entry.mjs` drives the **V2 default export** against a mock V2 plugin context — the recovery path across all three event-stream encodings, permission autopilot, message normalization, and the cross-message plan fallback that replaces the removed `todowrite` tool. `tests/reanimate.mjs` covers **restart auto-resume** specifically: that an interrupted session is revived on V1, on V2 without any `session.list()`, on the first boot after a self-update, and that sessions the user stopped or that are empty are left alone. `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
+The Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/v2entry.mjs` drives the **V2 default export** against a mock V2 plugin context — the recovery path across all three event-stream encodings, permission autopilot, message normalization, and the cross-message plan fallback that replaces the removed `todowrite` tool. `tests/reanimate.mjs` covers **restart auto-resume** specifically: that an interrupted session is revived on V1, on V2 without any `session.list()`, on the first boot after a self-update, and that sessions the user stopped or that are empty are left alone. `tests/prompts.mjs` pins **message routing**: that each failure shape reaches its own message, that the V2 retry window and provider name reach the rate-limit prompt, that a content-filtered turn is reframed rather than repeated, and that an unattributable failure is not blindly retried. `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
 
 ### Windows unattended notes (UAC / SmartScreen)
 

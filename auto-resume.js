@@ -201,7 +201,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.16.1"
+const AUTO_RESUME_VERSION = "1.17.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -410,7 +410,99 @@ const AUTONOMY_DIRECTIVE_TIGHT =
  *  so the same words don't repeat across every prompt. */
 const QUALITY = " Senior-grade output: verify (build/test/lint) before claiming done. No TODOs, no apology, no recap. Exceed expectations."
 
+/** "Your own prior output is still in the transcript" — the single most useful
+ *  thing to tell a model resuming a cut-off turn. Models that suspect a fresh
+ *  context re-plan, re-read files, and re-explain; those tokens are wasted and
+ *  the user sees a redundant recap. Say it once, centrally. */
+const TRANSCRIPT_INTACT =
+  " Everything you already wrote this turn is still in the transcript — resume mid-thought, don't re-plan, don't re-read what you've already read, don't restate finished code."
+
+/** Format a provider-supplied retry window (ms) as a human duration. */
+const fmtWait = (ms) => {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) return ""
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.round(s / 60)
+  return m <= 90 ? `${m}min` : `${(m / 60).toFixed(1)}h`
+}
+
 const PROMPTS = {
+  /* ── Recovery: one prompt per *distinct* failure shape ──────────────────────
+   * These used to collapse into a single "a provider turn failed" message.
+   * That is the wrong trade: the remedy differs per failure, and a model given
+   * the wrong remedy does the wrong thing — it re-plans when it should resume,
+   * or retries verbatim when it must rephrase. Each entry below states the one
+   * thing that actually fixes that failure mode.
+   */
+
+  /** Transport dropped (ECONNRESET / DNS / TLS / fetch failed / socket hang).
+   *  Nothing about the work was rejected — only the pipe broke. The correct
+   *  behaviour is the *smallest* possible re-entry: resume the exact token. */
+  networkDrop: (auto, detail, hint) =>
+    `${RESUME_TAG} Auto-resume. The connection dropped mid-turn — a transport fault, not a rejection.` +
+    (detail ? ` Cause: "${detail}".` : "") +
+    (hint?.provider ? ` Provider: ${hint.provider}.` : "") +
+    ` Your request was fine and your reasoning was not at fault. Do not re-plan, re-summarise, or re-derive what you had already worked out.` +
+    TRANSCRIPT_INTACT,
+
+  /** Provider-side 5xx / 529 / gateway / overload. The request is valid; the
+   *  provider is unhealthy. Identical remedy to a transport drop, but naming
+   *  the cause stops the model from suspecting its own request was malformed. */
+  providerDown: (auto, detail, hint) =>
+    `${RESUME_TAG} Auto-resume. The provider's servers failed (${(detail || "5xx / overloaded").slice(0, 80)}) — your request was not at fault.` +
+    (hint?.provider ? ` Provider: ${hint.provider}.` : "") +
+    ` Retry the same work the same way; don't simplify or defensively rewrite the request.` +
+    TRANSCRIPT_INTACT,
+
+  /** 429 / throttle. The critical detail is the *wait*: a model told "rate
+   *  limited" without a window tends to either stall or immediately re-do the
+   *  heaviest part. Also worth steering toward landing an increment so a
+   *  second throttle can't lose everything. */
+  rateLimited: (auto, detail, hint) =>
+    `${RESUME_TAG} Auto-resume. Rate limited.` +
+    (hint?.provider ? ` Provider: ${hint.provider}.` : "") +
+    (hint?.retryWait ? ` Retry window: ~${hint.retryWait}.` : "") +
+    (hint?.reason ? ` Provider says: "${String(hint.reason).slice(0, 90)}".` : (detail ? ` Cause: "${detail}".` : "")) +
+    ` Nothing is wrong with your work and nothing was lost.` +
+    ` If the remaining work is large, land a complete, verified increment first, then continue.` +
+    TRANSCRIPT_INTACT,
+
+  /** 402 / free tier / insufficient credits with no alternate model available.
+   *  Budget is the binding constraint, so the instruction is about *spending*
+   *  it: finish what is in flight, start nothing new, keep replies tight. */
+  quotaExhausted: (auto, detail, hint) =>
+    `${RESUME_TAG} Auto-resume on an exhausted quota/credit balance, with no alternate model available.` +
+    (detail ? ` Cause: "${detail}".` : "") +
+    ` Spend what remains on the highest-value work: finish and verify what is already in flight rather than starting anything new.` +
+    ` Keep replies tight — no preamble, no restated context, no unchanged code blocks. Edits over rewrites, diffs over restatement.`,
+
+  /** Provider safety filter stopped the turn. Retrying verbatim is guaranteed
+   *  to fail again and burns quota, so the message's whole job is to change the
+   *  framing rather than the work. Only reachable on OpenCode 2, which reports
+   *  the finish reason directly instead of burying it in an error string. */
+  contentFilter: () =>
+    `${RESUME_TAG} Auto-resume. Your previous reply was stopped by the provider's safety filter — not by length, quota, or a network fault.` +
+    ` Repeating it verbatim will be blocked again.` +
+    ` Reframe the request in neutral, task-focused terms and continue with the parts that do not touch the blocked content.` +
+    ` If the blocked portion is not essential to the user's goal, complete everything else and state plainly what you skipped and why. Do not stall on it.`,
+
+  /** Context overflow → compaction → resume. Without this the model treats the
+   *  truncated history as corruption and frequently restarts the task from
+   *  scratch, which is the single most expensive failure mode after compaction. */
+  afterCompaction: () =>
+    `${RESUME_TAG} Auto-resume. The conversation exceeded the context window, so earlier turns were compacted into a summary.` +
+    ` This is normal — nothing was lost from the codebase, and the recent turns plus the summary are intact.` +
+    ` Do NOT restart the task or re-derive earlier decisions; the summary already carries them.` +
+    ` Re-read only the specific files you still need, then continue from exactly where you stopped.`,
+
+  /** The turn was aborted while a tool was still running. The tool may well
+   *  have completed its work, so blind re-execution is the expensive mistake
+   *  (and can double-apply a migration or re-run a deploy). */
+  stalledInTool: () =>
+    `${RESUME_TAG} Auto-resume. The turn stalled while a tool call was still running and was aborted waiting on it.` +
+    ` Before re-running anything, check whether it already landed — read the file, check the process, or query the result.` +
+    ` Re-executing a completed side-effecting tool can double-apply it. If it did not land, re-run that one step; otherwise continue past it.`,
+
   retry: (attempt) => {
     // Later attempts get terser: a model stuck in a retry loop tends to
     // re-emit a recap when the prompt grows, so shorten as we escalate.
@@ -424,6 +516,9 @@ const PROMPTS = {
     return `${RESUME_TAG} Auto-retry #${attempt}. Self-healing; the previous turn was busy ~60s with no output and got aborted.` +
       ` Pick up exactly where you stopped; finish production-grade.`
   },
+  /** Generic fallback. Only reached for a failure we cannot attribute to a
+   *  specific cause; the dedicated variants above carry the actionable advice,
+   *  so this stays deliberately non-committal rather than guessing. */
   resume: (auto, detail, modelNote) =>
     `${RESUME_TAG} Auto-resume. A provider turn failed (network / 5xx / rate-limit / timeout / quota).` +
     (detail ? ` Cause: "${detail}".` : "") +
@@ -437,35 +532,51 @@ const PROMPTS = {
     ` Lead with the answer, justify concisely. Skip preamble, restated context, and unchanged code blocks. Edits > rewrites; diffs > restatements. Tight prose, minimal code, no corners cut on correctness or verification. Quality bar above user expectations.` +
     (auto ? AUTONOMY_DIRECTIVE_TIGHT : ""),
   truncated: (auto) =>
-    `${RESUME_TAG} Last reply hit max output length and was cut off. Continue seamlessly from the cut point. Close any half-open block/sentence first, then finish. Code must be whole + runnable, not fragmentary.`,
+    `${RESUME_TAG} Last reply hit the provider's max output length and was cut off mid-stream — not a content rejection.` +
+    ` Continue from the exact cut point: if a block or sentence is half-written, close it first.` +
+    ` Do not re-emit code you have already written — finish the remainder and move on.` +
+    ` If the remaining work will not fit in one reply, split it: land a complete increment, then continue.`,
   empty: (auto) =>
-    `${RESUME_TAG} Previous reply came back empty (likely a transient provider hiccup). Answer the original request now: concise, precise, production-grade.`,
+    `${RESUME_TAG} Previous reply came back empty — zero content — which is a transient provider hiccup, not a judgement on the request.` +
+    ` Answer the original request now: lead with the substance, concise and precise.` +
+    ` If you already produced the answer earlier in this session, restate that result rather than redoing the work.`,
   todos: () =>
-    `${RESUME_TAG} Session idle, todos unfinished. Pick up the remaining items autonomously, one by one: work the list you set yourself (tool-tracked todos where the client provides them, otherwise the checklist you wrote inline), implement each end-to-end (code + tests + docs where they matter), verify (build/test/lint), then mark or tick each item complete. Hold the bar above industry standards — edges, errors, clean integration — until the list is flawless. If everything is already done, say so in one line and stop.`,
+    `${RESUME_TAG} Session idle, todos unfinished. Work the list you set yourself (tool-tracked todos where the client provides them, otherwise the checklist you wrote inline), one item at a time:` +
+    ` implement each end-to-end (code + tests + docs where they matter), verify it actually runs, then tick it off before moving on — don't batch ticks at the end.` +
+    ` If an item turns out to be wrong, blocked, or already done, say which and why rather than forcing it.` +
+    ` If everything is genuinely done, say so in one line and stop.`,
   proceed: () =>
-    `${RESUME_TAG} Proceed autonomously with what you just proposed/asked — answer is yes. Decide and continue.` +
-    ` Execute end-to-end at senior level: full impl + tests + error handling + doc touches, verified against the real toolchain. Aim to exceed expectations.` +
+    `${RESUME_TAG} Proceed autonomously with what you just proposed/asked — the answer is yes.` +
+    ` Don't restate the question or ask it again. Finish the work end-to-end — full implementation, tests, error handling, doc touches — verified against the real toolchain.` +
+    ` If a decision genuinely can't be made without input, take the safe call, document the assumption in one line, and keep going.` +
     AUTONOMY_DIRECTIVE,
   proceedAll: () =>
     `${RESUME_TAG} You asked "which of these should I tackle first?" — autonomous answer: do ALL of them, one by one, end-to-end.` +
-    ` Pick the most foundational first (whichever other proposals depend on, or the one with the broadest blast radius); build, test, lint, commit, then move to the next.` +
-    ` Don't ask for sign-off between proposals; don't stop to summarize between proposals; just drive them to completion in order.` +
-    ` If a proposal is genuinely risky or ambiguous, implement the safe core and document the assumption in one line — do not stop.` +
+    ` Order them by dependency: whatever unblocks the others first, then the widest blast radius, then the cheapest wins.` +
+    ` Build, test, lint, commit, then move to the next. No sign-off between items, no summary between items — just drive them to completion in order.` +
+    ` If one is genuinely risky or ambiguous, implement the safe core, note the assumption in one line, and continue.` +
     AUTONOMY_DIRECTIVE,
   keepGoing: () =>
-    `${RESUME_TAG} You paused mid-work ("continue", "finalize", etc.) — indicating there is still work to do. Pick up now and drive to perfect finalization: finish remaining steps, verify (build/test/lint), nothing half-done. Production-grade, not partial.` +
+    `${RESUME_TAG} You paused mid-work ("continue", "finalize", etc.), indicating there is still work to do.` +
+    ` Pick up at the exact point you stopped and drive it to full finalization: finish every remaining step, verify (build/test/lint), leave nothing half-done.` +
+    ` Don't ask whether to continue — that was the question you already answered.` +
     AUTONOMY_DIRECTIVE,
   debug: () =>
-    `${RESUME_TAG} Multiple tool calls failed. Stop the failing approach. Root-cause: read the FULL error (not just the first line), inspect the actual files/state, form ONE concrete hypothesis, apply the smallest targeted fix for the real cause, prove it (re-run the failing command), add a regression test so this class stays dead.`,
+    `${RESUME_TAG} Multiple tool calls failed in a row. Stop retrying the failing approach.` +
+    ` Root-cause it: read the FULL error (not the first line — the actionable cause is often below it), inspect the real files/state, form ONE concrete hypothesis.` +
+    ` Apply the smallest targeted fix for the actual cause, prove it by re-running the same command, and add a regression test so this class stays dead.` +
+    ` If the same error persists after the fix, the hypothesis was wrong — state what you ruled out before trying a different one, rather than cycling blindly.`,
   improve: (cycle, total) =>
-    `${RESUME_TAG} Self-improvement pass ${cycle}/${total}. Review all work this session as a principal engineer signing off a release.` +
-    ` Hunt concrete gains: correctness, perf, security, robustness, readability — unhandled edges, missing input validation, races, leaks, stale docs/comments, thin test coverage on critical paths, inefficient hot spots, style inconsistencies.` +
-    ` Implement what you're confident about and validate (build/test/lint/typecheck). Skip ambiguous/risky items; one-line note why. No new features — raise existing work above industry standards, beyond what the user asked for.`,
+    `${RESUME_TAG} Self-improvement pass ${cycle}/${total}. Review this session's work as a principal engineer signing off a release.` +
+    ` Hunt concrete gains: correctness, perf, security, robustness, readability — unhandled edges, missing input validation, races, resource leaks, stale docs/comments, thin coverage on critical paths, inefficient hot spots, style inconsistencies.` +
+    ` Prioritise by real risk, not by how easy the fix is. Implement what you're confident about and validate (build/test/lint/typecheck); skip ambiguous/risky items with a one-line reason.` +
+    ` No new features — raise existing work above industry standards, beyond what the user asked for.` +
+    ` If you find nothing worth changing, say so and stop rather than inventing busywork.`,
   propose: () =>
-    `${RESUME_TAG} Todos/plan complete, flawless execution. Do NOT implement more. Don't summarize the work. Wrap-up = NEW info only:` +
-    ` (1) Verification status — what you ran (build/test/lint/typecheck) and results; flag anything unverified.` +
-    ` (2) Known limitations, risks, assumptions a reviewer should know.` +
-    ` (3) Up to 3 follow-up improvement proposals, each with expected payoff — aim above user expectations.`,
+    `${RESUME_TAG} Todos/plan complete. Do NOT implement more and don't summarise the work. Wrap-up = NEW information only:` +
+    ` (1) Verification status — exactly what you ran (build/test/lint/typecheck) and the result; flag anything you could not verify.` +
+    ` (2) Known limitations, risks, and assumptions a reviewer should know — including anything you deliberately skipped.` +
+    ` (3) Up to 3 follow-up improvement proposals, each with its expected payoff. Rank them; don't pad the list.`,
 }
 
 const NETWORK_PATTERNS = [
@@ -2089,6 +2200,54 @@ export const AutoResumePlugin = async ({ client, $ }) => {
    *  - rotated: true if we already swapped to a new model for this resume
    *  - rotatedFrom: modelKey of the old model (null if no rotation)
    *  Returns (auto) => string. */
+  /** Split the generic "retryable" bucket into the two causes that need
+   *  *opposite* advice from the model. A transport fault (ECONNRESET, DNS,
+   *  TLS, socket hang) means "resume at the exact token"; a provider 5xx/529
+   *  means "the same request will fail identically, so wait and retry
+   *  unchanged". Collapsing them — as they were — produces a prompt that is
+   *  half right in both directions.
+   *
+   *  HTTP status wins when present, because it is the provider's own verdict
+   *  rather than our reading of an error string. */
+  const splitRetryable = (error) => {
+    const code = Number(error?.data?.statusCode ?? error?.status)
+    if (typeof code === "number" && Number.isFinite(code)) {
+      if (code === 429) return "rate_limit"
+      if (code === 402) return "quota"
+      if (code === 408) return "timeout"
+      if (code >= 500) return "provider"
+      if (code === 401 || code === 403) return "auth"
+      if (code >= 400) return "fatal"
+    }
+    const text = `${error?.data?.message ?? ""} ${error?.data?.responseBody ?? ""} ${error?.message ?? ""}`
+    if (matchesAny(text, RATE_LIMIT_PATTERNS)) return "rate_limit"
+    if (matchesAny(text, QUOTA_PATTERNS)) return "quota"
+    if (matchesAny(text, OVERFLOW_PATTERNS)) return "overflow"
+    // 5xx / gateway / overload phrasings that arrive without a status code.
+    if (/\b(50[0-9]|52[0-9]|529)\b/.test(text) ||
+        matchesAny(text, ["bad gateway", "service unavailable", "internal server error",
+                          "overloaded", "gateway", "upstream"])) {
+      return "provider"
+    }
+    if (matchesAny(text, NETWORK_PATTERNS)) return "network"
+    return "network"
+  }
+
+  /** Build the provider-facing hint block the V2 adapter attaches (rate-limit
+   *  window, provider name, the provider's own reason). V1 cores attach
+   *  nothing, so this is simply an empty hint there. */
+  const v2Hint = (error) => {
+    const d = error?.data ?? {}
+    const retryNext = d.retryNext
+    const wait = retryNext && retryNext > Date.now() ? fmtWait(retryNext - Date.now()) : ""
+    return {
+      provider: d.retryProvider,
+      reason: d.retryReason,
+      attempt: d.retryAttempt,
+      retryWait: wait,
+    }
+  }
+
   const buildResumePrompt = (sessionID, kind, error, rotated, rotatedFrom) => {
     // prompt-facing cause: compact, URL/help-text stripped, OpenRouter
     // "requested N tokens, can afford M" rewritten as a one-liner.
@@ -2098,8 +2257,21 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const modelNote = rotated && rotatedFrom && nowKey && rotatedFrom !== nowKey
       ? `You are now on a different model (${nowKey}).`
       : ""
+    const hint = v2Hint(error)
+    // Pick the prompt that matches the actual failure shape. Every branch here
+    // carries advice the generic one cannot give.
     if (kind === "quota" && isCreditsConstraint(error)) {
       return (a) => PROMPTS.lowBudget(a, detail, modelNote)
+    }
+    if (kind === "rate_limit") return (a) => PROMPTS.rateLimited(a, detail, hint)
+    if (kind === "quota") return (a) => PROMPTS.quotaExhausted(a, detail, hint)
+    if (kind === "retryable") {
+      const sub = splitRetryable(error)
+      if (sub === "provider") return (a) => PROMPTS.providerDown(a, detail, hint)
+      if (sub === "timeout") return (a) => PROMPTS.providerDown(a, detail, hint)
+      if (sub === "network") return (a) => PROMPTS.networkDrop(a, detail, hint)
+      if (sub === "rate_limit") return (a) => PROMPTS.rateLimited(a, detail, hint)
+      if (sub === "quota") return (a) => PROMPTS.quotaExhausted(a, detail, hint)
     }
     return (a) => PROMPTS.resume(a, detail, modelNote)
   }
@@ -3220,6 +3392,26 @@ export const AutoResumePlugin = async ({ client, $ }) => {
     const hasContent = (lastAssistant.parts ?? []).some((p) => ["text", "tool", "reasoning"].includes(p?.type))
     const errored = Boolean(info.error)
 
+    /* Provider safety filter stopped the turn. OpenCode 2 reports this as an
+     * explicit finish reason rather than burying it in an error string, so it
+     * is detectable without guessing. It needs its own message: every other
+     * recovery prompt tells the model to *continue*, but a filtered reply will
+     * be filtered again verbatim. The correct remedy is to reframe, or to skip
+     * the blocked part and finish everything else — so drive that directly
+     * instead of letting the generic success/empty paths decide. */
+    if (info.finish === "content-filter" && cfg.autonomy && s.contentFilterFired !== info.id) {
+      s.contentFilterFired = info.id
+      log("warn", "turn stopped by provider content filter", { sessionID, messageID: info.id })
+      if (s.nudges < cfg.maxNudges && budgetLeft(s)) {
+        s.nudges += 1
+        s.chain = 0
+        schedule(sessionID, cfg.nudgeDelayMs, { kind: "contentFilter", prompt: PROMPTS.contentFilter })
+        return
+      }
+      notice(`${RESUME_TAG}: Provider content filter blocked the last reply — finishing around it.`, "warning")
+      return
+    }
+
     if (!errored && hasContent) {
       noteSuccess()
       const curKey = s.currentModel ?? s.lastModel
@@ -3592,8 +3784,17 @@ export const AutoResumePlugin = async ({ client, $ }) => {
         ? cfg.stallTimeoutMs * cfg.runningToolFactor
         : cfg.stallTimeoutMs
       if (nowMs - s.lastActivity < silenceLimit) continue
+      // A stall while a tool was still in flight needs different advice from a
+      // stall on a silent model: the tool may already have applied its effect,
+      // so re-running it can double-apply a migration, re-deploy, or re-send.
+      const stallPlan = s.toolRunning
+        ? { kind: "resume", prompt: PROMPTS.stalledInTool }
+        : undefined
       takeover(sessionID, "stalled stream detected, aborting + resuming",
-        `${RESUME_TAG}: Response appears stuck — restarting it.`)
+        s.toolRunning
+          ? `${RESUME_TAG}: A tool call never returned — checking whether it landed.`
+          : `${RESUME_TAG}: Response appears stuck — restarting it.`,
+        stallPlan)
     }
   }
 
@@ -4188,7 +4389,10 @@ export const AutoResumePlugin = async ({ client, $ }) => {
               s.awaitingCompactionSince = 0
               if (s.compactionTimer) { clearTimeout(s.compactionTimer); s.compactionTimer = null }
               log("info", "compaction done, resuming", { sessionID: p.sessionID })
-              schedule(p.sessionID, 3_000, { kind: "resume", prompt: PROMPTS.resume })
+              // The history was just rewritten into a summary. A generic resume
+              // reads like data loss and makes models restart the task; say
+              // explicitly that compaction is expected and the work is intact.
+              schedule(p.sessionID, 3_000, { kind: "resume", prompt: PROMPTS.afterCompaction })
             }
             break
           }
@@ -4341,6 +4545,11 @@ const v2MessageInfo = (msg, sessionID) => {
     agent: msg.agent,
     error: v2ErrorToV1(msg.error),
     finish: msg.finish ?? msg.rawFinish,
+    rawFinish: msg.rawFinish ?? msg.finish,
+    // V2 records how many times the core already retried this turn, and why.
+    // The provider's own retry counter is a far better signal than inferring
+    // "it has been failing" from repeated identical errors.
+    retry: msg.retry,
     cost: msg.cost,
     tokens: msg.tokens,
     time: msg.time,
@@ -4443,6 +4652,39 @@ const buildV2Client = (ctx, hooks) => {
   const statusBySession = new Map()
   const setStatus = (sessionID, type) => {
     if (sessionID && type) statusBySession.set(sessionID, type)
+  }
+
+  /* OpenCode 2 publishes a far richer "why is this session still going" signal
+   * than V1 ever did. While a turn is waiting on a provider it emits
+   *   session.status = { type:"retry", attempt, message,
+   *                      action:{ reason, provider, title, message, label, link },
+   *                      next }
+   * `action.reason` / `action.provider` / `action.title` / `action.message` /
+   * `action.link` are authored by the provider, and `next` is the moment the
+   * core will try again. That is precisely the information a resume prompt
+   * should carry: "rate limited, wait 40s" beats a generic "a provider turn
+   * failed". Capture the latest per session and fold it into the error the
+   * engine classifies, so the prompt builder can quote it. V1 cores have no
+   * equivalent, so this is a no-op there. */
+  const retryStatusBySession = new Map()
+  const rememberRetryStatus = (sessionID, status) => {
+    if (!sessionID || !status || status.type !== "retry") return
+    retryStatusBySession.set(sessionID, status)
+  }
+  const retryHint = (sessionID) => {
+    const st = retryStatusBySession.get(sessionID)
+    if (!st) return null
+    const action = st.action ?? {}
+    return {
+      attempt: typeof st.attempt === "number" ? st.attempt : undefined,
+      next: typeof st.next === "number" ? st.next : undefined,
+      reason: action.reason ?? st.message,
+      provider: action.provider,
+      title: action.title,
+      detail: action.message,
+      label: action.label,
+      link: action.link,
+    }
   }
 
   // Track assistant-message state so `session.message()` can answer for a
@@ -4663,14 +4905,14 @@ const buildV2Client = (ctx, hooks) => {
   // Expose the same reply helper at the client root (the engine probes both).
   facade.postSessionIdPermissionsPermissionId = facade.session.respondToPermission
 
-  return { client: facade, setStatus, remember, messageCache, statusBySession }
+  return { client: facade, setStatus, remember, rememberRetryStatus, retryHint, messageCache, statusBySession }
 }
 
 export default {
   id: "auto-resume",
   setup: async (ctx) => {
     const hooksForClient = {}
-    const { client, setStatus, remember } = buildV2Client(ctx, hooksForClient)
+    const { client, setStatus, remember, rememberRetryStatus, retryHint } = buildV2Client(ctx, hooksForClient)
 
     // Instantiate the V1 engine against the bridged client.
     const engine = await AutoResumePlugin({ client })
@@ -4695,6 +4937,7 @@ export default {
       // Feed the status cache before normalizing.
       if (type === "session.status" && payload.sessionID) {
         setStatus(payload.sessionID, payload.status?.type ?? "unknown")
+        rememberRetryStatus(payload.sessionID, payload.status)
       } else if (type === "session.idle" && payload.sessionID) {
         setStatus(payload.sessionID, "idle")
       } else if (type === "message.updated" && payload.sessionID && payload.info) {
@@ -4712,7 +4955,21 @@ export default {
       }
 
       if (type === "session.error") {
-        properties = { ...payload, error: v2ErrorToV1(payload.error) }
+        const normalized = v2ErrorToV1(payload.error)
+        // Fold in V2's own account of the failure so the resume prompt can quote
+        // the provider's reason instead of guessing from the message text.
+        const hint = retryHint(payload.sessionID)
+        const attempts = payload.error?.retry?.attempt ?? payload.info?.retry?.attempt ?? hint?.attempt
+        if (normalized && typeof normalized === "object" && (hint || attempts)) {
+          normalized.data = {
+            ...(normalized.data ?? {}),
+            retryAttempt: attempts,
+            retryNext: hint?.next,
+            retryReason: hint?.reason ?? hint?.title ?? hint?.detail,
+            retryProvider: hint?.provider,
+          }
+        }
+        properties = { ...payload, error: normalized }
       } else if (type === "permission.asked" || type === "permission.updated") {
         properties = v2PermissionToV1(payload)
       }
