@@ -201,7 +201,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.18.0"
+const AUTO_RESUME_VERSION = "1.19.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -4221,12 +4221,35 @@ export const AutoResumePlugin = async ({ client, $ }) => {
                 detach(reanimate, "reanimate-activity")
               }
             }
-            // Capture model from assistant messages for resume fidelity
-            if (info.role === "assistant" && info.modelID) {
+            // Capture model + spend from assistant messages.
+            if (info.role === "assistant") {
               const s = state(info.sessionID)
-              const seen = { providerID: info.providerID, modelID: info.modelID }
-              s.originalModel = s.originalModel ?? seen
-              s.lastModel = seen
+              if (info.modelID) {
+                const seen = { providerID: info.providerID, modelID: info.modelID }
+                s.originalModel = s.originalModel ?? seen
+                s.lastModel = seen
+              }
+              /* Accumulate spend against the per-task cost cap
+               * (OPENCODE_AUTOPILOT_MAX_COST_USD).
+               *
+               * This used to never happen: taskCost was initialised to 0 and
+               * compared against the cap, but nothing ever added to it, so the
+               * cap could not trip and the "paused - cost cap" title state and
+               * the cap notice were unreachable. Accumulate on the assistant
+               * message, which is where the provider reports turn cost.
+               *
+               * Guarded because message.updated can be re-delivered: count a
+               * given message once, or a re-render inflates the total and halts
+               * a healthy task. */
+              const cost = Number(info.cost)
+              if (Number.isFinite(cost) && cost > 0) {
+                if (!s.countedCostMessageIds) s.countedCostMessageIds = new Set()
+                const costMsgID = info.id
+                if (!costMsgID || !s.countedCostMessageIds.has(costMsgID)) {
+                  if (costMsgID) s.countedCostMessageIds.add(costMsgID)
+                  s.taskCost = (s.taskCost ?? 0) + cost
+                }
+              }
             }
             break
           }
@@ -5015,9 +5038,12 @@ export default {
       const payload = v2EventPayload(ev) ?? {}
       let properties = payload
       const sessionID = payload.sessionID ?? payload.durable?.aggregateID ?? null
+      if (sessionID) lastSeenBySession.set(sessionID, Date.now())
 
       /* ── native V2 vocabulary ─────────────────────────────────────────── */
-      if (type.startsWith("session.step.")) {
+      // session.step.failed carries the provider error and is handled in the
+      // failure block below; it must not fall into the ordinary step branch.
+      if (type.startsWith("session.step.") && type !== "session.step.failed") {
         if (!sessionID) return
         cancelIdle(sessionID)
         if (type === "session.step.started") {
@@ -5062,6 +5088,85 @@ export default {
         return
       }
 
+      /* ── failure events (the ones that actually carry a provider error) ──
+       *
+       * A rejected request — "Provider request failed with HTTP 403", 429, 5xx,
+       * a network drop — arrives as session.step.failed carrying a structured
+       * error. This mapping was absent, so every provider failure looked
+       * identical to a silent stall: nothing was detected, and the think-stall
+       * watchdog fired ~60s later with a misleading "busy with no output"
+       * message instead of the actual cause. */
+      if (type === "session.step.failed" || type === "session.execution.failed") {
+        if (!sessionID) return
+        cancelIdle(sessionID)
+        const raw = payload.error ?? {
+          type: "ProviderError",
+          message: payload.rawFinish ?? payload.message ?? "provider request failed",
+          status: payload.status,
+        }
+        const normalized = v2ErrorToV1(raw)
+        const hint = retryHint(sessionID)
+        if (normalized && typeof normalized === "object") {
+          normalized.data = {
+            ...(normalized.data ?? {}),
+            statusCode: normalized.data?.statusCode ?? raw.status ?? raw.statusCode,
+            retryAttempt: payload.attempt ?? raw.attempt ?? hint?.attempt,
+            retryNext: hint?.next,
+            retryReason: hint?.reason ?? payload.rawFinish,
+            retryProvider: raw.provider ?? hint?.provider,
+          }
+        }
+        // A content-filter stop is not a provider failure to retry: the engine
+        // has a dedicated reframe path for it in idle evaluation. Let the turn
+        // end and let that run instead of injecting a generic error resume.
+        const filtered = payload.finish === "content-filter" ||
+          normalized?.name === "ContentFilterError"
+        // A failed step is definitively over: the turn cannot continue, so mark
+        // the session idle immediately. Without this the engine's injection guard
+        // still sees "busy" and defers the recovery prompt by a full poll
+        // interval, which reads to the user as the plugin not reacting.
+        setStatus(sessionID, "idle")
+        if (!filtered) synth("session.error", { sessionID, error: normalized })
+        // The turn is over either way, so evaluate idle state.
+        armIdle(sessionID)
+        return
+      }
+
+      /* An execution interrupt is NOT surfaced as an error on purpose. It fires
+       * for both a user Stop and our own takeover, and the engine already
+       * distinguishes them from the stored assistant message (isAbortError ->
+       * markUserStopped). Synthesising an error here would let a genuine user
+       * Stop be "recovered" from, which is exactly the behaviour the plugin
+       * promises never to do. Just let the turn end. */
+      if (type === "session.execution.interrupted") {
+        if (!sessionID) return
+        cancelIdle(sessionID)
+        armIdle(sessionID)
+        return
+      }
+
+      /* A compaction that failed leaves the turn unfinished. Surface it so the
+       * overflow path can act rather than sitting on a half-summarised context. */
+      if (type === "session.compaction.failed") {
+        if (!sessionID) return
+        synth("session.error", {
+          sessionID,
+          error: v2ErrorToV1(payload.error ?? {
+            type: "CompactionError",
+            message: payload.message ?? "compaction failed",
+            status: payload.status,
+          }),
+        })
+        return
+      }
+
+      if (type === "session.deleted") {
+        if (!sessionID) return
+        synth("session.deleted", { sessionID })
+        return
+      }
+
+
       if (type.startsWith("session.tool.")) {
         if (!sessionID) return
         cancelIdle(sessionID)
@@ -5077,7 +5182,7 @@ export default {
           status = "running"
         } else if (type === "session.tool.success") {
           status = metaStatus === "error" ? "error" : "completed"
-        } else if (type === "session.tool.error" || type === "session.tool.failure") {
+        } else if (type === "session.tool.failed" || type === "session.tool.error" || type === "session.tool.failure") {
           status = "error"
         }
         if (!status) return
@@ -5269,10 +5374,18 @@ export default {
     const sweepState = new Map() // sessionID -> last assistant message id handled
     const SWEEP_MS = 15_000
     const SWEEP_MAX = 4
+    const SWEEP_WINDOW_MS = 10 * 60_000
+    // Last time we observed ANY event for a session, so the sweep can revisit
+    // sessions that have since gone idle.
+    const lastSeenBySession = new Map()
     const sweep = async () => {
       if (typeof client?.session?.context !== "function" && typeof ctx.session?.context !== "function") return
-      const candidates = [...statusBySession.entries()]
-        .filter(([, st]) => st === "busy" || st === "retry" || st === "unknown")
+      const candidates = [...new Set([...statusBySession.keys(), ...lastSeenBySession.keys()])]
+        // Not filtered by status: a session halted by a hard provider
+        // rejection goes idle, so a busy/retry filter missed exactly the
+        // failures this sweep exists to catch.
+        .filter((id) => (lastSeenBySession.get(id) ?? 0) > Date.now() - SWEEP_WINDOW_MS)
+        .sort((a, b) => (lastSeenBySession.get(b) ?? 0) - (lastSeenBySession.get(a) ?? 0))
         .slice(0, SWEEP_MAX)
       for (const [sessionID] of candidates) {
         try {
