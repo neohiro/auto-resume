@@ -201,7 +201,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.19.3"
+const AUTO_RESUME_VERSION = "1.19.4"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -5115,7 +5115,8 @@ export default {
 
     // Tool-failure tracking, so the engine's debug nudge still works. V2 splits
     // a tool call across several events; only the terminal ones matter here.
-    const toolState = new Map() // `${sessionID}|${callID}` -> status
+    // The status is handed straight to the engine as a message.part.updated —
+    // no per-call state is retained here, so this path allocates nothing.
 
     const dispatch = (ev) => {
       const type = ev?.type
@@ -5262,12 +5263,10 @@ export default {
         return
       }
 
-
       if (type.startsWith("session.tool.")) {
         if (!sessionID) return
         cancelIdle(sessionID)
         const callID = payload.id ?? payload.callID ?? ""
-        const key = `${sessionID}|${callID}`
         const metaStatus = payload.metadata?.status ?? payload.state?.status
         let status = null
         if (type === "session.tool.input.started" || type === "session.tool.input.ended") {
@@ -5282,7 +5281,6 @@ export default {
           status = "error"
         }
         if (!status) return
-        toolState.set(key, status)
         // The engine counts tool errors off part updates; replay them through the
         // legacy part shape so the debug-nudge heuristic keeps working.
         synth("message.part.updated", {
@@ -5573,7 +5571,6 @@ export default {
       clearInterval(sweepTimer)
       for (const t of idleArmed.values()) clearTimeout(t)
       idleArmed.clear()
-      toolState.clear()
       // Release the native permission hook. Without this it stays registered on
       // the context after teardown, so a re-initialised plugin would answer
       // permissions twice — once per live hook.
