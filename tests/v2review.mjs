@@ -258,4 +258,58 @@ const baseState = () => ({ prompts: [], logs: [], contextCalls: 0 })
     `R7: a late-resolving registration is released immediately, not leaked (${state.disposed})`)
 }
 
+// ---- R8: after teardown the plugin is inert -------------------------------
+// Every event reaches the engine through one choke point, including the
+// fallback sweep's in-flight iterations. Without a guard there, an event
+// resolving after dispose() still reaches the engine and injects a resume into
+// a session the plugin no longer manages.
+//
+// Control first: the same event, before dispose, must be handled — otherwise a
+// "no prompt" assertion proves nothing.
+{
+  const makeStreamCtx = (state) => {
+    const queue = []
+    let notify = () => {}
+    const nextEvent = () => new Promise((r) => {
+      const v = queue.shift()
+      if (v !== undefined) return r(v)
+      notify = () => { notify = () => {}; r(queue.shift()) }
+    })
+    const ctx = makeCtx(state, [], [])
+    ctx.event.subscribe = async function* () { while (true) yield await nextEvent() }
+    ctx.feed = (e) => { queue.push(e); notify() }
+    return ctx
+  }
+  const errEvent = () => ev("session.error", {
+    sessionID: S,
+    error: { name: "ProviderAuthError", data: { message: "HTTP 403", statusCode: 403 } },
+  })
+
+  // Control: still live, so the error must reach the engine and recover.
+  {
+    const state = baseState()
+    const ctx = makeStreamCtx(state)
+    const dispose = await plugin.setup(ctx)
+    await sleep(250)
+    ctx.feed(errEvent())
+    await sleep(700)
+    ok(state.logs.some((l) => /session error/i.test(l)) || state.prompts.length > 0,
+      `R8: control — a live plugin handles the error (${state.logs.length} logs, ${state.prompts.length} prompts)`)
+    dispose()
+  }
+
+  // After dispose the very same event must be inert.
+  {
+    const state = baseState()
+    const ctx = makeStreamCtx(state)
+    const dispose = await plugin.setup(ctx)
+    await sleep(250)
+    dispose()
+    ctx.feed(errEvent())
+    await sleep(700)
+    ok(!state.logs.some((l) => /session error/i.test(l)) && state.prompts.length === 0,
+      `R8: a disposed plugin handles nothing (${state.logs.length} logs, ${state.prompts.length} prompts)`)
+  }
+}
+
 console.log(process.exitCode ? "V2 REVIEW TESTS FAILED" : "ALL V2 REVIEW TESTS PASSED")

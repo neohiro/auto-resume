@@ -201,7 +201,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.19.2"
+const AUTO_RESUME_VERSION = "1.19.3"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -5079,6 +5079,12 @@ export default {
      * change. Envelope: { id, created, type, durable, location, data }.
      */
     const synth = (type, properties) => {
+      // Single choke point for every event into the engine — the live stream, the
+      // startup reanimation and the fallback sweep all funnel through here.
+      // After teardown the plugin must be inert: an in-flight sweep iteration or
+      // an already-queued event would otherwise still reach the engine and
+      // inject a resume into a session the plugin no longer manages.
+      if (disposed) return
       chain = chain.then(() => handle({ event: { type, properties } })).catch((err) => {
         console.error(`${RESUME_TAG} event handler error:`, err?.message ?? err)
       })
