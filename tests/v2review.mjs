@@ -143,6 +143,7 @@ const baseState = () => ({ prompts: [], logs: [], contextCalls: 0 })
     ["retryStatusBySession", "RETRY_STATUS_MAX"],
     ["sweepState", "SWEEP_STATE_MAX"],
     ["lastSeenBySession", "LAST_SEEN_MAX"],
+    ["messageCache", "MESSAGE_CACHE_MAX"],
   ]
   for (const [mapName, capName] of sessionKeyed) {
     const declares = new RegExp(`const ${mapName} = new Map\\(\\)`).test(src)
@@ -230,6 +231,31 @@ const baseState = () => ({ prompts: [], logs: [], contextCalls: 0 })
     await sleep(100)
     ok(state.disposed === 1, `R6: the native hook is disposed on teardown (disposed ${state.disposed}x)`)
   }
+}
+
+// ---- R7: teardown wins the race against a pending hook registration -------
+// Registration resolves asynchronously, so dispose() can run first. Without an
+// explicit guard the late resolution stores a disposer nobody will call and the
+// hook stays bound to the context forever — the exact leak this pass fixed.
+{
+  const state = { ...baseState(), disposed: 0 }
+  const ctx = makeCtx(state, [], [])
+  let release
+  const pending = new Promise((r) => { release = r })
+  ctx.permission.hook = async () => {
+    await pending // registration deliberately held open
+    return async () => { state.disposed += 1 }
+  }
+
+  const dispose = await plugin.setup(ctx)
+  dispose() // teardown runs BEFORE registration resolves
+  await sleep(50)
+  ok(state.disposed === 0, `R7: nothing to release before registration resolves (${state.disposed})`)
+
+  release() // now let registration complete
+  await sleep(300)
+  ok(state.disposed === 1,
+    `R7: a late-resolving registration is released immediately, not leaked (${state.disposed})`)
 }
 
 console.log(process.exitCode ? "V2 REVIEW TESTS FAILED" : "ALL V2 REVIEW TESTS PASSED")

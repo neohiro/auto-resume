@@ -201,7 +201,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "1.19.1"
+const AUTO_RESUME_VERSION = "1.19.2"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -4768,12 +4768,27 @@ const buildV2Client = (ctx, hooks) => {
 
   // Track assistant-message state so `session.message()` can answer for a
   // single message without a dedicated round trip.
+  //
+  // Bounded: one entry per message ever seen, so without a cap this grows with
+  // total conversation volume for the life of the process. Eviction is safe by
+  // construction — the reader falls back to a live fetch and then to a full
+  // message list, so a miss only ever costs a round trip that was always
+  // possible. Re-inserting before the size check keeps Map's insertion order in
+  // recency order, so the active session's newest messages are what survive.
   const messageCache = new Map() // "sessionID|messageID" -> { info, parts }
+  const MESSAGE_CACHE_MAX = 512
 
   const remember = (msg, sessionID) => {
     const shaped = v2MessageInfo(msg, sessionID)
     if (shaped?.info?.id) {
-      messageCache.set(`${shaped.info.sessionID}|${shaped.info.id}`, shaped)
+      const key = `${shaped.info.sessionID}|${shaped.info.id}`
+      messageCache.delete(key)
+      messageCache.set(key, shaped)
+      while (messageCache.size > MESSAGE_CACHE_MAX) {
+        const oldest = messageCache.keys().next().value
+        if (oldest === undefined) break
+        messageCache.delete(oldest)
+      }
     }
     return shaped
   }
@@ -5033,6 +5048,11 @@ export default {
 
     // The hook's teardown handle, once registration resolves.
     let hookDisposer = null
+
+    // Set by teardown. Registration resolves asynchronously, so dispose() can
+    // run first; without this the late `.then` would store a disposer nobody
+    // will ever call and leave the hook registered on the context forever.
+    let disposed = false
 
     /* ── V2 event vocabulary → the engine's legacy event vocabulary ──────────
      *
@@ -5428,6 +5448,14 @@ export default {
           console.error(`${RESUME_TAG} permission evaluate failed:`, err?.message ?? err)
         }
       }).then((disposeHook) => {
+        if (disposed) {
+          // Teardown already ran while this was in flight. Release the hook now,
+          // or it stays bound to the context for the life of the server.
+          if (typeof disposeHook === "function") {
+            try { void disposeHook() } catch { /* teardown is best-effort */ }
+          }
+          return
+        }
         permissionHookBound = true
         hookDisposer = typeof disposeHook === "function" ? disposeHook : null
       }).catch((err) => {
@@ -5534,6 +5562,7 @@ export default {
     sweepTimer.unref?.()
 
     return () => {
+      disposed = true
       controller.abort()
       clearInterval(sweepTimer)
       for (const t of idleArmed.values()) clearTimeout(t)
