@@ -17,6 +17,13 @@
 //   node tests/v2failures.mjs
 //
 process.env.OPENCODE_RESUME_BASE_DELAY_MS ??= "30"
+// Pin the fast-retry knobs so F1f measures the shipped defaults rather than
+// whatever a developer has in their environment. The suite's tiny BASE_DELAY_MS
+// would otherwise mask the difference and let F1f pass vacuously.
+delete process.env.OPENCODE_RESUME_FAST_RETRY
+delete process.env.OPENCODE_RESUME_FAST_RETRY_BASE_MS
+delete process.env.OPENCODE_RESUME_FAST_RETRY_GROWTH
+delete process.env.OPENCODE_RESUME_FAST_RETRY_MAX_MS
 process.env.OPENCODE_RESUME_RATE_LIMIT_BASE_MS ??= "40"
 process.env.OPENCODE_RESUME_MAX_DELAY_MS ??= "500"
 process.env.OPENCODE_RESUME_NUDGE_DELAY_MS ??= "30"
@@ -207,6 +214,65 @@ const baseState = () => ({ prompts: [], logs: [] })
     "F1e: a rejected resume does not echo the credential back through log or notice")
   ok(/rejected/i.test(rejHaystack), "F1e: the rejection itself is still reported")
   dispose3()
+}
+
+// ---- F1f: transient failures retry fast and consecutively -----------------
+// With rotation off (the default) there is no other model to move to, so the
+// only recovery lever is trying the same one again. Escalating backoff put a
+// two-second 403 behind a 40-second wait.
+//
+// One error yields one resume — the plugin does not blind-fire, it resumes and
+// waits to see the outcome. So consecutive attempts require repeated failures,
+// which is what a persistent outage actually looks like. Drive the mock as a
+// stream so each attempt's failure triggers the next.
+{
+  const state = baseState()
+  const ctx = makeCtx(state, [], [])
+  const stamps = []
+  let notify = () => {}
+  const queue = []
+  const next = () => new Promise((r) => {
+    const v = queue.shift()
+    if (v !== undefined) return r(v)
+    notify = () => { notify = () => {}; r(queue.shift()) }
+  })
+  ctx.event.subscribe = async function* () { while (true) yield await next() }
+  ctx.session.prompt = async (i) => {
+    stamps.push(Date.now())
+    state.prompts.push({ id: i.sessionID, text: i.text })
+    // The resumed attempt fails the same way — that is the outage continuing.
+    queue.push(stepFailed({ type: "APIError", message: "Provider request failed with HTTP 403", status: 403 }))
+    notify()
+    return {}
+  }
+
+  const dispose = await plugin.setup(ctx)
+  queue.push(stepStarted())
+  queue.push(stepFailed({ type: "APIError", message: "Provider request failed with HTTP 403", status: 403 }))
+  notify()
+
+  const deadline = Date.now() + 40_000
+  while (stamps.length < 5 && Date.now() < deadline) await sleep(100)
+  ok(stamps.length >= 5, `F1f: retries keep coming (${stamps.length} attempts)`)
+
+  const gaps = stamps.slice(1).map((t, i) => t - stamps[i])
+  if (gaps.length) {
+    // Ceilings are derived from the shipped fast-retry defaults
+    // (1.2s base, 1.5x growth, 8s cap) plus the +-25% jitter band. The old
+    // escalating backoff started at 5s and doubled, so even its FIRST gap blew
+    // past the first ceiling here — which is exactly what this catches.
+    ok(gaps.every((g) => g < 10_000),
+      `F1f: consecutive retries are fast (gaps ${gaps.map((g) => (g / 1000).toFixed(1) + 's').join(', ')})`)
+    // Non-decreasing but gentle: each gap stays under the previous backoff would.
+    ok(gaps[0] < 3_000,
+      `F1f: the very first retry comes fast, not after the old 5s base (${(gaps[0] / 1000).toFixed(2)}s)`)
+    const span = stamps.at(-1) - stamps[0]
+    ok(span < 30_000,
+      `F1f: five attempts land inside 30s, not minutes (${(span / 1000).toFixed(1)}s)`)
+  } else {
+    ok(false, "F1f: not enough attempts to measure spacing")
+  }
+  dispose()
 }
 
 // ---- F2: a retryable 5xx IS recovered with a resume prompt ----------------

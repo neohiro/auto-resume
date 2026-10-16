@@ -202,7 +202,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "2.0.4"
+const AUTO_RESUME_VERSION = "2.1.0"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -237,6 +237,27 @@ const DEFAULTS = {
   baseDelayMs: 5_000,
   maxDelayMs: 120_000,
   rateLimitBaseMs: 20_000,
+  /* Fast-burst retry for TRANSIENT failures (403/5xx/network) when model
+   * rotation is off — the default configuration.
+   *
+   * With rotation off there is no other model to move to, so the only recovery
+   * lever is trying the same one again. Escalating backoff is the wrong shape
+   * for a blip: a 403 or 502 that clears in two seconds is still sitting
+   * behind a 40s wait. A blip is overwhelmingly the common case, so the early
+   * attempts come fast and close together.
+   *
+   * Growth is gentle (1.5x, not 2x) and the ceiling is low, so this stays a
+   * "keep pushing through it" posture rather than a tight infinite loop. It is
+   * still bounded three ways: maxChain attempts, the circuit breaker, and
+   * s.pendingResume which drops a retry that lands while one is in flight.
+   *
+   * Deliberately NOT applied to rate_limit: there the provider states when its
+   * bucket refills, and hammering ahead of that just burns the quota faster.
+   */
+  fastRetry: true,
+  fastRetryBaseMs: 1_200,
+  fastRetryGrowth: 1.5,
+  fastRetryMaxMs: 8_000,
   outputLengthMax: 3,
   nudgeDelayMs: 1_500,
   stallTimeoutMs: 240_000,
@@ -843,6 +864,8 @@ function bool(name, fallback) {
 }
 
 function loadConfig() {
+  // The retry base, read once so the fast-retry path can inherit it.
+  const cfgBaseDelay = () => num("OPENCODE_RESUME_BASE_DELAY_MS", DEFAULTS.baseDelayMs)
   const aggressionRaw = str("OPENCODE_RESUME_AGGRESSION", DEFAULT_AGGRESSION).toLowerCase()
   const aggressionKey = Object.hasOwn(AGGRESSION_PRESETS, aggressionRaw)
     ? aggressionRaw
@@ -888,6 +911,21 @@ function loadConfig() {
     // Rotation is NEVER triggered silently. User must explicitly enable via
     // OPENCODE_RESUME_ROTATION_ENABLED=true to activate ANY rotation behavior.
     rotationEnabled: bool("OPENCODE_RESUME_ROTATION_ENABLED", false),
+    /* Fast-burst retry for transient failures (403/5xx/network), used when
+     * rotation is OFF — the default. With no other model to move to, retrying
+     * the same one is the only recovery lever, so the early attempts come fast
+     * and close together instead of escalating 5s, 10s, 20s, 40s… past an
+     * outage that may have already cleared.
+     *
+     * The base defaults to BASE_DELAY_MS when that is set, so the documented
+     * "how soon do we retry" knob still applies and suites that tune it down
+     * keep working. fastRetryMaxMs is deliberately much lower than
+     * maxDelayMs: this is a "keep pushing through it" posture, not a loop.
+     */
+    fastRetry: bool("OPENCODE_RESUME_FAST_RETRY", DEFAULTS.fastRetry),
+    fastRetryBaseMs: num("OPENCODE_RESUME_FAST_RETRY_BASE_MS", Math.min(cfgBaseDelay(), DEFAULTS.fastRetryBaseMs)),
+    fastRetryGrowth: num("OPENCODE_RESUME_FAST_RETRY_GROWTH", DEFAULTS.fastRetryGrowth),
+    fastRetryMaxMs: num("OPENCODE_RESUME_FAST_RETRY_MAX_MS", DEFAULTS.fastRetryMaxMs),
     switchOnQuota: bool("OPENCODE_RESUME_SWITCH_ON_QUOTA", DEFAULTS.switchOnQuota),
     switchOnRateLimit: bool("OPENCODE_RESUME_SWITCH_ON_RATELIMIT", DEFAULTS.switchOnRateLimit),
     switchOnFailures: bool("OPENCODE_RESUME_SWITCH_ON_FAILURES", DEFAULTS.switchOnFailures),
@@ -2261,6 +2299,24 @@ export const createEngine = async ({ client }) => {
   const backoff = (attempt, base) =>
     Math.min(jitter(base * Math.pow(2, Math.max(attempt - 1, 0))), cfg.maxDelayMs)
 
+  /** Delay before the next recovery attempt.
+   *
+   *  Transient failures retry fast and consecutively; rate limits wait for the
+   *  window the provider stated. See the fastRetry defaults for why the two
+   *  shapes differ. */
+  const retryDelay = (kind, chain, error) => {
+    if (kind === "rate_limit") return retryAfterMs(error) ?? backoff(chain, cfg.rateLimitBaseMs)
+    // Only the no-rotation default gets the fast burst. With rotation on, a
+    // slow ramp is deliberate: the next attempt lands on a DIFFERENT model, and
+    // spacing them out avoids burning the new model's budget as fast as the
+    // old one ran dry.
+    if (cfg.fastRetry && !cfg.rotationEnabled) {
+      const ms = cfg.fastRetryBaseMs * Math.pow(cfg.fastRetryGrowth, Math.max(chain - 1, 0))
+      return Math.min(jitter(ms), cfg.fastRetryMaxMs)
+    }
+    return backoff(chain, cfg.baseDelayMs)
+  }
+
   // ── model catalog + rotation ───────────────────────────────────────
   const modelKey = (m) => `${m.providerID}/${m.modelID}`
   const cooling = (key) => (modelCooldown.get(key) ?? 0) > Date.now()
@@ -3231,9 +3287,7 @@ export const createEngine = async ({ client }) => {
     }
     s.pendingResume = true
     s.chain += 1
-    const delay = kind === "rate_limit"
-      ? (retryAfterMs(error) ?? backoff(s.chain, cfg.rateLimitBaseMs))
-      : backoff(s.chain, cfg.baseDelayMs)
+    const delay = retryDelay(kind, s.chain, error)
     schedule(sessionID, delay, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, false, null) })
   }
 
