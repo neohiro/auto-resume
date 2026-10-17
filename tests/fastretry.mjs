@@ -131,6 +131,29 @@ const fast = await measureGaps(false)
   }
 }
 
+// ---- G4: the budget is scaled so total tolerance is preserved --------------
+// The regression this guards: maxChain is a COUNT, so shortening every wait
+// shrank the wall-clock window it covers. At an 8s ceiling 8 attempts spanned
+// ~40s, against ~8.5 minutes before. Snappy-but-quitting is not persistent.
+{
+  const bOld = 5000, cOld = 120_000, chain = 8
+  const bFast = 1200, g = 1.8, cFast = 30_000, maxChain = 32
+  let target = 0
+  for (let i = 0; i < chain; i++) target += Math.min(bOld * Math.pow(2, i), cOld)
+
+  let n = chain, window = 0
+  while (n < maxChain && window < target) {
+    window += Math.min(bFast * Math.pow(g, n - 1), cFast)
+    n++
+  }
+  ok(n > chain, `G4: budget scales above maxChain under fast retry (${n} vs ${chain})`)
+  ok(n <= maxChain, `G4: budget stays capped (${n} <= ${maxChain})`)
+  ok(window >= target * 0.85 && window <= target * 1.35,
+    `G4: fast window matches the old one (${(window / 1000).toFixed(0)}s vs ${(target / 1000).toFixed(0)}s)`)
+  // The whole point: still bounded, so a long outage is not a request storm.
+  ok(n <= 32, `G4: an unbounded storm is not possible (${n} attempts max)`)
+}
+
 // ---- G2: growth is gentle, not doubling ------------------------------------
 if (fast.length >= 3) {
   const ratios = fast.slice(1).map((g, i) => g / Math.max(fast[i], 1))

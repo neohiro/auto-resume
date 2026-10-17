@@ -202,7 +202,7 @@
 
 import { writeFile, rename, unlink } from "node:fs/promises"
 
-const AUTO_RESUME_VERSION = "2.1.0"
+const AUTO_RESUME_VERSION = "2.1.1"
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -256,8 +256,17 @@ const DEFAULTS = {
    */
   fastRetry: true,
   fastRetryBaseMs: 1_200,
-  fastRetryGrowth: 1.5,
-  fastRetryMaxMs: 8_000,
+  fastRetryGrowth: 1.8,
+  fastRetryMaxMs: 30_000,
+  /* Ceiling on the attempt budget that fast retry scales maxChain up to.
+   *
+   * At the shipped values (base 1.2s, 1.8x growth, 8 maxChain) the fast
+   * schedule would cover the same wall-clock window as the old escalating one
+   * in about 26 attempts. 32 keeps that window while staying far below the
+   * ~68 a literal match would need — every attempt is a real provider request,
+   * and the point of this is decent tokens/hour on free models, not spending
+   * quota to buy patience. */
+  fastRetryMaxChain: 32,
   outputLengthMax: 3,
   nudgeDelayMs: 1_500,
   stallTimeoutMs: 240_000,
@@ -312,7 +321,7 @@ const DEFAULTS = {
   improveMax: 4,
   improveCooldownMs: 600_000,
   maxNudges: 25,
-  budgetMs: 28_800_000,
+  budgetMs: 0, // Off by default; only active when user defines OPENCODE_AUTOPILOT_BUDGET_MS
   // Maximum entries in dirAskCounts before forced cleanup (0 = unlimited, but
   // periodic cleanup in checkStalls will still run). Default 1000 entries.
   maxDirAskCounts: 1000,
@@ -926,6 +935,7 @@ function loadConfig() {
     fastRetryBaseMs: num("OPENCODE_RESUME_FAST_RETRY_BASE_MS", Math.min(cfgBaseDelay(), DEFAULTS.fastRetryBaseMs)),
     fastRetryGrowth: num("OPENCODE_RESUME_FAST_RETRY_GROWTH", DEFAULTS.fastRetryGrowth),
     fastRetryMaxMs: num("OPENCODE_RESUME_FAST_RETRY_MAX_MS", DEFAULTS.fastRetryMaxMs),
+    fastRetryMaxChain: num("OPENCODE_RESUME_FAST_RETRY_MAX_CHAIN", DEFAULTS.fastRetryMaxChain),
     switchOnQuota: bool("OPENCODE_RESUME_SWITCH_ON_QUOTA", DEFAULTS.switchOnQuota),
     switchOnRateLimit: bool("OPENCODE_RESUME_SWITCH_ON_RATELIMIT", DEFAULTS.switchOnRateLimit),
     switchOnFailures: bool("OPENCODE_RESUME_SWITCH_ON_FAILURES", DEFAULTS.switchOnFailures),
@@ -2304,17 +2314,55 @@ export const createEngine = async ({ client }) => {
    *  Transient failures retry fast and consecutively; rate limits wait for the
    *  window the provider stated. See the fastRetry defaults for why the two
    *  shapes differ. */
+  const usesFastRetry = () => cfg.fastRetry && !cfg.rotationEnabled
+
+  /** Delay before the next recovery attempt.
+   *
+   *  Transient failures retry fast and consecutively; rate limits wait for the
+   *  window the provider stated. See the fastRetry defaults for why the two
+   *  shapes differ. */
   const retryDelay = (kind, chain, error) => {
     if (kind === "rate_limit") return retryAfterMs(error) ?? backoff(chain, cfg.rateLimitBaseMs)
     // Only the no-rotation default gets the fast burst. With rotation on, a
     // slow ramp is deliberate: the next attempt lands on a DIFFERENT model, and
     // spacing them out avoids burning the new model's budget as fast as the
     // old one ran dry.
-    if (cfg.fastRetry && !cfg.rotationEnabled) {
+    if (usesFastRetry()) {
       const ms = cfg.fastRetryBaseMs * Math.pow(cfg.fastRetryGrowth, Math.max(chain - 1, 0))
       return Math.min(jitter(ms), cfg.fastRetryMaxMs)
     }
     return backoff(chain, cfg.baseDelayMs)
+  }
+
+  /** How many recovery attempts this session gets before giving up.
+   *
+   *  maxChain is a COUNT, and shortening every wait shrinks the wall-clock
+   *  window that count covers. At an 8s ceiling, 8 attempts spanned ~40s —
+   *  against ~8.5 minutes for the old escalating schedule at the same count.
+   *  That traded "persistent" for "snappy": a two-minute outage the old timing
+   *  rode out got abandoned in under a minute.
+   *
+   *  So the budget scales with the schedule: count how many fast attempts cover
+   *  the window the escalating one covered, bounded. Solved numerically rather
+   *  than algebraically because both schedules have ceilings, which the closed
+   *  form ignores — and it is only ever ~8 iterations.
+   *
+   *  Bounded at fastRetryMaxChain because every attempt is a real provider
+   *  request: an uncapped budget would spend free-tier quota to buy patience,
+   *  which is backwards on exactly the free models this targets. */
+  const retryBudget = () => {
+    if (!usesFastRetry()) return cfg.maxChain
+    const g = Math.max(1.01, cfg.fastRetryGrowth)
+    const b = Math.max(1, cfg.fastRetryBaseMs)
+    let target = 0
+    for (let i = 0; i < cfg.maxChain; i++) target += Math.min(cfg.baseDelayMs * Math.pow(2, i), cfg.maxDelayMs)
+    let n = cfg.maxChain
+    let window = 0
+    while (n < cfg.fastRetryMaxChain && window < target) {
+      window += Math.min(b * Math.pow(g, n - 1), cfg.fastRetryMaxMs)
+      n += 1
+    }
+    return Math.max(cfg.maxChain, Math.min(n, cfg.fastRetryMaxChain))
   }
 
   // ── model catalog + rotation ───────────────────────────────────────
@@ -2982,7 +3030,7 @@ export const createEngine = async ({ client }) => {
     // anything recurring after a dispatched resume is a new incident.
     const sig = `${error?.name}:${error?.data?.statusCode ?? ""}:${error?.data?.message ?? ""}`
     const duplicateIncident =
-      sig === s.lastErrorSig && nowMs - s.lastErrorAt < DUPLICATE_INCIDENT_WINDOW_MS && s.lastResumeAt <= s.lastErrorAt
+      sig === s.lastErrorSig && nowMs - s.lastErrorAt < DUPLICATE_INCIDENT_WINDOW_MS && (s.lastResumeAt <= s.lastErrorAt || nowMs - s.lastResumeAt < DUPLICATE_INCIDENT_WINDOW_MS)
     if (duplicateIncident) return
     s.lastErrorSig = sig
     s.lastErrorAt = nowMs
@@ -3257,7 +3305,7 @@ export const createEngine = async ({ client }) => {
     }
 
     if (s.pendingResume) return
-    if (s.chain >= cfg.maxChain) {
+    if (s.chain >= retryBudget()) {
       noteResumeFailure()
       notice(`${RESUME_TAG}: Gave up after ${s.chain} recovery attempts (${kind}). Send a message to try manually.`, "error")
       // Bounded self-re-arm for unattended runs: after a cool-down, reset the
@@ -3482,6 +3530,9 @@ export const createEngine = async ({ client }) => {
 
   const evaluateIdle = async (sessionID) => {
     const s = state(sessionID)
+    if (s.evaluatingIdle) return
+    s.evaluatingIdle = true
+    try {
     if (suppressed(sessionID)) { s.awaitingCompactionSince = 0; return }
     const relevant =
       s.lastErrorName || s.lastResumeAt || s.continueCount ||
@@ -3784,6 +3835,9 @@ export const createEngine = async ({ client }) => {
     // boundary — masking the actual state of the session. The success branch
     // already cleared this above; this catches the errored/empty paths.
     if (errored || !hasContent) s.improveActive = false
+    } finally {
+      s.evaluatingIdle = false
+    }
   }
 
   // ── stall + stuck-retry watchdog ───────────────────────────────────
@@ -5461,23 +5515,9 @@ export default {
           sessionID,
           status: { type: "retry", attempt, next, message: reason, action: { reason, provider, title: payload.title } },
         })
-        // Surface a genuine provider error if the payload carries one, so the
-        // engine's classifier can act on it rather than only seeing "retrying".
-        const rawErr = payload.error ?? (reason && typeof reason === "object" ? reason : null)
-        if (rawErr && typeof rawErr === "object") {
-          const normalized = v2ErrorToV1(rawErr)
-          const hint = retryHint(sessionID)
-          if (normalized && typeof normalized === "object") {
-            normalized.data = {
-              ...(normalized.data ?? {}),
-              retryAttempt: attempt,
-              retryNext: next,
-              retryReason: reason?.reason ?? reason?.title ?? payload.title,
-              retryProvider: provider ?? hint?.provider,
-            }
-          }
-          synth("session.error", { sessionID, error: normalized })
-        }
+        // Retry schedules are normal recovery, not new failures — the original
+        // error arrived via session.step.failed (or the sweep catches misses).
+        // Synthesising here double-fires resumes and turns retries into loops.
         return
       }
 
