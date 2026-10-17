@@ -425,9 +425,8 @@ const DEPRECATION_COOLDOWN_MS = 86_400_000 * 365
 const RESUME_TAG = "[auto-resume]"
 
 const AUTONOMY_DIRECTIVE =
-  " You are a senior engineer working unattended. Decide, don't ask. Document assumptions; pick sensible defaults." +
-  " Done = production-grade, above user expectations: builds + tests + linters/type-checks green; edges + errors handled; security + perf considered; backward-compatible; no TODO/FIXME or dead code; docs match code." +
-  " Verify with the real toolchain. Quality > speed. Exceed industry standards."
+  " You are a principal engineer working unattended. Decide, don't ask. Document assumptions; pick sensible defaults." +
+  " Done = production-grade, above industry standards and above user expectations: builds + tests + linters/type-checks green; edges + errors handled; security + perf considered; backward-compatible; no TODO/FIXME or dead code; docs match code; verify with the real toolchain. Quality > speed. Exceed expectations."
 
 /** Compact version of AUTONOMY_DIRECTIVE for the lowBudget path — keeps the
  *  production-grade definition but drops the "working unattended / don't ask"
@@ -5420,7 +5419,10 @@ export default {
         // still sees "busy" and defers the recovery prompt by a full poll
         // interval, which reads to the user as the plugin not reacting.
         setStatus(sessionID, "idle")
-        if (!filtered) synth("session.error", { sessionID, error: normalized })
+        if (!filtered) {
+          synth("session.error", { sessionID, error: normalized })
+          lastErrorSynthAt.set(sessionID, Date.now())
+        }
         // The turn is over either way, so evaluate idle state.
         armIdle(sessionID)
         return
@@ -5517,7 +5519,31 @@ export default {
         })
         // Retry schedules are normal recovery, not new failures — the original
         // error arrived via session.step.failed (or the sweep catches misses).
-        // Synthesising here double-fires resumes and turns retries into loops.
+        // BUT if the core never emits step.failed, a retry that carries an error
+        // payload must still reach the engine once — deduped so it never loops.
+        const retryErrKey = `${sessionID}|retry:${attempt}`
+        const recentErr = (lastErrorSynthAt.get(sessionID) ?? 0) > Date.now() - 5000
+        if (payload.error && !retryErrorSent.has(retryErrKey) && !recentErr) {
+          retryErrorSent.add(retryErrKey)
+          if (retryErrorSent.size > RETRY_ERROR_MAX) {
+            const oldest = retryErrorSent.values().next().value
+            if (oldest !== undefined) retryErrorSent.delete(oldest)
+          }
+          lastErrorSynthAt.set(sessionID, Date.now())
+          const rawErr = payload.error
+          const normalized = v2ErrorToV1(rawErr)
+          const hint = retryHint(sessionID)
+          if (normalized && typeof normalized === "object") {
+            normalized.data = {
+              ...(normalized.data ?? {}),
+              retryAttempt: attempt,
+              retryNext: next,
+              retryReason: reason?.reason ?? reason?.title ?? payload.title,
+              retryProvider: provider ?? hint?.provider,
+            }
+          }
+          synth("session.error", { sessionID, error: normalized })
+        }
         return
       }
 
@@ -5672,6 +5698,9 @@ export default {
      * and remembers the last message it acted on so the same dead turn is
      * never reported twice. */
     const sweepState = new Map() // sessionID -> last assistant message id handled
+    const retryErrorSent = new Set() // dedupe retries that carry errors
+    const RETRY_ERROR_MAX = 256
+    const lastErrorSynthAt = new Map() // sessionID -> timestamp of last synthesized session.error
     const SWEEP_STATE_MAX = 64
     const SWEEP_MS = 15_000
     const SWEEP_MAX = 4
