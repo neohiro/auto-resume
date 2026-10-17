@@ -4383,6 +4383,7 @@ export const createEngine = async ({ client }) => {
                 // prompt arrived — the new conversation must not be polluted by
                 // a stale "Continue" / "Auto-resume" that fires seconds later.
                 cancelPending(info.sessionID, "user prompt arrived")
+                sessionErrorSynthLock.delete(info.sessionID)
                 // A REAL prompt starts a new workflow — lift the stop, on
                 // disk too, so future runs automate this session again.
                 // (An explicit opt-out is only lifted by "auto-resume on".)
@@ -5419,7 +5420,9 @@ export default {
         // still sees "busy" and defers the recovery prompt by a full poll
         // interval, which reads to the user as the plugin not reacting.
         setStatus(sessionID, "idle")
-        if (!filtered) {
+        const synthLockKey = sessionID
+        if (!filtered && !sessionErrorSynthLock.has(synthLockKey)) {
+          sessionErrorSynthLock.add(synthLockKey)
           synth("session.error", { sessionID, error: normalized })
           lastErrorSynthAt.set(sessionID, Date.now())
         }
@@ -5523,12 +5526,13 @@ export default {
         // payload must still reach the engine once — deduped so it never loops.
         const retryErrKey = `${sessionID}|retry:${attempt}`
         const recentErr = (lastErrorSynthAt.get(sessionID) ?? 0) > Date.now() - 5000
-        if (payload.error && !retryErrorSent.has(retryErrKey) && !recentErr) {
+        if (payload.error && !retryErrorSent.has(retryErrKey) && !recentErr && !sessionErrorSynthLock.has(sessionID)) {
           retryErrorSent.add(retryErrKey)
           if (retryErrorSent.size > RETRY_ERROR_MAX) {
             const oldest = retryErrorSent.values().next().value
             if (oldest !== undefined) retryErrorSent.delete(oldest)
           }
+          sessionErrorSynthLock.add(sessionID)
           lastErrorSynthAt.set(sessionID, Date.now())
           const rawErr = payload.error
           const normalized = v2ErrorToV1(rawErr)
@@ -5700,6 +5704,7 @@ export default {
     const sweepState = new Map() // sessionID -> last assistant message id handled
     const retryErrorSent = new Set() // dedupe retries that carry errors
     const RETRY_ERROR_MAX = 256
+    const sessionErrorSynthLock = new Set() // only one error synthesis per session at a time
     const lastErrorSynthAt = new Map() // sessionID -> timestamp of last synthesized session.error
     const SWEEP_STATE_MAX = 64
     const SWEEP_MS = 15_000
