@@ -262,6 +262,7 @@ const DEFAULT_AGGRESSION = "balanced"
 
 const DEFAULTS = {
   enabled: true,
+  budgetPrompts: false,
   baseDelayMs: 5_000,
   maxDelayMs: 120_000,
   rateLimitBaseMs: 20_000,
@@ -910,6 +911,7 @@ function loadConfig() {
   const hasRawStall = process.env.OPENCODE_RESUME_MAX_STALL_TAKEOVERS !== undefined
   return {
     enabled: bool("OPENCODE_RESUME_ENABLED", DEFAULTS.enabled),
+    budgetPrompts: bool("OPENCODE_RESUME_BUDGET_PROMPTS", DEFAULTS.budgetPrompts),
     maxChain: hasRawChain
       ? num("OPENCODE_RESUME_MAX_CHAIN", preset.maxChain)
       : preset.maxChain,
@@ -2862,6 +2864,10 @@ export const createEngine = async ({ client }) => {
     s.previousKind = originalKind
     s.previousKindChain = s.chain
     const kindKey = `${sessionID}|${plan.kind}`
+    if (!cfg.budgetPrompts && (plan.kind === "lowBudget" || plan.kind === "quota")) {
+      log("info", `budget prompts disabled; skipping "${plan.kind}" for ${sessionID}`)
+      return
+    }
     if (scheduledKinds.has(kindKey)) {
       log("info", `skipping duplicate schedule "${plan.kind}" for ${sessionID}`)
       return
