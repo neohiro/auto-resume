@@ -2885,6 +2885,8 @@ export const createEngine = async ({ client }) => {
     log("info", `scheduled "${plan.kind}" in ${delayMs}ms`, { sessionID })
   }
 
+  const lastInjected = new Map() // sessionID -> { kind, at }
+
   /** Cancel any pending auto-injection on a session and clear its pendingResume
    *  flag.  Called the moment we observe the user sending their own message —
    *  a stale plan would otherwise fire AFTER the new user prompt and pollute
@@ -2930,6 +2932,11 @@ export const createEngine = async ({ client }) => {
 
   const runPlan = async (sessionID, plan) => {
     if (!injectionAllowed(sessionID)) return
+    const last = lastInjected.get(sessionID)
+    if (last && last.kind === plan.kind && Date.now() - last.at < 3000) {
+      log("info", `dropping duplicate injection "${plan.kind}" for ${sessionID}`)
+      return
+    }
     const s0 = state(sessionID)
     if (suppressed(sessionID)) {
       log("info", `suppressed "${plan.kind}" — session was stopped by the user`, { sessionID })
@@ -3040,6 +3047,7 @@ export const createEngine = async ({ client }) => {
         model: model ? modelKey(model) : undefined,
         mode: typeof asyncPrompt === "function" ? "async" : "sync",
       })
+      lastInjected.set(sessionID, { kind: plan.kind, at: Date.now() })
       queueTitleRefresh(sessionID)
     } catch (err) {
       const ns = client.session ?? {}
