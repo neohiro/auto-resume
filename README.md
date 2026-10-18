@@ -1,393 +1,123 @@
 <div align="center">
 
-# auto-resume
+# auto-resume <!-- version --> 2.1.5
 
-**Free AI coding agents that don't fall asleep on the job.**
+**Self-healing OpenCode sessions · retries · model rotation · permission autopilot · quality loops**
 
-An [OpenCode](https://opencode.ai) plugin.
+[![Version](https://img.shields.io/badge/version-2.1.5-blue)](https://github.com/neohiro/auto-resume/releases)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![OpenCode](https://img.shields.io/badge/plugin-opencode-black)](https://opencode.ai)
 
-Recovery · Model rotation · Permission autopilot · Task autonomy
+Install once. Prompt a big task. Go to sleep. Come back to completed, verified work.
 
 </div>
 
 ---
 
-OpenCode gives you free LLM coding agents — which is awesome. Unfortunately, compared to other agentic coding software, its sessions are **prone to interruptions**: one network hiccup, rate limit, provider outage or max-token cutoff and your carefully prompted task just… stops. You walk away expecting a finished product and come back to an error message.
+## What it does (one line each)
 
-**auto-resume makes OpenCode sessions effectively unkillable.** It sits quietly in the background of every session and:
-
-- 🩹 **heals interruptions** — network failures, provider outages, timeouts, truncations, stalls, even crashed servers are recovered without you
-- 🔁 **rotates models automatically** — free tier exhausted? Provider down? It moves your task to the strongest healthy model mid-conversation, no input needed
-- ✅ **answers permission prompts** — safe-mode autopilot approves routine work and rejects anything dangerous while you're gone
-- 🚀 **drives tasks to done** — unfinished todos get finished (including checklists the model writes in plain replies), "Continue to finalize.", "Remaining things to do:" and similar turn-endings actually continue, and the agent's own questions get answered
-- 💎 **goes beyond done** — when the model declares victory, it's sent back to critique and improve its own work before you ever see it
-- 🏷️ **shows itself** — engaged sessions carry a live `[auto-resume: 🟢 armed / 🔁 recovering / ⏸️ stopped / 🚫 paused]` tag behind the title; say `auto-resume off` to disable it for one session (title restored without a trace) and `auto-resume on` to re-arm
-- 🔄 **updates itself** — checks GitHub daily and swaps in new releases automatically (one OpenCode restart to apply; opt-out available)
-
-Install it once, prompt a big task, go to sleep. Come back to completed work.
-
-This is what auto-resume is for.
+- **Resilience** — heals transport failures, 5xx, 429, quota, truncated output, stalls, crashes, and restarts automatically
+- **Model rotation** — switches to best healthy model when quota/rate-limit/failures persist (opt-in, never silent)
+- **Permission autopilot** — safe-mode answers edits/web-fetches; rejects dangerous patterns (`rm -rf`, disk format, registry, pipe-to-shell) automatically; answers workspace-external directory grants
+- **Task drive** — unfinished todos/checklists continue; stop-asking questions get answered; wrap-up proposes concrete follow-ups
+- **Quality loop** — when the model declares done it reviews its own work for correctness/perf/security/robustness and implements safe improvements; when work is complete it pivots to optimization/UX/performance instead of stopping
+- **Self-monitoring** — live title tag (`[auto-resume: 🟢 armed / 🔁 recovering / ⏸️ stopped / 🚫 paused]`); say `auto-resume off/on`
+- **Self-updating** — checks GitHub daily; applies new releases on restart (acknowledged via OS notification)
 
 ---
 
-`auto-resume` is a single-file OpenCode plugin that turns flaky, interruption-prone AI coding sessions into unattended ones. It hooks into OpenCode's event bus and keeps work alive whenever something dies — network blips, provider outages, free-tier limits, max-token truncations, stalled streams, permission prompts, unfinished todo lists — and then goes one step further: it makes the model **critique and improve its own finished work**.
+## Install (one command)
 
-## What it does
-
-### 1 — Recovery *(always on)*
-| Failure | Automatic response |
-|---|---|
-| Network / transport errors (`ECONNRESET`, `fetch failed`, DNS, TLS…) | Exponential backoff + jitter, re-injects a continuation prompt |
-| Provider outages (5xx, 529 overloaded, gateway errors) | Same, with model rotation after repeated rounds (see below) |
-| Rate limits (429) | Honors `Retry-After`; rotates models on repeated strikes |
-| Free-tier / quota exhaustion (`402`, "free usage exceeded", "Insufficient balance", "requires more credits, or fewer max_tokens"…) | **Rotates to another model instantly — no user input**; if OpenRouter-style max_tokens/credits constraint and no alternate model, resumes with a compact low-token-budget prompt so the same model can finish under the tighter limit |
-| Truncated output (`MessageOutputLengthError`) | Seamless *"continue exactly where you stopped"* nudge |
-| Context-window overflow | Triggers compaction, resumes automatically afterwards |
-| Empty responses | Re-nudges up to twice, then one explicit keep-going nudge (capped) |
-| Silently stalled streams (busy but no events) | Fast automatic retry after ~60s of silent "thinking" (labelled as such), full restart after the extended stall window |
-| Quiet-but-running tools (builds, test suites) | Extended grace window (×4) before any stall verdict |
-| Internal retry loops that never end (huge provider `Retry-After` values) | Taken over: aborted and resumed on the plugin's own schedule |
-| Client restarts / server crashes mid-task | On startup, recently-interrupted sessions ("Interrupted") are **re-animated** automatically — a restart is never mistaken for a Stop |
-| Subagent sessions | Left alone — their parent orchestrator owns them |
-| User aborts (**Stop**) | Detected — everything queued is cancelled and automation stays fully quiet until your next prompt |
-| Message reverts (**Revert**) | Treated like a Stop — queued autoprompts are cancelled and nothing is injected while you edit and reprompt manually |
-| Auth errors | Surfaced — never hammered |
-
-### 2 — Model rotation
-Anything **model-specific** that keeps failing moves your session elsewhere:
-
-- Exhausted quota → old model gets a cooldown, session continues on the best alternative
-- Repeated 429s or persistent network/5xx waves on one model → rotation too
-- Selection ranking:
-  1. Your preferred chain via `OPENCODE_RESUME_FALLBACK_MODELS`
-  2. Strongest sibling of the current provider
-  3. Best model of other installed providers
-- Candidates are ranked by **capability tier**: `max`/`ultra`/`opus`/`pro`/`high` variants beat `mini`/`nano`/`lite`/`flash`. Non-chat endpoints (embeddings, TTS, image) are filtered out.
-- The conversation continues seamlessly — same session, same context, new engine.
-
-> **Prerequisite — configure your allowed models in OpenCode.** The rotation engine picks from whatever models OpenCode has in its active provider catalog. If no other model is available to switch to, the session stalls on quota. To enable smooth auto-rotation:
-> 1. Open OpenCode's main window (the model selector is below the prompt area).
-> 2. Click **Manage Models** (or the models gear icon).
-> 3. In the **Allowed models** list, select only the models you want the agent to use — add at least 2–3 so rotation has somewhere to go. Remove any you don't want it to touch (including slow/free models you only use manually).
-> 4. You can also set a preferred ordering (top = used first).
->
-> Without this step, OpenCode may not expose alternative models to the plugin even if they're installed — the catalog it sees may be empty or restricted.
-
-### 3 — Permission autopilot
-Never comes back from lunch to a session stuck on *"Allow bash command?"*:
-
-- **Safe mode** (default): edits & web fetches approved; shell commands approved *unless* they match a danger blocklist (`rm -rf`, force-push, disk formatting, pipe-to-shell, registry edits…). Matched commands are **rejected** so the agent adapts instead of hanging.
-- **Workspace-external directory grants** ("Allow always / Allow once" pop-ups) are answered automatically so AFK runs never stall on them — a built-in cross-OS denylist rejects sensitive areas in **any path convention** (`C:\Windows`, `/etc`, `~/.ssh`, macOS Keychains, …), and `OPENCODE_AUTOPILOT_EXTRA_DENY` adds your own.
-- Unknown permission types stay human-decided in safe mode; `all` mode approves everything.
-
-### 4 — Task driver ("beyond expectations")
-The walk-away loop:
-
-1. **Todo drive** — session idles with unfinished todos → nudged to continue (spin-detection stops pointless loops)
-2. **Debug nudge** — 3 consecutive failed tool calls → *"diagnose the root cause first"*
-3. **Auto-proceed** — agent ends its turn by asking *"Should I proceed…?"* → the plugin answers yes and keeps it moving (capped)
-4. **Autonomy directive** — every injected prompt tells the model to decide things itself, never wait for confirmation, document assumptions
-5. **Self-improvement passes** — when the model declares the task done, it's told to critically review its own output (correctness, performance, security, robustness, readability) and implement the improvements it's confident about — capped number of cycles
-6. **Wrap-up** — final message summarizes what was accomplished plus up to three follow-up proposals, success notice logged
-
-## Install
-
-**Easiest: just ask your agent.** You are already talking to an AI with full shell access - let it do the work. Paste this into OpenCode:
-
-```text
-Install the auto-resume plugin from https://github.com/neohiro/auto-resume
-into my global plugins folder (~/.config/opencode/plugins/) so every
-session gets it machine-wide.
-```
-
-The agent downloads the single file, puts it in place, and tells you when it is done - restart OpenCode and you are protected.
-
-
-**Option A — one file (recommended):**
-
-Windows PowerShell:
-```powershell
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.config\opencode\plugins" | Out-Null
-Invoke-WebRequest "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js" -OutFile "$env:USERPROFILE\.config\opencode\plugins\auto-resume.js"
-```
-
-macOS / Linux:
 ```sh
 mkdir -p ~/.config/opencode/plugins
 curl -fsSL https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js \
   -o ~/.config/opencode/plugins/auto-resume.js
 ```
 
-Restart OpenCode. Done.
-
-> ⚠️ Install it in **one place only** — global (`~/.config/opencode/plugins/`) *or* project (`.opencode/plugins/`). Both copies would load and double-fire every hook.
-
-**Option B — clone:**
-```sh
-git clone https://github.com/neohiro/auto-resume ~/.config/opencode/plugins/auto-resume
+Windows (PowerShell):
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.config\opencode\plugins" | Out-Null
+Invoke-WebRequest "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js" `
+  -OutFile "$env:USERPROFILE\.config\opencode\plugins\auto-resume.js"
 ```
-(OpenCode loads plugin files from the directory root.)
 
-## Configuration
+Restart OpenCode. The plugin loads automatically — no extra dependencies.
 
-Everything is env vars with sensible defaults. Set them globally or per shell.
+---
 
-| Variable | Default | Meaning |
+## Why it exceeds industry standards
+
+1. **No double prompts** — session-level error-synthesis lock (`sessionErrorSynthLock`) + recent-error guard (`lastErrorSynthAt`) + keyed dedupe (`retryErrKey`) prevent duplicate resume injections when both `session.step.failed` and `session.retry.scheduled` fire.
+2. **No missed failures** — retry events carrying `payload.error` synthesize recovery once if `step.failed` never arrives; bounded `retryErrorSent` (max 256) prevents leaks.
+3. **Encrypted sidecars** — set `OPENCODE_RESUME_ENCRYPTION_KEY`; all persistent markers (`.stopped.json`, `.off.json`, `.paused.json`, `.active.json`, `.health.json`) use AES-256-GCM. No plaintext session IDs on disk.
+4. **Bounded state everywhere** — `messageCache` (512), `statusBySession` (64), `dirAskCounts` (1000), `sweepState` (64), `retryErrorSent` (256), `lastSeenBySession` (256). No unbounded growth.
+5. **Defensive event adapter** — normalizes all V2 vocabulary (`session.step.*`, `session.text.*`, `session.retry.scheduled`, `session.permissions`, legacy names) into V1 engine shapes; drop noisy families (`skill.*`, `plugin.*`, etc.) before processing.
+6. **Quality-first directives** — `AUTONOMY_DIRECTIVE` requires build/test/lint verification; improvement cycles pivot to optimization/UX when scoped work completes; wrap-up demands verified proof + follow-up proposals.
+7. **Plugin registry manifest** — `plugin-manifest.json` declares `id`, `version`, `registry`, `update_url`, `min_opencode_version`, tags. Ready for marketplace integration.
+
+---
+
+## Configuration (env vars, all optional)
+
+| Variable | Default | Purpose |
 |---|---|---|
 | `OPENCODE_RESUME_ENABLED` | `true` | Master switch |
-| `OPENCODE_RESUME_AGGRESSION` | `balanced` | `conservative` \| `balanced` \| `relentless` — one-word preset setting `MAX_CHAIN` + `MAX_STALL_TAKEOVERS` together |
-| `OPENCODE_RESUME_MAX_CHAIN` | `8` | Max recovery resumes per task (default from the aggression preset) |
-| `OPENCODE_RESUME_MAX_STALL_TAKEOVERS` | `4` | Max stall takeovers per task (default from the aggression preset; was a hard-coded 2) |
-| `OPENCODE_RESUME_FAVORITE_RETURN` | `true` | Hand the session back to your original model once the alternate proves stable |
-| `OPENCODE_RESUME_FAVORITE_CHECK_AFTER_MS` | `300000` | Minimum time on the alternate before returning |
-| `OPENCODE_RESUME_FAVORITE_MIN_TURNS` | `3` | Stable turns on the alternate required before returning |
-| `OPENCODE_RESUME_BASE_DELAY_MS` | `5000` | Backoff base |
-| `OPENCODE_RESUME_MAX_DELAY_MS` | `120000` | Backoff cap |
-| `OPENCODE_RESUME_RATE_LIMIT_BASE_MS` | `20000` | Backoff base for 429s |
-| `OPENCODE_RESUME_FAST_RETRY` | `true` | Retry transient failures (403/5xx/network) fast and consecutively while model rotation is **off** |
-| `OPENCODE_RESUME_FAST_RETRY_BASE_MS` | `min(BASE_DELAY_MS, 1200)` | First fast-retry delay; inherits `BASE_DELAY_MS` when that is lower |
-| `OPENCODE_RESUME_FAST_RETRY_GROWTH` | `1.5` | Multiplier per attempt (gentler than the 2x used when rotating) |
-| `OPENCODE_RESUME_FAST_RETRY_MAX_MS` | `8000` | Ceiling for a single fast-retry wait |
-| `OPENCODE_RESUME_OUTPUT_LENGTH_MAX` | `3` | Truncation continue-nudges |
-| `OPENCODE_RESUME_NUDGE_DELAY_MS` | `1500` | Delay before the "continue" nudge fires on a finished turn |
-| `OPENCODE_RESUME_STALL_TIMEOUT_MS` | `240000` | Busy-without-events ⇒ stalled |
-| `OPENCODE_RESUME_THINK_STALL_MS` | `60000` | Busy "thinking" silence ⇒ labelled automatic retry |
-| `OPENCODE_RESUME_WATCHDOG_MS` | `10000` | Stall check interval |
-| `OPENCODE_RESUME_RUNNING_TOOL_FACTOR` | `4` | Stall grace multiplier while a tool is running |
-| `OPENCODE_RESUME_RETRY_TAKEOVER_MS` | `900000` | Max time in OpenCode's internal retry loop before takeover |
-| `OPENCODE_RESUME_RETRY_FUTURE_CAP_MS` | `600000` | Next-retry scheduled further out ⇒ takeover |
-| `OPENCODE_RESUME_REARM_MS` | `600000` | Cool-down before one bounded recovery re-arm after giving up |
-| `OPENCODE_RESUME_REANIMATE` | `true` | Revive crashed sessions on startup |
-| `OPENCODE_RESUME_REANIMATE_WINDOW_MS` | `600000` | Max age of sessions eligible for revival |
-| `OPENCODE_RESUME_AUTO_UPDATE` | `true` | Self-update daily from GitHub (applies on next OpenCode restart); a native TUI toast (with an OS notification as backup) announces the completed update |
-| `OPENCODE_RESUME_NOTICE_THROTTLE_MS` | `3000` | Min gap between user notices in the OpenCode log (legacy `OPENCODE_RESUME_TOAST_THROTTLE_MS` still honored) |
-| `OPENCODE_RESUME_STOPSTORE` | `<plugin>/auto-resume.js.stopped.json` | Where user-stop markers are persisted across restarts |
-| `OPENCODE_RESUME_OFFSTORE` | `<plugin>/auto-resume.js.off.json` | Where per-session opt-outs (`auto-resume off`) are persisted |
-| `OPENCODE_RESUME_MAX_DIR_ASK_COUNTS` | `1000` | Maximum entries in directory ask counter before forced cleanup (`0` = unlimited) |
-| `OPENCODE_RESUME_PAUSESTORE` | `<plugin>/auto-resume.js.paused.json` | Where "user paused" markers are persisted across restarts (set to a path, or empty to keep the default) |
-| `OPENCODE_RESUME_ACTIVESTORE` | `<plugin>/auto-resume.js.active.json` | Where previously active session markers are persisted across restarts for automatic revival after client/server restart |
-| `OPENCODE_RESUME_HEALTHSTORE` | `<plugin>/auto-resume.js.health.json` | Where provider health metrics (success/failure rates) are persisted across restarts to bias rotation away from flaky models |
-| `OPENCODE_RESUME_BREAKER_THRESHOLD` | `6` | Failures inside the window before the global breaker opens |
-| `OPENCODE_RESUME_BREAKER_WINDOW_MS` | `900000` | Circuit-breaker rolling window |
-| `OPENCODE_RESUME_BREAKER_COOLDOWN_MS` | `300000` | Circuit-breaker cool-down once open |
-| `OPENCODE_RESUME_COMPACT_ON_OVERFLOW` | `true` | Summarize + resume on overflow |
-| `OPENCODE_RESUME_ROTATION_ENABLED` | `false` | Master switch for model rotation (OFF by default for all cases) |
-| `OPENCODE_RESUME_SWITCH_ON_QUOTA` | `false` | Rotate on free-tier exhaustion |
-| `OPENCODE_RESUME_SWITCH_ON_RATELIMIT` | `false` | Rotate on repeated 429s |
-| `OPENCODE_RESUME_SWITCH_ON_FAILURES` | `false` | Rotate on persistent network/5xx failures |
-| `OPENCODE_RESUME_DISABLE_ROTATION` | `true` | Disable ALL model rotation (overrides the three above) |
-| `OPENCODE_RESUME_RL_SWITCH_AFTER` | `1` | 429s before rotating |
-| `OPENCODE_RESUME_ROTATE_AFTER_FAILURES` | `3` | Failed rounds before rotating |
-| `OPENCODE_RESUME_MAX_ROTATIONS` | `3` | Model rotations per task |
-| `OPENCODE_RESUME_MODEL_COOLDOWN_MS` | `3600000` | Exhausted-model pause |
-| `OPENCODE_RESUME_FALLBACK_MODELS` | *(auto-discover)* | Preferred chain, e.g. `"anthropic/claude-opus-4-1,openai/gpt-5"` |
-| `OPENCODE_RESUME_DENYLIST_MODELS` | *(empty)* | Comma-separated list of deprecated or permanently unavailable models to avoid (e.g., `"exo,exo-1"`) |
-| `OPENCODE_RESUME_AUTONOMY` | `true` | Master switch for subsystems 3+4 |
-| `OPENCODE_AUTOPILOT_PERMISSIONS` | `true` | Auto-answer permission prompts |
-| `OPENCODE_AUTOPILOT_PERMISSION_MODE` | `safe` | `safe` \| `all` |
-| `OPENCODE_AUTOPILOT_EXTRA_DENY` | *(empty)* | Extra deny substrings, comma-separated (`re:` prefix = regex) |
-| `OPENCODE_AUTOPILOT_DIR_ALWAYS_AFTER` | `0` (off) | After N auto-approved asks for the *same* benign external directory, escalate to **Allow always** for the session |
-| `OPENCODE_AUTOPILOT_TODO_DRIVE` | `true` | Continue unfinished todos |
-| `OPENCODE_AUTOPILOT_DEBUG_NUDGE` | `true` | Root-cause nudge after tool failures |
-| `OPENCODE_AUTOPILOT_IMPROVE` | `true` | Self-improvement pass after completion |
-| `OPENCODE_AUTOPILOT_IMPROVE_CYCLES` | `2` | Max improvement cycles |
-| `OPENCODE_AUTOPILOT_PROPOSALS` | `true` | Wrap-up proposals message |
-| `OPENCODE_AUTOPILOT_PROCEED` | `true` | Answer the agent's own questions and continue |
-| `OPENCODE_AUTOPILOT_MAX_PROCEEDS` | `3` | Self-answered questions per task |
-| `OPENCODE_AUTOPILOT_MAX_NUDGES` | `25` | Self-driven nudges per task |
-| `OPENCODE_AUTOPILOT_BUDGET_MS` | `28800000` (8h) | Wall-clock budget per task (`0` = off) |
+| `OPENCODE_RESUME_MAX_CHAIN` | `8` (balanced aggression) | Recovery attempts per task |
+| `OPENCODE_RESUME_AUTONOMY` | `true` | Enable task driver (subs 3+4) |
+| `OPENCODE_AUTOPILOT_PERMISSIONS` | `true` | Auto-answer safe permission prompts |
+| `OPENCODE_AUTOPILOT_PROCEED` | `true` | Answer agent's own questions |
+| `OPENCODE_AUTOPILOT_IMPROVE` | `true` | Self-improvement pass after done |
+| `OPENCODE_RESUME_ROTATION_ENABLED` | `false` | Master switch for model rotation (never silent) |
+| `OPENCODE_RESUME_ENCRYPTION_KEY` | — | AES-256-GCM encryption for sidecars |
+| `OPENCODE_RESUME_AUTO_UPDATE` | `true` | Daily self-update check |
 
-## Safety rails
+Full list in file header (lines 128–201).
 
-- **User Stop is absolute**: hitting Stop cancels every queued injection and pauses recovery, todo-drive, auto-proceed, improvement passes, proposals *and* permission autopilot until you send the next prompt — and the stop is **remembered across restarts** (small JSON sidecar file), so a stopped session is never automatically revived. This holds even mid-flight: a Stop that lands while the plugin is waiting on the server (history fetch, status probe, model rotation) still cancels the pending work instead of injecting into the session you just silenced
-- **Revert means manual control**: reverting a message cancels every queued injection and pauses automation until your next prompt — same mechanics as a Stop, so no autoprompt ever fires into the reverted session while you edit and reprompt by hand
-- **Per-session kill switch**: `auto-resume off` in chat disables everything for that session only (survives restarts; title restored with no trace) — `auto-resume on` re-arms. On-by-default everywhere else: install and go
-- Per-task resume chain cap, reset by any real user message or clean completion
-- Shared autopilot nudge budget + wall-clock budget per task
-- Spin detection (todo drive stops when nothing progresses)
-- Anti-redundant-repeat: the same plan kind scheduled twice with no progress escalates to an explicit "change approach" prompt instead of re-injecting the same nudge (the empty-streak ladder is exempt — it has its own escalation)
-- Incident-signature dedupe (one failure never double-triggers)
-- Idle-status check immediately before every injection
-- Global circuit breaker with cool-down during full outages
-- Rotation caps prevent endless provider hopping
-- Model rotation is self-healing: once the alternate has held up for a few clean turns and your original model's cool-down has expired, an idle session goes back to the model you picked (no SDK call — the model is carried on the next injected prompt)
-- Every injected prompt is tagged `[auto-resume]` so automation is always visible in chat
-- Dangerous shell commands are rejected, not silently approved
+---
 
-## Compatibility
+## Security & privacy
 
-Works anywhere OpenCode runs — **Windows, macOS, Linux** — on **OpenCode 2.x** (including the desktop client). The plugin is a single zero-dependency file using only the OpenCode plugin context, timers, and environment variables, plus the tiny local files it manages itself: the self-update backup (`.bak`), the update-ack marker (`.acked`), the user-stop memory (`auto-resume.js.stopped.json`), the per-session opt-out memory (`auto-resume.js.off.json`), and the pause memory (`auto-resume.js.paused.json`). Requires Node ≥ 18 semantics (Bun, which runs OpenCode, exceeds this).
+- **Safe mode defaults** — dangerous commands rejected; external directory grants auto-answered only after denylist scan (`SENSITIVE_DIR_RES` covers Windows/Linux/macOS paths).
+- **ReDoS protection** — extra deny regexes are screened against catastrophic backtracking (`DANGEROUS_REGEX_PATTERN`) before use.
+- **Credential redaction** — error messages holding tokens/keys are redacted before writing to disk or console.
+- **Encrypted persistence** — sidecars can be encrypted with `OPENCODE_RESUME_ENCRYPTION_KEY`. If not set, files stay local next to the plugin.
 
-Tested against OpenCode 2's event API: `server.connected`, `session.step.started/ended/failed`,
-`session.text.*`, `session.reasoning.*`, `session.tool.*`, `session.retry.scheduled`,
-`session.execution.*`, `session.compaction.failed`, `session.deleted`, and the V2 permission
-`evaluate` hook.
+---
 
-### OpenCode 1.x is no longer supported
+## Truth-check / facts
 
-Development targeted OpenCode 2 exclusively from v1.17 onward, and **v2.0.0 completes the
-migration**: the V1 `AutoResumePlugin` hook entrypoint has been removed, and `main` no longer
-exports it. OpenCode 2 does not run V1 plugin implementations at all — a V1 module fails to load
-with `Plugin must export a default definition with an id and an effect or setup function` — so
-keeping that export only preserved a path that no supported client could load.
-
-If you are still on OpenCode 1, pin to the last release that exports the V1 hook:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/neohiro/auto-resume/v1.16.1/auto-resume.js \
-  -o ~/.config/opencode/plugins/auto-resume.js
-```
-
-### OpenCode 2 support
-
-This plugin exports a single entrypoint:
-
-| Export | Runtime |
+| Claim | Evidence |
 |---|---|
-| `export default { id: "auto-resume", setup(ctx) }` | OpenCode 2.x (Promise plugin API) |
+| Recovers from interrupted turns | `handleError` schedules `resume`; `reanimate` revives on startup; `session.compacted` resumes after compaction |
+| Answers permission prompts | `permission.updated` / `permission.asked` → `respondToPermission`; native V2 `ctx.permission.hook("evaluate")` also registered |
+| Rotates models | `rotateAwayFrom` picks from catalog with tier ranking (`TIER_BONUS` / `TIER_PENALTY`); only when `rotationEnabled=true` |
+| Resumes after restart | `startupActiveSnapshot` scanned; `reanimate()` revives recent session with `kind` derived from last assistant message |
+| Prevents double prompts | `sessionErrorSynthLock` + `lastErrorSynthAt` 5s + `retryErrKey` dedup (v2.1.3) |
+| Encrypts sidecars | `encryptPayload` / `decryptPayload` using AES-256-GCM (v2.1.5) |
+| Registry manifest exists | `plugin-manifest.json` at repo root (v2.1.5) |
 
-`createEngine` is also exported, but only so the engine suites can drive it directly against a
-bridged client — it is not a runtime entrypoint.
+---
 
-The V2 `setup` is an adapter, not a rewrite. It maps the V2 plugin context onto the client
-interface the engine already speaks, subscribes to `ctx.event.subscribe()`, and normalizes
-each V2 event onto the `{ type, properties }` shape the engine consumes:
+## Version history (compact)
 
-| Engine call | V2 context method |
-|---|---|
-| `session.prompt({ path, body })` | `ctx.session.prompt({ sessionID, text, model })` |
-| `session.abort()` | `ctx.session.interrupt({ sessionID, resume: false })` |
-| `session.summarize()` | `ctx.session.compact({ sessionID })` |
-| `session.messages()` / `session.message()` | `ctx.session.context()` / `message.get()` |
-| `session.update()` / `session.get()` | `ctx.session.update()` / `get()` |
-| `session.list()` | **no equivalent — reconstructed (see below)** |
-| `session.status()` | `ctx.session.status()`, else the `session.status` event cache |
-| permission reply | `ctx.permission.reply({ sessionID, requestID, reply })` |
+- **2.1.5** — encrypted sidecars (AES-256-GCM); plugin registry manifest (`plugin-manifest.json`)
+- **2.1.4** — improvement cycles pivot to optimization/UX when work complete; `propose` demands concrete payoff
+- **2.1.3** — session-level error-synthesis lock stops double prompts; `sessionErrorSynthLock`
+- **2.1.2** — package version sync for plugin list visibility
+- **2.1.1** — fast retry schedule + bounded retry budget; duplicate incident dedupe improved
+- **2.1.0** – rapid transient retry when rotation off
+- **2.0.4** – credential redaction in error prompts
+- **2.0.3** – redaction of provider error text
+- **2.0.2** – honor provider-stated retry window
+- **2.0.1** – rotation master control for auth/rotation
+- **2.0.0** – complete OpenCode 2 migration
 
-The permission autopilot runs from `ctx.permission.hook("evaluate")`, which fires *after* your
-configured rules resolve and *before* the action runs — so there is no window in which you are shown
-a prompt the autopilot is about to answer. V2 never emits `permission.asked`, but a core that did
-would otherwise be answered twice, so once the hook registers it takes exclusive ownership of
-permission decisions and the legacy event route stands down. If the hook fails to register, the
-event route stays active rather than silently disabling the autopilot, and the hook is disposed on
-teardown so a re-initialised plugin never answers through a stale registration.
-| `config.providers()` | `ctx.provider.list()` |
+---
 
-**`session.list()` has no V2 equivalent**, and this one matters: restart reanimation enumerates
-sessions to find ones interrupted by a crash, so with no listing available it silently found
-nothing and every restart came back "green" with nothing revived. The adapter reconstructs the
-candidate set from the plugin's own `<plugin>.active.json` — the session ids it persists on
-every observed event — and confirms each one still exists with `ctx.session.get()`. That set is
-strictly narrower than V1's full listing (only sessions that were actually active when the last
-server died), and the engine still re-checks each candidate's current state before reviving, so
-stale ids from an older install are dropped rather than revived as phantoms.
+## Licensing & contribution
 
-V2-specific event and payload differences that are bridged: `permission.asked` carries
-`action` + `resources` instead of `permission` + `metadata`; V2 replaced the `{ role, parts }`
-message envelope with a `type`-discriminated message plus a typed `content[]` array; and
-structured errors (`{ type, message, status }`) are mapped back to the `{ name, data }` shape
-the classifier reads. Event payloads are read under `properties`, `data`, or flattened, so
-transport-encoding drift cannot silently disable recovery.
+MIT — see `LICENSE`. For bugs or feature requests: open issue at [neohiro/auto-resume](https://github.com/neohiro/auto-resume).
 
-V2 also renamed the session lifecycle vocabulary wholesale — `session.step.started/ended/failed`,
-`session.text.delta`, `session.tool.*`, `session.retry.scheduled`, `session.execution.*` — and the
-adapter maps that native stream rather than reconstructing it from heartbeats. Two consequences
-worth knowing:
+---
 
-- A provider error is now seen at `session.step.failed` rather than inferred from a turn that
-  stopped producing output, so a 403 or a 5xx is classified (and messaged) as what it is instead of
-  reading as a stall.
-- A turn that is simply still streaming is never treated as a failure. A bounded sweep re-reads
-  recently active sessions as a backstop for errors the stream missed, but it reports only real
-  errors — "no completion timestamp" is the same shape as a slow model mid-thought, and reacting
-  to it would inject a resume into a live turn and duplicate the work.
-
-Because that stream is high-volume (a live 2.0.30 server emitted 2064 `skill.updated` events in a
-~30s window against 418 events of everything else combined), event families the engine has no
-handling for are dropped before any work is done, keeping the hot path free. It is a denylist, not
-an allowlist: an event family the engine learns to handle later still reaches it.
-
-**Two behavior notes on V2** (platform changes, not plugin limitations):
-- V2 removed the `todowrite` tool and the `todo.updated` event. The TODO drive, improvement
-  loop and wrap-up therefore track the plan the model writes inline (markdown checkboxes or a
-  "next steps" list). Detection scans the most recent such plan across recent assistant
-  messages, so a plan stated a few turns ago keeps driving even when the newest reply is a
-  short acknowledgment. The autoprompts were reworded to work for both structured todos and
-  inline plans.
-- V2 removed `client.app.log`. Log lines fall back to the server console; the plugin's own
-  notice drop-file (`auto-resume-notices.jsonl`) and OS notifications are unaffected.
-
-### Why each recovery message is different
-
-A single generic "a provider turn failed, continue" prompt is wrong for most failures — the
-remedy differs, and giving the wrong remedy makes the model do the wrong thing. Each failure
-shape therefore gets its own message:
-
-| Failure | What the model is told |
-|---|---|
-| Transport drop (`ECONNRESET`, DNS, TLS, socket hang) | Resume mid-token; your reasoning wasn't rejected and your output is still in the transcript |
-| Provider 5xx / 529 / gateway | Same request, same plan — the provider is unhealthy, not your request |
-| Rate limited (429) | The actual retry window and provider name, plus: land a complete verified increment so a second throttle can't lose everything |
-| Quota / credits exhausted, no alternate model | Spend what's left finishing work in flight; start nothing new; keep replies tight |
-| Safety filter (V2 reports the finish reason directly) | Repeating verbatim will be blocked again — reframe, or complete everything else and state what you skipped |
-| Context overflow → compaction | Compaction is expected, nothing was lost, do **not** restart the task |
-| Stall while a tool was still running | Check whether the tool already landed before re-running it — a repeated migration or deploy is the expensive mistake |
-| Truncated output (`finish: "length"`) | Resume at the cut point; don't re-emit finished code; split the work if it won't fit |
-
-OpenCode 2 is what makes several of these possible. It exposes the provider's own account of a
-failure as structured data rather than only an error string:
-
-- `Session.Message.Assistant.finish` — a first-class reason (`stop` / `length` / `tool-calls` /
-  `content-filter` / `error` / `unknown`). The content-filter case is only detectable this way.
-- `session.status` → `{ type: "retry", attempt, message, action: { reason, provider, title, link }, next }` —
-  the provider's own reason, its name, and the moment it will try again. The rate-limit prompt
-  quotes these directly instead of guessing.
-- `Session.Message.Assistant.retry` — how many times the core already retried before giving up.
-- `Session.StructuredError` — `{ type, message, status }` instead of a message-string blob.
-
-A failure the plugin genuinely cannot attribute is **not** retried; it's surfaced. Hammering a
-request the provider refused for a reason we can't name wastes quota and hides the problem.
-
-### Permission payload shapes
-
-The autopilot tolerates every known shape; the source of truth lives in [`tests/fixtures/permission-shapes.json`](tests/fixtures/permission-shapes.json) and every entry is asserted on each test run:
-
-| Shape | Where seen | Type field | Autopilot |
-|---|---|---|---|
-| `core-flat-*` | current cores | top-level `permission` = tool-name string | answered per tool rules |
-| `legacy-type-field` | older cores / mocks | top-level `type` | answered per tool rules |
-| `nested-info-object` | some intermediate builds (`permission.asked`) | info object under `p.permission` | answered per tool rules |
-| `unknown-type-safe-mode` | any unlisted tool in safe mode | — | left for human decision (logged) |
-
-Reply delivery probes the SDK surface (`postSessionByIdPermissionsByPermissionId` → `respondToPermission` → …) until one method resolves, so client version drift cannot strand a pending ask.
-
-## Development
-
-```sh
-git clone https://github.com/neohiro/auto-resume && cd auto-resume
-npm test        # <!-- coverage -->340+ assertions across 17 suites<!-- /coverage --> (+1 Bun-gated integration suite), mocked SDK, no OpenCode needed
-```
-
-The Node suites simulate full failure scenarios (outages, quota walls, stalls, permission storms, todo loops, adversarial input, per-OS notifier branches) against a mocked client and assert on every injected prompt, abort, permission response, and user notice — including OpenCode's real permission payload shape (`{ id, sessionID, permission: "<tool>", metadata }`). `tests/v2entry.mjs` drives the **V2 default export** against a mock V2 plugin context — the recovery path across all three event-stream encodings, permission autopilot, message normalization, and the cross-message plan fallback that replaces the removed `todowrite` tool. `tests/reanimate.mjs` covers **restart auto-resume** specifically: that an interrupted session is revived through the V2 default export with no `session.list()` available at all, on the first boot after a self-update, and that sessions the user stopped or that are empty are left alone. `tests/prompts.mjs` pins **message routing**: that each failure shape reaches its own message, that the V2 retry window and provider name reach the rate-limit prompt, that a content-filtered turn is reframed rather than repeated, and that an unattributable failure is not blindly retried. `tests/v2review.mjs` pins the adapter's hot-path invariants: that high-volume noise events (`skill.updated` and friends) cost nothing before reaching the engine, that real `session.*` events still get through that filter, that a turn which is merely still streaming is never misreported as a failure, and that a genuinely errored turn still is. `tests/integration.bun.mjs` boots the plugin with Bun's real shell runner and dispatches a genuine OS notification (skipped automatically under plain Node; `npm run test:integration` or CI's setup-bun job runs it). `node scripts/verify-updater.mjs` proves the self-updater end-to-end against the live GitHub repo (network required, run separately).
-
-### Windows unattended notes (UAC / SmartScreen)
-
-Unattended sessions on Windows can stall when the OS throws a consent dialog at your toolchain — most commonly **SmartScreen / UAC gating the first run of a downloaded binary** (portable Node, npm-installed CLIs). That is Mark-of-the-Web provenance, not a permission problem OpenCode can auto-answer. Mitigate once, from any shell:
-
-```powershell
-# strip download provenance from trusted tooling (add -WhatIf to preview)
-powershell -ExecutionPolicy Bypass -File scripts\unblock-tooling.ps1 -Path C:\path\to\node-or-tools
-```
-
-Additional hardening that keeps agents running unattended:
-
-- **Prefer 64-bit builds** of local runtimes — 32-bit executables without an elevation manifest hit Windows' Installer-Detection heuristic (argv keywords like `install`/`update` can trigger a UAC prompt).
-- **Keep long-lived toolchains out of `%TEMP%`** — prefer `%LOCALAPPDATA%\tools`; temp dirs get swept by AV/cleanup and re-flagged.
-- The plugin itself never requests elevation: its only OS integration spawns the signed `System32\WindowsPowerShell\v1.0\powershell.exe` with `-NoProfile -NonInteractive -EncodedCommand`.
-
-## License
-
-[MIT](LICENSE)
-
-
-[![Visitors](https://api.visitorbadge.io/api/visitors?path=github.com/neohiro/auto-resume&label=Visitors&countColor=%23263759)](https://visitorbadge.io/status?path=github.com/neohiro/auto-resume)
+<div align="center"><b>Made to exceed expectations — not just meet them.</b></div>
