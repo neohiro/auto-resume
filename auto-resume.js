@@ -203,7 +203,7 @@
 import { writeFile, rename, unlink } from "node:fs/promises"
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:crypto"
 
-const AUTO_RESUME_VERSION = "2.1.2"
+const AUTO_RESUME_VERSION = "2.1.5"
 
 /** Optional sidecar encryption. When OPENCODE_RESUME_ENCRYPTION_KEY is set,
  *  all persisted stores are encrypted with AES-256-GCM and the ciphertext is
