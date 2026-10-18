@@ -5820,8 +5820,16 @@ export default {
           // timing and a running-tool grace window. Since session.step.failed
           // is mapped, this sweep only needs to catch errors the stream
           // missed.
+          // Guard against event-duplication: sweep must not synthesize an error
+          // the event pump (session.step.failed / retry.scheduled) already handled.
           if (info.error) {
-            synth("session.error", { sessionID, error: v2ErrorToV1(info.error) })
+            const synthLockKey = sessionID
+            const recentErr = (lastErrorSynthAt.get(sessionID) ?? 0) > Date.now() - DUPLICATE_INCIDENT_WINDOW_MS
+            if (!sessionErrorSynthLock.has(synthLockKey) && !recentErr) {
+              sessionErrorSynthLock.add(synthLockKey)
+              synth("session.error", { sessionID, error: v2ErrorToV1(info.error) })
+              lastErrorSynthAt.set(sessionID, Date.now())
+            }
           }
         } catch { /* session gone or unreadable */ }
       }
