@@ -5271,9 +5271,16 @@ const V2_NOISE_EVENTS = [
   "server.info", "server.pair",
 ]
 
+let adapterInitLock = false
+
 export default {
   id: "auto-resume",
   setup: async (ctx) => {
+    if (adapterInitLock) {
+      // Prevent double adapter load when OpenCode reloads or duplicates hooks.
+      return
+    }
+    adapterInitLock = true
     const hooksForClient = {}
     const { client, setStatus, remember, rememberRetryStatus, retryHint, statusBySession } = buildV2Client(ctx, hooksForClient)
 
