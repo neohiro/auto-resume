@@ -201,8 +201,36 @@
  */
 
 import { writeFile, rename, unlink } from "node:fs/promises"
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:crypto"
 
 const AUTO_RESUME_VERSION = "2.1.2"
+
+/** Optional sidecar encryption. When OPENCODE_RESUME_ENCRYPTION_KEY is set,
+ *  all persisted stores are encrypted with AES-256-GCM and the ciphertext is
+ *  stored as base64. No plaintext session IDs or health metrics are written. */
+const ENCRYPTION_KEY = process.env.OPENCODE_RESUME_ENCRYPTION_KEY || null
+const encryptPayload = (text) => {
+  if (!ENCRYPTION_KEY) return text
+  const iv = randomBytes(16)
+  const key = scryptSync(ENCRYPTION_KEY, "auto-resume-salt-v2", 32)
+  const cipher = createCipheriv("aes-256-gcm", key, iv)
+  const encrypted = Buffer.concat([cipher.update(text, "utf8"), cipher.final()])
+  const tag = cipher.getAuthTag()
+  return iv.toString("base64") + ":" + encrypted.toString("base64") + ":" + tag.toString("base64")
+}
+const decryptPayload = (data) => {
+  if (!ENCRYPTION_KEY) return data
+  if (typeof data !== "string" || !data.includes(":")) return data
+  const [ivB64, encB64, tagB64] = data.split(":")
+  const iv = Buffer.from(ivB64, "base64")
+  const encrypted = Buffer.from(encB64, "base64")
+  const tag = Buffer.from(tagB64, "base64")
+  const key = scryptSync(ENCRYPTION_KEY, "auto-resume-salt-v2", 32)
+  const decipher = createDecipheriv("aes-256-gcm", key, iv)
+  decipher.setAuthTag(tag)
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8")
+}
+
 const UPDATE_URL =
   "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
 
@@ -1431,7 +1459,9 @@ export const createEngine = async ({ client }) => {
       loading ??= (async () => {
         try {
           const { readFile } = await import("node:fs/promises")
-          const raw = JSON.parse(await readFile(path, "utf8"))
+          const rawText = await readFile(path, "utf8")
+          const decrypted = decryptPayload(rawText)
+          const raw = JSON.parse(decrypted)
           const cutoff = Date.now() - STORE_TTL_MS
           if (raw && typeof raw === "object") {
             for (const [id, ts] of Object.entries(raw)) {
@@ -1448,7 +1478,7 @@ export const createEngine = async ({ client }) => {
       const out = {}
       const cutoff = Date.now() - STORE_TTL_MS
       for (const [id, ts] of map) if (ts > cutoff) out[id] = ts
-      const payload = JSON.stringify(out, null, 2)
+      const payload = encryptPayload(JSON.stringify(out, null, 2))
       const tmp = `${path}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
       try {
         await writeFile(tmp, payload, "utf8")
@@ -1500,7 +1530,9 @@ export const createEngine = async ({ client }) => {
       loading ??= (async () => {
         try {
           const { readFile } = await import("node:fs/promises")
-          const raw = JSON.parse(await readFile(path, "utf8"))
+          const rawText = await readFile(path, "utf8")
+          const decrypted = decryptPayload(rawText)
+          const raw = JSON.parse(decrypted)
           if (raw && typeof raw === "object") {
             for (const [key, val] of Object.entries(raw)) {
               if (val && typeof val === "object") map.set(key, val)
@@ -1515,7 +1547,7 @@ export const createEngine = async ({ client }) => {
       if (!path) return
       const out = {}
       for (const [key, val] of map) out[key] = val
-      const payload = JSON.stringify(out, null, 2)
+      const payload = encryptPayload(JSON.stringify(out, null, 2))
       const tmp = `${path}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
       try {
         await writeFile(tmp, payload, "utf8")
