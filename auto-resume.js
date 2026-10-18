@@ -517,22 +517,21 @@ const PROMPTS = {
    *  heaviest part. Also worth steering toward landing an increment so a
    *  second throttle can't lose everything. */
   rateLimited: (auto, detail, hint) =>
-    `${RESUME_TAG} Auto-resume. Rate limited.` +
+    `${RESUME_TAG} Rate limited.` +
     (hint?.provider ? ` Provider: ${hint.provider}.` : "") +
-    (hint?.retryWait ? ` Retry window: ~${hint.retryWait}.` : "") +
-    (hint?.reason ? ` Provider says: "${String(hint.reason).slice(0, 90)}".` : (detail ? ` Cause: "${detail}".` : "")) +
-    ` Nothing is wrong with your work and nothing was lost.` +
-    ` If the remaining work is large, land a complete, verified increment first, then continue.` +
+    (hint?.retryWait ? ` Window: ~${hint.retryWait}.` : "") +
+    (hint?.reason ? ` Note: "${String(hint.reason).slice(0, 80)}".` : (detail ? ` Cause: "${detail}".` : "")) +
+    ` Work continues; this may be temporary. Land a verified increment when possible.` +
     TRANSCRIPT_INTACT,
 
   /** 402 / free tier / insufficient credits with no alternate model available.
    *  Budget is the binding constraint, so the instruction is about *spending*
    *  it: finish what is in flight, start nothing new, keep replies tight. */
   quotaExhausted: (auto, detail, hint) =>
-    `${RESUME_TAG} Auto-resume on an exhausted quota/credit balance, with no alternate model available.` +
-    (detail ? ` Cause: "${detail}".` : "") +
-    ` Spend what remains on the highest-value work: finish and verify what is already in flight rather than starting anything new.` +
-    ` Keep replies tight — no preamble, no restated context, no unchanged code blocks. Edits over rewrites, diffs over restatement.`,
+    `${RESUME_TAG} Quota/credit balance low.` +
+    (detail ? ` Note: "${detail}".` : "") +
+    ` Work continues within remaining budget; prefer verified increments.` +
+    TRANSCRIPT_INTACT,
 
   /** Provider safety filter stopped the turn. Retrying verbatim is guaranteed
    *  to fail again and burns quota, so the message's whole job is to change the
