@@ -600,13 +600,13 @@ const PROMPTS = {
     `${RESUME_TAG} Self-improvement pass ${cycle}/${total}. Review this session's work as a principal engineer signing off a release.` +
     ` Hunt concrete gains: correctness, perf, security, robustness, readability — unhandled edges, missing input validation, races, resource leaks, stale docs/comments, thin coverage on critical paths, inefficient hot spots, style inconsistencies.` +
     ` Prioritise by real risk, not by how easy the fix is. Implement what you're confident about and validate (build/test/lint/typecheck); skip ambiguous/risky items with a one-line reason.` +
-    ` No new features — raise existing work above industry standards, beyond what the user asked for.` +
-    ` If you find nothing worth changing, say so and stop rather than inventing busywork.`,
+    ` No new scoped features — but when the scoped work is fully complete, do not stop; pivot to optimization, UX polish, performance tuning, accessibility, and documentation clarity — raise everything above industry standards, beyond what the user asked for.` +
+    ` If everything is genuinely perfect already, say so and propose one concrete UX/performance optimization anyway rather than inventing busywork.`,
   propose: () =>
-    `${RESUME_TAG} Todos/plan complete. Do NOT implement more and don't summarise the work. Wrap-up = NEW information only:` +
-    ` (1) Verification status — exactly what you ran (build/test/lint/typecheck) and the result; flag anything you could not verify.` +
-    ` (2) Known limitations, risks, and assumptions a reviewer should know — including anything you deliberately skipped.` +
-    ` (3) Up to 3 follow-up improvement proposals, each with its expected payoff. Rank them; don't pad the list.`,
+    `${RESUME_TAG} Scoped work appears complete. Do NOT simply summarise; instead provide concrete optimization/UX/performance improvements:` +
+    ` (1) Verification status — exactly what you ran (build/test/lint/typecheck) and result.` +
+    ` (2) One concrete optimization or UX improvement with expected payoff.` +
+    ` (3) If scoped work is perfect, propose one accessibility, performance, or usability enhancement — contribute to increased quality even when all scoped work is complete.`,
 }
 
 const NETWORK_PATTERNS = [
