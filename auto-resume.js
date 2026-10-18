@@ -3056,6 +3056,12 @@ export const createEngine = async ({ client }) => {
   // ── central failure handler ────────────────────────────────────────
   const handleError = async (sessionID, error) => {
     if (!sessionID) return
+    // Suppress false-positive error autoprompts when no real error exists.
+    const hasRealError = error && (error.name || (error.data && (error.data.statusCode || error.data.message)) || error.message)
+    if (!hasRealError) {
+      log("info", "ignoring false-positive error prompt — no real error", { sessionID })
+      return
+    }
     if (sessions.get(sessionID)?.child) {
       log("info", "ignoring error in subagent session (parent orchestrates)", { sessionID })
       return
