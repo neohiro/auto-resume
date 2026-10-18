@@ -2863,12 +2863,21 @@ export const createEngine = async ({ client }) => {
     // correctly identifies subsequent identical asks and keeps escalating.
     s.previousKind = originalKind
     s.previousKindChain = s.chain
-    const nowMs = Date.now()
-    if (s.lastScheduleAt && (nowMs - s.lastScheduleAt < 3000)) {
-      log("info", `suppressing rapid duplicate schedule for ${sessionID}`)
+    // Duplicate-prevention lives in exactly two places, and both are needed:
+    //   • scheduledKinds (below) — blocks a SECOND live timer for the same
+    //     session+kind. A poll re-arm is the same timer continuing, not a
+    //     duplicate, so it is exempt (see BUSY_POLL re-schedule in runPlan).
+    //   • lastInjected (in runPlan) — blocks a second injection of the same kind
+    //     inside the dispatch window.
+    // Nothing else may gate scheduling: an earlier wall-clock guard here looked
+    // harmless but silently killed poll re-arms and dropped recovery entirely.
+    // Final duplicate-prevention layer: suppress any new schedule within 3s of a
+    // previous injection — catches engine-level / cross-instance duplicates.
+    const last = lastInjected.get(sessionID)
+    if (last && (Date.now() - last.at < 3000)) {
+      log("info", `suppressing rapid duplicate schedule (${plan.kind}) for ${sessionID}: last ${last.kind} at ${last.at}`)
       return
     }
-    s.lastScheduleAt = nowMs
     const kindKey = `${sessionID}|${plan.kind}`
     if (!cfg.budgetPrompts && (plan.kind === "lowBudget" || plan.kind === "quota")) {
       log("info", `budget prompts disabled; skipping "${plan.kind}" for ${sessionID}`)
