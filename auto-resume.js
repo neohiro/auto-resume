@@ -584,10 +584,10 @@ const PROMPTS = {
     ` Reconstruct state from the conversation + codebase (re-read files if unsure); continue from exactly where you stopped.` +
     ` Exceed industry standards on the remaining work.`,
   lowBudget: (auto, detail, modelNote) =>
-    `${RESUME_TAG} Auto-resume on a tight token/credit budget. The previous reply was rejected for exceeding max_tokens the account can afford.` +
-    (detail ? ` Cause: "${detail}".` : "") +
+    `${RESUME_TAG} Quality-demanding retry — verify state from conversation + codebase, then resume from exactly where you stopped, exceeding industry standards.` +
+    (detail ? ` Note: "${detail}".` : "") +
     (modelNote ? ` ${modelNote}` : "") +
-    ` Lead with the answer, justify concisely. Skip preamble, restated context, and unchanged code blocks. Edits > rewrites; diffs > restatements. Tight prose, minimal code, no corners cut on correctness or verification. Quality bar above user expectations.` +
+    ` Lead with substance, skip preamble/restated context/unchanged code. Edits > rewrites; diffs > restatements. Verify correctness; no corners cut.` +
     (auto ? AUTONOMY_DIRECTIVE_TIGHT : ""),
   truncated: (auto) =>
     `${RESUME_TAG} Last reply hit the provider's max output length and was cut off mid-stream — not a content rejection.` +
