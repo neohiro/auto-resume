@@ -1423,6 +1423,7 @@ export const createEngine = async ({ client }) => {
   const permissionPendingById = new Map() // "sessionID|permID" -> timestamp (for dedupe)
   const modelCooldown = new Map() // "provider/model" -> untilTs
   const timers = new Map()
+  const scheduledKinds = new Set() // sessionID|kind -> prevents duplicate schedules
   const breakerFailures = []
   let breakerOpenUntil = 0
   let breakerNoted = false
@@ -2861,10 +2862,17 @@ export const createEngine = async ({ client }) => {
     // correctly identifies subsequent identical asks and keeps escalating.
     s.previousKind = originalKind
     s.previousKindChain = s.chain
+    const kindKey = `${sessionID}|${plan.kind}`
+    if (scheduledKinds.has(kindKey)) {
+      log("info", `skipping duplicate schedule "${plan.kind}" for ${sessionID}`)
+      return
+    }
     const existing = timers.get(sessionID)
     if (existing) clearTimeout(existing)
+    scheduledKinds.add(kindKey)
     const t = setTimeout(() => {
       timers.delete(sessionID)
+      scheduledKinds.delete(kindKey)
       detach(runPlan(sessionID, plan), "runPlan")
     }, delayMs)
     t.unref?.()
@@ -2881,6 +2889,7 @@ export const createEngine = async ({ client }) => {
   const cancelPending = (sessionID, why) => {
     const t = timers.get(sessionID)
     if (t) { clearTimeout(t); timers.delete(sessionID) }
+    for (const k of scheduledKinds) if (k.startsWith(`${sessionID}|`)) scheduledKinds.delete(k)
     const s = sessions.get(sessionID)
     if (s) {
       s.pendingResume = false
