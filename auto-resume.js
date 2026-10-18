@@ -2863,6 +2863,12 @@ export const createEngine = async ({ client }) => {
     // correctly identifies subsequent identical asks and keeps escalating.
     s.previousKind = originalKind
     s.previousKindChain = s.chain
+    const nowMs = Date.now()
+    if (s.lastScheduleAt && (nowMs - s.lastScheduleAt < 3000)) {
+      log("info", `suppressing rapid duplicate schedule for ${sessionID}`)
+      return
+    }
+    s.lastScheduleAt = nowMs
     const kindKey = `${sessionID}|${plan.kind}`
     if (!cfg.budgetPrompts && (plan.kind === "lowBudget" || plan.kind === "quota")) {
       log("info", `budget prompts disabled; skipping "${plan.kind}" for ${sessionID}`)
