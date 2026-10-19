@@ -263,6 +263,7 @@ const DEFAULT_AGGRESSION = "balanced"
 const DEFAULTS = {
   enabled: true,
   budgetPrompts: false,
+  reanimate: false,
   baseDelayMs: 5_000,
   maxDelayMs: 120_000,
   rateLimitBaseMs: 20_000,
@@ -912,6 +913,7 @@ function loadConfig() {
   return {
     enabled: bool("OPENCODE_RESUME_ENABLED", DEFAULTS.enabled),
     budgetPrompts: bool("OPENCODE_RESUME_BUDGET_PROMPTS", DEFAULTS.budgetPrompts),
+    reanimate: bool("OPENCODE_RESUME_REANIMATE", DEFAULTS.reanimate),
     maxChain: hasRawChain
       ? num("OPENCODE_RESUME_MAX_CHAIN", preset.maxChain)
       : preset.maxChain,
@@ -5436,9 +5438,15 @@ export default {
           // arrived and make the turn look empty -- which silently skips idle
           // evaluation, and with it every recovery, todo-drive and improvement
           // path. An ended step is the opposite of busy.
-          const finish = payload.finish ?? payload.rawFinish
-          // "tool-calls" => another step follows, so NOT a turn end.
-          if (finish !== "tool-calls") armIdle(sessionID)
+          const finish = String(payload.finish ?? payload.rawFinish ?? "").toLowerCase().trim()
+          const recentFailure = (lastErrorSynthAt.get(sessionID) ?? 0) > Date.now() - 3000
+          // Guard against malformed/missing finish values.
+          const isRealEnd = finish && finish !== "" && !(finish === "busy" || (String(payload.rawFinish ?? "").includes("busy") && !finish.includes("stop")))
+          if (finish === "tool-calls") {
+            // Another step follows: NOT a turn end.
+          } else if (isRealEnd && !recentFailure) {
+            armIdle(sessionID)
+          }
         }
         return
       }
@@ -5508,7 +5516,11 @@ export default {
           synth("session.error", { sessionID, error: normalized })
           lastErrorSynthAt.set(sessionID, Date.now())
         }
-        // The turn is over either way, so evaluate idle state.
+        // Clear synthesis lock after recovery injects so a future error
+        // (e.g., retry after rotation) is not permanently suppressed.
+        const clearTimer = setTimeout(() => sessionErrorSynthLock.delete(synthLockKey), 30000)
+        clearTimer.unref?.()
+        // The turn is over either way, so evaluate idle state once.
         armIdle(sessionID)
         return
       }
@@ -5520,8 +5532,25 @@ export default {
        * Stop be "recovered" from, which is exactly the behaviour the plugin
        * promises never to do. Just let the turn end. */
       if (type === "session.execution.interrupted") {
+        // FIX: tool-execution interrupted must reach the engine (message.part.updated
+        // with interrupted error) so evaluation doesn't miss a stopped tool.
         if (!sessionID) return
         cancelIdle(sessionID)
+        // Tool execution interrupted needs to reach the engine so it can
+        // count the failure / stop correctly, not just sit idle silently.
+        synth("message.part.updated", {
+          part: {
+            type: "tool",
+            sessionID,
+            tool: payload.tool ?? payload.name ?? "unknown",
+            callID: payload.id ?? payload.callID ?? "",
+            state: {
+              status: "error",
+              input: payload.input ?? payload.text,
+              error: { name: "ExecutionInterrupted", message: "Tool execution interrupted" },
+            },
+          },
+        })
         armIdle(sessionID)
         return
       }
@@ -5543,6 +5572,11 @@ export default {
 
       if (type === "session.deleted") {
         if (!sessionID) return
+        // Performance: purge dead message cache for deleted session so
+        // long-lived servers don't retain useless entries.
+        for (const key of messageCache.keys()) {
+          if (key.startsWith(`${sessionID}|`)) messageCache.delete(key)
+        }
         synth("session.deleted", { sessionID })
         return
       }
