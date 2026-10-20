@@ -1,10 +1,10 @@
 <div align="center">
 
-# auto-resume <!-- version --> 2.1.5
+# auto-resume <!-- version --> 2.1.7
 
 **Self-healing OpenCode sessions · retries · model rotation · permission autopilot · quality loops**
 
-[![Version](https://img.shields.io/badge/version-2.1.5-blue)](https://github.com/neohiro/auto-resume/releases)
+[![Version](https://img.shields.io/badge/version-2.1.7-blue)](https://github.com/neohiro/auto-resume/releases)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![OpenCode](https://img.shields.io/badge/plugin-opencode-black)](https://opencode.ai)
 
@@ -100,6 +100,7 @@ Full list in file header (lines 128–201).
 
 ## Version history (compact)
 
+- **2.1.7** — double-prompt race fixed (synchronous `dispatchClaims` claim, byte-identical text dedupe, bounded deferred retry); `scheduledKinds` timer-key leak fixed; `ReferenceError` in user-turn handler fixed; regression suite `tests/doubleprompt.mjs`; bounded-concurrency reanimate prefetch (8 workers, 15 s deadline)
 - **2.1.5** — encrypted sidecars (AES-256-GCM); plugin registry manifest (`plugin-manifest.json`)
 - **2.1.4** — improvement cycles pivot to optimization/UX when work complete; `propose` demands concrete payoff
 - **2.1.3** — session-level error-synthesis lock stops double prompts; `sessionErrorSynthLock`
@@ -111,6 +112,12 @@ Full list in file header (lines 128–201).
 - **2.0.2** – honor provider-stated retry window
 - **2.0.1** – rotation master control for auth/rotation
 - **2.0.0** – complete OpenCode 2 migration
+
+---
+
+## Test coverage
+
+<!-- coverage -->350+ assertions across 18 suites<!-- /coverage -->
 
 ---
 

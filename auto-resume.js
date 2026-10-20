@@ -203,7 +203,7 @@
 import { writeFile, rename, unlink } from "node:fs/promises"
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:crypto"
 
-const AUTO_RESUME_VERSION = "2.1.6"
+const AUTO_RESUME_VERSION = "2.1.7"
 
 /** Optional sidecar encryption. When OPENCODE_RESUME_ENCRYPTION_KEY is set,
  *  all persisted stores are encrypted with AES-256-GCM and the ciphertext is
@@ -248,11 +248,16 @@ const MODULE_SELF_PATH = (() => {
   } catch { return null }
 })()
 
-/** One-word aggression preset → (maxChain, maxStallTakeovers). Numeric
- *  env vars (OPENCODE_RESUME_MAX_CHAIN, OPENCODE_RESUME_MAX_STALL_TAKEOVERS)
- *  override the preset when set. conservative matches the pre-1.14 hard cap;
- *  relentless buys maximum headroom for unattended free-tier runs where the
- *  user genuinely wants the agent to keep trying. balanced is the default. */
+/** One-word aggression preset → (maxChain, maxStallTakeovers).
+ *
+ *  These presets are OPT-IN. By default the plugin retries forever: a
+ *  recovery attempt is never the last one, so a provider outage that clears
+ *  at 3am is still picked up at 3am. The presets exist for people who want
+ *  a hard ceiling back (a metered provider, a shared machine), and they are
+ *  only applied when OPENCODE_RESUME_AGGRESSION is set explicitly.
+ *
+ *  Numeric env vars (OPENCODE_RESUME_MAX_CHAIN, OPENCODE_RESUME_MAX_STALL_TAKEOVERS)
+ *  override the preset when set. `0` means "no ceiling" for both. */
 const AGGRESSION_PRESETS = {
   conservative: { maxChain: 6, maxStallTakeovers: 2 },
   balanced:     { maxChain: 8, maxStallTakeovers: 4 },
@@ -260,10 +265,22 @@ const AGGRESSION_PRESETS = {
 }
 const DEFAULT_AGGRESSION = "balanced"
 
+/** Sentinel for "no ceiling". Every counter compared against it stays
+ *  reachable, so the retry paths never hit a give-up branch. */
+const UNLIMITED = Number.POSITIVE_INFINITY
+
+/** Resolve a cap from an env var. `0` (or an absent var) means unlimited. */
+const capFromEnv = (name, fallback) => {
+  const raw = process.env[name]
+  if (raw === undefined || raw === "") return fallback
+  const v = Number(raw)
+  if (!Number.isFinite(v) || v < 0) return fallback
+  return v > 0 ? v : UNLIMITED
+}
+
 const DEFAULTS = {
   enabled: true,
   budgetPrompts: false,
-  reanimate: false,
   baseDelayMs: 5_000,
   maxDelayMs: 120_000,
   rateLimitBaseMs: 20_000,
@@ -306,6 +323,11 @@ const DEFAULTS = {
   runningToolFactor: 4,
   retryTakeoverMs: 900_000,
   retryFutureCapMs: 600_000,
+  /* Revive sessions that were open when the client/server went down.
+   *
+   *  ON by default: the whole point of the plugin is that a restart (client
+   *  crash, laptop lid, service restart) does not lose the tabs you had
+   *  open. Every open session tab gets its own auto-resume prompt back. */
   reanimate: true,
   reanimateWindowMs: 600_000,
   favoriteReturn: true,
@@ -903,23 +925,32 @@ function bool(name, fallback) {
 function loadConfig() {
   // The retry base, read once so the fast-retry path can inherit it.
   const cfgBaseDelay = () => num("OPENCODE_RESUME_BASE_DELAY_MS", DEFAULTS.baseDelayMs)
-  const aggressionRaw = str("OPENCODE_RESUME_AGGRESSION", DEFAULT_AGGRESSION).toLowerCase()
-  const aggressionKey = Object.hasOwn(AGGRESSION_PRESETS, aggressionRaw)
-    ? aggressionRaw
-    : DEFAULT_AGGRESSION
-  const preset = AGGRESSION_PRESETS[aggressionKey]
-  const hasRawChain = process.env.OPENCODE_RESUME_MAX_CHAIN !== undefined
-  const hasRawStall = process.env.OPENCODE_RESUME_MAX_STALL_TAKEOVERS !== undefined
+  const aggressionRaw = str("OPENCODE_RESUME_AGGRESSION", "").toLowerCase()
+  const hasRawAggression = Object.hasOwn(AGGRESSION_PRESETS, aggressionRaw)
+  const preset = AGGRESSION_PRESETS[hasRawAggression ? aggressionRaw : DEFAULT_AGGRESSION]
+  /* Retry ceiling — UNLIMITED unless the user asks for one.
+   *
+   *  The whole recovery loop is built around "keep trying until it works":
+   *  a provider outage that lasts an hour must not turn into a dead session.
+   *  So no ceiling is applied by default and the aggression presets only
+   *  bite when OPENCODE_RESUME_AGGRESSION is set explicitly.
+   *
+   *  OPENCODE_RESUME_MAX_CHAIN / OPENCODE_RESUME_MAX_STALL_TAKEOVERS win over
+   *  the preset, and `0` means "no ceiling" there too. */
+  const chainCap = capFromEnv(
+    "OPENCODE_RESUME_MAX_CHAIN",
+    hasRawAggression ? preset.maxChain : UNLIMITED,
+  )
+  const stallCap = capFromEnv(
+    "OPENCODE_RESUME_MAX_STALL_TAKEOVERS",
+    hasRawAggression ? preset.maxStallTakeovers : UNLIMITED,
+  )
   return {
     enabled: bool("OPENCODE_RESUME_ENABLED", DEFAULTS.enabled),
     budgetPrompts: bool("OPENCODE_RESUME_BUDGET_PROMPTS", DEFAULTS.budgetPrompts),
     reanimate: bool("OPENCODE_RESUME_REANIMATE", DEFAULTS.reanimate),
-    maxChain: hasRawChain
-      ? num("OPENCODE_RESUME_MAX_CHAIN", preset.maxChain)
-      : preset.maxChain,
-    maxStallTakeovers: hasRawStall
-      ? Math.max(1, num("OPENCODE_RESUME_MAX_STALL_TAKEOVERS", preset.maxStallTakeovers))
-      : preset.maxStallTakeovers,
+    maxChain: chainCap,
+    maxStallTakeovers: stallCap,
     baseDelayMs: num("OPENCODE_RESUME_BASE_DELAY_MS", DEFAULTS.baseDelayMs),
     maxDelayMs: num("OPENCODE_RESUME_MAX_DELAY_MS", DEFAULTS.maxDelayMs),
     rateLimitBaseMs: num("OPENCODE_RESUME_RATE_LIMIT_BASE_MS", DEFAULTS.rateLimitBaseMs),
@@ -932,7 +963,6 @@ function loadConfig() {
     runningToolFactor: Math.max(1, num("OPENCODE_RESUME_RUNNING_TOOL_FACTOR", DEFAULTS.runningToolFactor)),
     retryTakeoverMs: num("OPENCODE_RESUME_RETRY_TAKEOVER_MS", DEFAULTS.retryTakeoverMs),
     retryFutureCapMs: num("OPENCODE_RESUME_RETRY_FUTURE_CAP_MS", DEFAULTS.retryFutureCapMs),
-    reanimate: bool("OPENCODE_RESUME_REANIMATE", DEFAULTS.reanimate),
     reanimateWindowMs: num("OPENCODE_RESUME_REANIMATE_WINDOW_MS", DEFAULTS.reanimateWindowMs),
     favoriteReturn: bool("OPENCODE_RESUME_FAVORITE_RETURN", DEFAULTS.favoriteReturn),
     favoriteCheckAfterMs: num("OPENCODE_RESUME_FAVORITE_CHECK_AFTER_MS", DEFAULTS.favoriteCheckAfterMs),
@@ -1418,7 +1448,7 @@ const armShutdownHooks = () => {
   }
 }
 
-export const createEngine = async ({ client }) => {
+export const createEngine = async ({ client, releaseErrorSynth }) => {
   const cfg = loadConfig()
 
   const sessions = new Map() // sessionID -> state
@@ -2102,6 +2132,9 @@ export const createEngine = async ({ client }) => {
   // ── circuit breaker ────────────────────────────────────────────────
   const breakerOpen = () => Date.now() < breakerOpenUntil
   const noteResumeFailure = () => {
+    // Threshold 0 disables the breaker entirely — the "retry forever, never
+    // pause" posture some users want on a provider they know is flaky.
+    if (cfg.breakerThreshold <= 0) return
     const nowMs = Date.now()
     breakerFailures.push(nowMs)
     while (breakerFailures.length && nowMs - breakerFailures[0] > cfg.breakerWindowMs) breakerFailures.shift()
@@ -2371,11 +2404,20 @@ export const createEngine = async ({ client }) => {
 
   /** How many recovery attempts this session gets before giving up.
    *
-   *  maxChain is a COUNT, and shortening every wait shrinks the wall-clock
-   *  window that count covers. At an 8s ceiling, 8 attempts spanned ~40s —
-   *  against ~8.5 minutes for the old escalating schedule at the same count.
-   *  That traded "persistent" for "snappy": a two-minute outage the old timing
-   *  rode out got abandoned in under a minute.
+   *  UNLIMITED by default. There is no ceiling on a recovery attempt: the
+   *  plugin's contract is "keep trying until it works", so an outage that
+   *  lasts an hour is ridden out instead of turning into a dead session.
+   *  The wall-clock spacing still grows (see retryDelay), so an infinite
+   *  budget is not an infinite request rate — the delay is capped, not the
+   *  attempt count.
+   *
+   *  When a ceiling IS configured (OPENCODE_RESUME_MAX_CHAIN, or an
+   *  aggression preset), maxChain is a COUNT, and shortening every wait
+   *  shrinks the wall-clock window that count covers. At an 8s ceiling, 8
+   *  attempts spanned ~40s — against ~8.5 minutes for the old escalating
+   *  schedule at the same count. That traded "persistent" for "snappy": a
+   *  two-minute outage the old timing rode out got abandoned in under a
+   *  minute.
    *
    *  So the budget scales with the schedule: count how many fast attempts cover
    *  the window the escalating one covered, bounded. Solved numerically rather
@@ -2386,6 +2428,8 @@ export const createEngine = async ({ client }) => {
    *  request: an uncapped budget would spend free-tier quota to buy patience,
    *  which is backwards on exactly the free models this targets. */
   const retryBudget = () => {
+    // No ceiling configured: retry forever.
+    if (!Number.isFinite(cfg.maxChain)) return UNLIMITED
     if (!usesFastRetry()) return cfg.maxChain
     const g = Math.max(1.01, cfg.fastRetryGrowth)
     const b = Math.max(1, cfg.fastRetryBaseMs)
@@ -2865,18 +2909,25 @@ export const createEngine = async ({ client }) => {
     // correctly identifies subsequent identical asks and keeps escalating.
     s.previousKind = originalKind
     s.previousKindChain = s.chain
-    // Duplicate-prevention lives in exactly two places, and both are needed:
+    // Duplicate-prevention lives in exactly three places, and all are needed:
     //   • scheduledKinds (below) — blocks a SECOND live timer for the same
     //     session+kind. A poll re-arm is the same timer continuing, not a
     //     duplicate, so it is exempt (see BUSY_POLL re-schedule in runPlan).
     //   • lastInjected (in runPlan) — blocks a second injection of the same kind
     //     inside the dispatch window.
+    //   • the guard below — blocks a re-schedule of the SAME kind right after
+    //     an injection of that kind.
     // Nothing else may gate scheduling: an earlier wall-clock guard here looked
     // harmless but silently killed poll re-arms and dropped recovery entirely.
-    // Final duplicate-prevention layer: suppress any new schedule within 3s of a
-    // previous injection — catches engine-level / cross-instance duplicates.
+    //
+    // The guard is SAME-KIND on purpose. A blanket "anything within 3s of any
+    // injection is dropped" rule also swallowed genuinely different
+    // recoveries: a truncation nudge ("continue") followed by a network
+    // failure dropped the network recovery, and the session died with the
+    // nudge unanswered. Different kinds are different actions — only a repeat
+    // of the same action is a duplicate.
     const last = lastInjected.get(sessionID)
-    if (last && (Date.now() - last.at < 3000)) {
+    if (last && last.kind === plan.kind && (Date.now() - last.at < 3000)) {
       log("info", `suppressing rapid duplicate schedule (${plan.kind}) for ${sessionID}: last ${last.kind} at ${last.at}`)
       return
     }
@@ -2890,13 +2941,22 @@ export const createEngine = async ({ client }) => {
       return
     }
     const existing = timers.get(sessionID)
-    if (existing) clearTimeout(existing)
+    if (existing) {
+      clearTimeout(existing)
+      // The timer just killed will never run its own
+      // `scheduledKinds.delete(kindKey)`, so release it here. Left booked, that
+      // kind could never be scheduled again — every later plan of it would be
+      // dropped as a "duplicate schedule" that does not exist (a MISSED prompt,
+      // the mirror image of the double-prompt bug).
+      if (existing.kindKey) scheduledKinds.delete(existing.kindKey)
+    }
     scheduledKinds.add(kindKey)
     const t = setTimeout(() => {
       timers.delete(sessionID)
       scheduledKinds.delete(kindKey)
       detach(runPlan(sessionID, plan), "runPlan")
     }, delayMs)
+    t.kindKey = kindKey
     t.unref?.()
     timers.set(sessionID, t)
     log("info", `scheduled "${plan.kind}" in ${delayMs}ms`, { sessionID })
@@ -2947,7 +3007,7 @@ export const createEngine = async ({ client }) => {
     return true
   }
 
-  const runPlan = async (sessionID, plan) => {
+  const dispatchPlan = async (sessionID, plan) => {
     if (!injectionAllowed(sessionID)) return
     const last = lastInjected.get(sessionID)
     if (last && last.kind === plan.kind && Date.now() - last.at < 3000) {
@@ -3018,7 +3078,8 @@ export const createEngine = async ({ client }) => {
     }
 
     const model = s.currentModel ?? s.lastModel
-    const body = { parts: [{ type: "text", text: autonomousPrompt(plan) }] }
+    const text = autonomousPrompt(plan)
+    const body = { parts: [{ type: "text", text }] }
     if (model) body.model = model
 
     // Re-check after the session.status() await above. A user Stop that lands
@@ -3036,6 +3097,17 @@ export const createEngine = async ({ client }) => {
     // landing during the async call would be missed. This check catches it.
     if (plan.createdTs && s.lastUserPromptAt > plan.createdTs) {
       log("info", `dropping "${plan.kind}" — user prompt arrived during status check`, { sessionID })
+      return
+    }
+    // Byte-identical repeat inside the dedupe window. Same-kind suppression at
+    // schedule()/entry time cannot catch this: the generic resume prompt is
+    // produced by several different sources (handleError fall-through, takeover,
+    // reanimate, rearm) that all render `PROMPTS.resume(auto)` and therefore can
+    // carry DIFFERENT kinds for the same literal text. Two sources firing for one
+    // incident is never two useful prompts, so compare the rendered text.
+    const prevInject = lastInjected.get(sessionID)
+    if (prevInject?.text && prevInject.text === text && Date.now() - prevInject.at < 3000) {
+      log("info", `dropping byte-identical duplicate "${plan.kind}" for ${sessionID}`, { sessionID })
       return
     }
 
@@ -3064,7 +3136,7 @@ export const createEngine = async ({ client }) => {
         model: model ? modelKey(model) : undefined,
         mode: typeof asyncPrompt === "function" ? "async" : "sync",
       })
-      lastInjected.set(sessionID, { kind: plan.kind, at: Date.now() })
+      lastInjected.set(sessionID, { kind: plan.kind, at: Date.now(), text })
       queueTitleRefresh(sessionID)
     } catch (err) {
       const ns = client.session ?? {}
@@ -3080,6 +3152,44 @@ export const createEngine = async ({ client }) => {
         // A rejection can echo upstream detail; this reaches an OS toast.
         notice(`${RESUME_TAG}: Could not resume (${redactSecrets(err?.message ?? "error")}).`, "error")
       }
+    }
+  }
+
+  /** In-flight dispatch claim.
+   *
+   *  `lastInjected` is only stamped AFTER the prompt call resolves (see
+   *  dispatchPlan), and dispatchPlan awaits `client.session.status()` on the
+   *  resume path. So two overlapping dispatches could both pass the
+   *  `lastInjected` guard at entry and both call `session.prompt` — which is
+   *  exactly what showed up in real sessions: two byte-identical
+   *  `[auto-resume] ...` prompts 0-10ms apart with adjacent sequence numbers
+   *  (301 such pairs in the local OpenCode store, all prompt kinds affected).
+   *
+   *  The claim is taken SYNCHRONOUSLY at entry, before any await, so a second
+   *  runPlan for the same session can never get past this point while the
+   *  first is still in flight — regardless of which timer or event produced
+   *  it. It is released in `finally`, so a rejected prompt call, a dropped
+   *  plan and a successful dispatch all leave the session claimable again. */
+  const dispatchClaims = new Set()
+
+  const runPlan = async (sessionID, plan) => {
+    if (dispatchClaims.has(sessionID)) {
+      const retries = (plan.claimRetries ?? 0) + 1
+      if (retries <= 6) {
+        plan.claimRetries = retries
+        log("info", `plan "${plan.kind}" deferred — another dispatch in flight (attempt ${retries})`, { sessionID })
+        schedule(sessionID, 150, plan)
+        return
+      }
+      log("info", `dropping "${plan.kind}" — dispatch stayed busy after ${retries} attempts`, { sessionID })
+      return
+    }
+    dispatchClaims.add(sessionID)
+    try {
+      return await dispatchPlan(sessionID, plan)
+    } finally {
+      dispatchClaims.delete(sessionID)
+      delete plan.claimRetries
     }
   }
 
@@ -3388,9 +3498,12 @@ export const createEngine = async ({ client }) => {
       // chain and try ONCE more — long outages (502 storms, provider blips)
       // must not permanently kill recovery until the user returns. We also
       // reset stallResumes here: the within-task stall-takeover cap
-      // (maxStallTakeovers, default 4) is an anti-loop guard, NOT a hard
-      // kill — a session that hit the cap should get a fresh budget after
-      // the rearm window.
+      // (maxStallTakeovers) is an anti-loop guard, NOT a hard kill — a
+      // session that hit the cap should get a fresh budget after the
+      // rearm window.
+      //
+      // Only reachable when a ceiling is configured: with the default
+      // unlimited budget `s.chain >= retryBudget()` is never true.
       if (!s.gaveUpRearmed && !suppressed(sessionID)) {
         s.gaveUpRearmed = true
         if (s.rearmTimer) clearTimeout(s.rearmTimer)
@@ -3411,6 +3524,11 @@ export const createEngine = async ({ client }) => {
     }
     s.pendingResume = true
     s.chain += 1
+    // Every attempt counts against the circuit breaker. With an unlimited
+    // budget the breaker is the only thing that ever pauses recovery, so it
+    // has to see the failures — otherwise a provider that is down for hours
+    // is retried at full speed for the whole outage.
+    noteResumeFailure()
     const delay = retryDelay(kind, s.chain, error)
     schedule(sessionID, delay, { kind: "resume", prompt: buildResumePrompt(sessionID, kind, error, false, null) })
   }
@@ -3919,6 +4037,17 @@ export const createEngine = async ({ client }) => {
   // ── stall + stuck-retry watchdog ───────────────────────────────────
   const takeover = (sessionID, why, noticeMsg, plan = { kind: "resume", prompt: PROMPTS.resume }) => {
     const s = state(sessionID)
+    // Re-entrancy guard. A takeover needs ~2.3s to abort and re-schedule its own
+    // prompt (TAKEOVER_RETRY_DELAY_MS + TAKEOVER_SCHEDULE_DELAY_MS) and the watchdog
+    // that fired it keeps ticking every few hundred ms. Until that window has
+    // passed, a second tick must not start another takeover: each entry aborts the
+    // session again and queues ANOTHER generic `PROMPTS.resume(auto)` prompt, which
+    // is precisely how two byte-identical prompts landed back-to-back.
+    if (s.takeoverAt > 0 &&
+        Date.now() - s.takeoverAt < TAKEOVER_RETRY_DELAY_MS + TAKEOVER_SCHEDULE_DELAY_MS + 1_000) {
+      log("info", "takeover already in flight — ignoring watchdog re-entry", { sessionID, why })
+      return
+    }
     // The previous hard cap of `s.stallResumes >= 2` forced babysitting on
     // long free-tier stalls once the model hit retry #3. Stall takeovers are
     // now capped independently via `cfg.maxStallTakeovers` (env:
@@ -4103,6 +4232,11 @@ export const createEngine = async ({ client }) => {
     const cutoff = Date.now() - cfg.reanimateWindowMs
     const activeCutoff = Date.now() - RESTART_RECOVERY_WINDOW_MS
     const activeList = [...list].sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0)).slice(0, 50)
+    // Phase 1 — concurrent bounded fetch of the conversation tails. The
+    // original strictly sequential loop turned a restart with 50 active
+    // sessions into up to 50 sequential round-trips, each with a 10s
+    // timeout, so a slow server could stall recovery for minutes.
+    const candidates = []
     for (const sess of activeList) {
       if (!sess?.id || sess.parentID) continue
       if (typeof sess.id !== "string" || sess.id.length > 256) continue
@@ -4113,15 +4247,37 @@ export const createEngine = async ({ client }) => {
       const s = state(sess.id)
       if (s.reanimated) continue
       s.reanimated = true
+      candidates.push({ sess, s, isActiveStore })
+    }
 
-      let entries = []
-      try {
-        const r = await Promise.race([
-          client.session.messages({ path: { id: sess.id } }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("messages fetch timeout")), 10_000))
-        ])
-        entries = (r?.data ?? r) ?? []
-      } catch { continue }
+    const REANIMATE_FETCH_CONC = 8
+    const REANIMATE_DEADLINE_MS = 15_000
+    const deadline = Date.now() + REANIMATE_DEADLINE_MS
+    const fetched = new Array(candidates.length)
+    let cursor = 0
+    const fetchWorker = async () => {
+      while (true) {
+        const idx = cursor++
+        if (idx >= candidates.length) return
+        if (Date.now() > deadline) { fetched[idx] = null; return }
+        const { sess } = candidates[idx]
+        try {
+          const r = await Promise.race([
+            client.session.messages({ path: { id: sess.id } }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("messages fetch timeout")), 10_000)),
+          ])
+          fetched[idx] = (r?.data ?? r) ?? []
+        } catch { fetched[idx] = null }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(REANIMATE_FETCH_CONC, candidates.length || 1) }, fetchWorker))
+
+    // Phase 2 — the decisions stay strictly sequential: rotateAwayFrom
+    // mutates shared provider health, so ordering must remain deterministic.
+    for (let i = 0; i < candidates.length; i++) {
+      const { sess, s, isActiveStore } = candidates[i]
+      const entries = fetched[i]
+      if (!Array.isArray(entries)) continue // fetch failed or deadline hit
       if (suppressed(sess.id)) continue
       // Only revive sessions that have actual conversation history.
       // Empty sessions (just created, no messages) should not be auto-prompted.
@@ -4431,9 +4587,8 @@ export const createEngine = async ({ client }) => {
             state(info.sessionID).lastActivity = Date.now()
 
             if (info.role === "user") {
-              // Fresh task boundary — unless it's OUR own injected prompt.
-              // UserMessage carries no parts in this event, so verify by
-              // fetching the stored message text and matching our tag.
+              // Non-user turns (assistant, system) don't trigger our user-boundary
+              // logic; skip the async message fetch entirely.
               const s0 = state(info.sessionID)
               let ours = false
               let userText = ""
@@ -4460,7 +4615,13 @@ export const createEngine = async ({ client }) => {
                 // prompt arrived — the new conversation must not be polluted by
                 // a stale "Continue" / "Auto-resume" that fires seconds later.
                 cancelPending(info.sessionID, "user prompt arrived")
-                sessionErrorSynthLock.delete(info.sessionID)
+                // `sessionErrorSynthLock` lives in the ADAPTER scope (it is
+                // created inside setup()); this handler runs in the engine and
+                // cannot see it — referencing it directly threw a ReferenceError
+                // that aborted the whole "fresh task boundary" reset below
+                // (persistedStops, resetTaskScope, currentModel, lastTurnHadText).
+                // The adapter hands the release hook in instead.
+                releaseErrorSynth?.(info.sessionID)
                 // A REAL prompt starts a new workflow — lift the stop, on
                 // disk too, so future runs automate this session again.
                 // (An explicit opt-out is only lifted by "auto-resume on".)
@@ -5302,7 +5463,12 @@ export default {
     const { client, setStatus, remember, rememberRetryStatus, retryHint, statusBySession } = buildV2Client(ctx, hooksForClient)
 
     // Instantiate the V1 engine against the bridged client.
-    const engine = await createEngine({ client })
+    const engine = await createEngine({
+      client,
+      // Adapter-scope lock: the engine only ever needs to RELEASE it (a real
+      // user prompt invalidates any error synthesis we were holding).
+      releaseErrorSynth: (sid) => sessionErrorSynthLock.delete(sid),
+    })
     const handle = engine?.event
     if (typeof handle !== "function") {
       throw new Error("auto-resume: engine did not return an event handler")
