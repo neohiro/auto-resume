@@ -70,6 +70,54 @@ Restart OpenCode. The plugin loads automatically — no extra dependencies.
 | `OPENCODE_RESUME_ROTATION_ENABLED` | `false` | Master switch for model rotation (never silent) |
 | `OPENCODE_RESUME_ENCRYPTION_KEY` | — | AES-256-GCM encryption for sidecars |
 | `OPENCODE_RESUME_AUTO_UPDATE` | `true` | Daily self-update check |
+| `OPENCODE_RESUME_BASE_DELAY_MS` | `30` | Base retry delay |
+| `OPENCODE_RESUME_MAX_DELAY_MS` | `500` | Max retry delay cap |
+| `OPENCODE_RESUME_NUDGE_DELAY_MS` | `30` | Nudge delay (continue / budget) |
+| `OPENCODE_RESUME_RATE_LIMIT_BASE_MS` | `40` | Rate-limit base delay |
+| `OPENCODE_RESUME_THINK_STALL_MS` | `30_000` | Think-stall detection |
+| `OPENCODE_RESUME_REARM_MS` | `30_000` | Re-arm after clean turn |
+| `OPENCODE_RESUME_WATCHDOG_MS` | `60_000` | Watchdog tick |
+| `OPENCODE_RESUME_RUNNING_TOOL_FACTOR` | `2` | Tool-activity multiplier |
+| `OPENCODE_RESUME_RETRY_TAKEOVER_MS` | `1500` | Takeover retry delay |
+| `OPENCODE_RESUME_RETRY_FUTURE_CAP_MS` | `600_000` | Retry future cap |
+| `OPENCODE_RESUME_REANIMATE` | `true` | Restart session revival |
+| `OPENCODE_RESUME_REANIMATE_WINDOW_MS` | `86_400_000` | Revival window |
+| `OPENCODE_RESUME_BREAKER_THRESHOLD` | `0` | Circuit-breaker disable (0 = off) |
+| `OPENCODE_RESUME_BREAKER_WINDOW_MS` | `300_000` | Breaker observation window |
+| `OPENCODE_RESUME_BREAKER_COOLDOWN_MS` | `60_000` | Breaker cooldown |
+| `OPENCODE_RESUME_COMPACT_ON_OVERFLOW` | `true` | Compact history on overflow |
+| `OPENCODE_RESUME_NOTICE_THROTTLE_MS` | `30_000` | Notice throttle |
+| `OPENCODE_RESUME_TOAST_THROTTLE_MS` | `30_000` | Toast throttle |
+| `OPENCODE_RESUME_SWITCH_ON_QUOTA` | `true` | Rotation on quota errors |
+| `OPENCODE_RESUME_SWITCH_ON_RATELIMIT` | `true` | Rotation on rate-limit |
+| `OPENCODE_RESUME_SWITCH_ON_FAILURES` | `true` | Rotation on persistent failures |
+| `OPENCODE_RESUME_DISABLE_ROTATION` | `false` | Hard-disable rotation |
+| `OPENCODE_RESUME_FAVORITE_RETURN` | `true` | Favorite-model stability gate |
+| `OPENCODE_RESUME_FAVORITE_CHECK_AFTER_MS` | `300_000` | Favorite-check interval |
+| `OPENCODE_RESUME_FAVORITE_MIN_TURNS` | `3` | Min turns before favorite check |
+| `OPENCODE_RESUME_RL_SWITCH_AFTER` | `3` | Rate-limit switch after N failures |
+| `OPENCODE_RESUME_ROTATE_AFTER_FAILURES` | `2` | Rotation after failure count |
+| `OPENCODE_RESUME_MAX_ROTATIONS` | `3` | Max rotations per session |
+| `OPENCODE_RESUME_MODEL_COOLDOWN_MS` | `300_000` | Cooldown between same-model use |
+| `OPENCODE_RESUME_STOPSTORE` | env path | Stop-store path |
+| `OPENCODE_RESUME_OFFSTORE` | env path | Off-store path |
+| `OPENCODE_RESUME_AGGRESSION` | `balanced` | Aggression preset |
+| `OPENCODE_RESUME_MAX_STALL_TAKEOVERS` | `3` | Max stall takeovers |
+| `OPENCODE_RESUME_DENYLIST_MODELS` | — | Denylisted model IDs |
+| `OPENCODE_RESUME_BUDGET_PROMPTS` | `false` | Enable budget/quota prompts |
+| `OPENCODE_RESUME_FAST_RETRY` | `true` | Fast-retry mode |
+| `OPENCODE_RESUME_FAST_RETRY_BASE_MS` | `30` | Fast retry base |
+| `OPENCODE_RESUME_FAST_RETRY_GROWTH` | `2` | Fast retry growth factor |
+| `OPENCODE_RESUME_FAST_RETRY_MAX_MS` | `500` | Fast retry max |
+| `OPENCODE_RESUME_FAST_RETRY_MAX_CHAIN` | `8` | Fast retry max chain |
+| `OPENCODE_RESUME_MAX_DIR_ASK_COUNTS` | `3` | Max direct-ask counts |
+| `OPENCODE_RESUME_PAUSESTORE` | env path | Pause-store path |
+| `OPENCODE_RESUME_ACTIVESTORE` | env path | Active-store path |
+| `OPENCODE_RESUME_HEALTHSTORE` | env path | Provider-health store |
+| `OPENCODE_RESUME_FALLBACK_MODELS` | `false` | Fallback model list |
+| `OPENCODE_RESUME_OUTPUT_LENGTH_MAX` | `3` | Max output-length hits before giving up |
+| `OPENCODE_RESUME_STALL_TIMEOUT_MS` | `30_000` | Stall timeout |
+| `OPENCODE_RESUME_NUDGE_DELAY_MS` | `30` | Nudge delay (continue / budget) |
 
 Full list in file header (lines 128–201).
 

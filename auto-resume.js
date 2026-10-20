@@ -3808,6 +3808,14 @@ export const createEngine = async ({ client, releaseErrorSynth }) => {
       // this, error→scheduled resume + core's own successful retry produced
       // spurious "transient infrastructure error" prompts on healthy turns.
       s.lastSuccessAt = Date.now()
+      // A clean turn resolves the previous incident. The 3s same-kind dedupe
+      // gate exists to block two injections FOR ONE incident; once the session
+      // has demonstrably recovered, a later failure is a NEW incident (smoke F:
+      // chain-reset retry after a clean turn) and must not be silently eaten.
+      // Stale plans from the old incident are blocked by the stale-plan guard
+      // (kind==="resume" && lastSuccessAt >= plan.createdTs) for resume kinds.
+      const li = lastInjected.get(sessionID)
+      if (li && li.kind === "resume") lastInjected.delete(sessionID)
       s.toolErrs = 0
       s.gaveUpRearmed = false
       s.budgetNotified = false
