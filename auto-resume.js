@@ -394,6 +394,8 @@ const NO_TODO_IMPROVE_MIN_CHARS = 80
  *  event, so a V2 model has no structured task tracker — it tracks remaining
  *  work either with markdown checkboxes (`- [ ]` / `- [x]`) or, when the core
  *  still exposes tool todos (V1 cores), via the todo list itself. */
+const LEAKED_TOOL_CALL_RE = /\[Assistant tool call\]:\s*(\w+)\s*\(\{/i
+
 const CHECKBOX_RE = /[-*+]\s+\[([ xX~+-])\]/g
 const PLAN_HEADING_RE = /^\s*(?:#{1,6}\s*)?(?:todo|to-do|task|plan|next steps?|remaining|checklist|outstanding)\b/im
 const textOfParts = (parts) =>
@@ -2962,7 +2964,7 @@ export const createEngine = async ({ client, releaseErrorSynth }) => {
     log("info", `scheduled "${plan.kind}" in ${delayMs}ms`, { sessionID })
   }
 
-  const lastInjected = new Map() // sessionID -> { kind, at }
+  const lastInjected = globalThis.__autoResumeLastInjected || (globalThis.__autoResumeLastInjected = new Map()) // sessionID -> { kind, at }
 
   /** Cancel any pending auto-injection on a session and clear its pendingResume
    *  flag.  Called the moment we observe the user sending their own message —
@@ -3170,7 +3172,7 @@ export const createEngine = async ({ client, releaseErrorSynth }) => {
    *  first is still in flight — regardless of which timer or event produced
    *  it. It is released in `finally`, so a rejected prompt call, a dropped
    *  plan and a successful dispatch all leave the session claimable again. */
-  const dispatchClaims = new Set()
+  const dispatchClaims = globalThis.__autoResumeDispatchClaims || (globalThis.__autoResumeDispatchClaims = new Set())
 
   const runPlan = async (sessionID, plan) => {
     if (dispatchClaims.has(sessionID)) {
@@ -3779,6 +3781,25 @@ export const createEngine = async ({ client, releaseErrorSynth }) => {
 
     const hasContent = (lastAssistant.parts ?? []).some((p) => ["text", "tool", "reasoning"].includes(p?.type))
     const errored = Boolean(info.error)
+
+    // Detect a leaked Assistant tool call: text contains a serialized tool
+    // invocation that never executed (interrupted / died idle). Prompt to
+    // resume so the work isn't lost.
+    const textParts = (lastAssistant.parts ?? []).filter((p) => p?.type === "text")
+    const leakedToolMatch = textParts.some((p) => LEAKED_TOOL_CALL_RE.test(p.text ?? ""))
+    // Leak recovery is failure-state (like empty-turn or interrupted-tool),
+    // not autonomous drive — fire regardless of cfg.autonomy.
+    if (leakedToolMatch && s.nudges < cfg.maxNudges && budgetLeft(s)) {
+      log("warn", "leaked Assistant tool call detected — resuming", { sessionID })
+      s.nudges += 1
+      s.chain = 0
+      const toolName = (leakedToolMatch ? (textParts.find((p) => LEAKED_TOOL_CALL_RE.test(p.text ?? ""))?.text ?? "").match(LEAKED_TOOL_CALL_RE)?.[1] : null) ?? "unknown"
+      schedule(sessionID, cfg.nudgeDelayMs, {
+        kind: "resume",
+        prompt: `[auto-resume] Assistant tool call leaked (${toolName}) — interrupted / died idle. Resume from where the tool should have run.`,
+      })
+      return
+    }
 
     /* Provider safety filter stopped the turn. OpenCode 2 reports this as an
      * explicit finish reason rather than burying it in an error string, so it
@@ -5458,6 +5479,9 @@ const V2_NOISE_EVENTS = [
 ]
 
 let adapterInitLock = false
+const ADAPTER_LOCK_KEY = Symbol.for("auto-resume.adapter-lock")
+if (globalThis[ADAPTER_LOCK_KEY]) adapterInitLock = true
+globalThis[ADAPTER_LOCK_KEY] = true
 
 export default {
   id: "auto-resume",
