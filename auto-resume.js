@@ -1665,7 +1665,7 @@ export const createEngine = async ({ client, releaseErrorSynth }) => {
       else modelFailureVelocities.set(key, filtered)
     }
   }
-  const persistedStops = stopStore.map
+  const persistedStops = new Map(); // redesigned: no persistent cross-session stops
 
   /** Stopped = flagged live this run OR remembered from a previous run. */
   const isUserStopped = (sessionID) =>
@@ -2828,8 +2828,8 @@ export const createEngine = async ({ client, releaseErrorSynth }) => {
     const s = state(sessionID)
     if (s.userStopped) return
     s.userStopped = true
-    persistedStops.set(sessionID, Date.now())
-    stopStore.save()
+    // persistedStops.set(sessionID, Date.now()); // redesigned: no persistent stops
+    // stopStore.save(); // redesigned
     const t = timers.get(sessionID)
     if (t) { clearTimeout(t); timers.delete(sessionID) }
     log("info", "user stop detected — automation paused until next prompt", { sessionID, why })
@@ -2854,8 +2854,8 @@ export const createEngine = async ({ client, releaseErrorSynth }) => {
       return
     }
     s.userStopped = true
-    persistedStops.set(sessionID, Date.now())
-    stopStore.save()
+    // persistedStops.set(sessionID, Date.now()); // redesigned: no persistent stops
+    // stopStore.save(); // redesigned
     const t = timers.get(sessionID)
     if (t) { clearTimeout(t); timers.delete(sessionID) }
     s.pendingResume = false
