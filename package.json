@@ -5,7 +5,10 @@
   "type": "module",
   "main": "auto-resume.js",
   "files": [
-    "auto-resume.js"
+    "auto-resume.js",
+    "plugin-manifest.json",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "node scripts/check-version.cjs && node tests/smoke.mjs && node tests/extended.mjs && node tests/favorite.mjs && node tests/v2.mjs && node tests/v2entry.mjs && node tests/v2events.mjs && node tests/v2failures.mjs && node tests/v2review.mjs && node tests/fastretry.mjs && node tests/reanimate.mjs && node tests/prompts.mjs && node tests/v3.mjs && node tests/v4.mjs && node tests/stop.mjs && node tests/title.mjs && node tests/osnotify.mjs && node tests/stress.mjs && node tests/doubleprompt.mjs && node tests/integration.bun.mjs",

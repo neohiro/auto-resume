@@ -232,7 +232,7 @@ const decryptPayload = (data) => {
 }
 
 const UPDATE_URL =
-  "https://raw.githubusercontent.com/neohiro/auto-resume/main/auto-resume.js"
+  "https://raw.githubusercontent.com/neohiro/auto-resume/v2.1.7/auto-resume.js"
 
 /** This module's own path on disk, resolved at import time.
  *
